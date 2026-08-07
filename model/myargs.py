@@ -1,0 +1,49 @@
+"""CLI args cho main.py — mọi default lấy đúng con số đã chốt trong Readme.md."""
+
+import argparse
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Two-Tower cold-start recsys (Kindle_Store)")
+
+    # data paths
+    p.add_argument("--reviews-file", type=str,
+                    default=r"D:\amazon-datasets\Kindle_Store\Kindle_Store.jsonl")
+    p.add_argument("--meta-file", type=str,
+                    default=r"D:\amazon-datasets\Kindle_Store\meta_Kindle_Store.jsonl")
+    p.add_argument("--item-emb-dir", type=str, default=None,
+                    help="Thư mục chứa text_embeddings.npy/image_embeddings.npy/has_image.npy/"
+                         "asin_to_idx.json (Giai đoạn 1, xem model/preprocess_data/data.py)")
+    p.add_argument("--cache-dir", type=str, default=None,
+                    help="Thư mục chứa metadata.npy/by_user.npy/train_interactions.npy/... "
+                         "(xuất bởi model/preprocess_data/build_cache.py). None = tự quét lại "
+                         "toàn bộ JSONL mỗi lần chạy (chậm, chỉ dùng khi chưa có cache).")
+
+    # sequence / user-tower (Readme: max_seq_len=10 đã chốt)
+    p.add_argument("--max-seq-len", type=int, default=10)
+    p.add_argument("--seq-hidden-dim", type=int, default=128)
+    p.add_argument("--n-heads", type=int, default=4)
+
+    # towers output dim
+    p.add_argument("--item-out-dim", type=int, default=128)
+    p.add_argument("--user-out-dim", type=int, default=128)
+    p.add_argument("--mlp-hidden-dim", type=int, default=256)
+    p.add_argument("--dropout", type=float, default=0.1)
+
+    # loss (Readme: InfoNCE multi-negative K=8 = 4 hard + 4 soft, đã chốt)
+    p.add_argument("--n-hard-neg", type=int, default=4)
+    p.add_argument("--n-soft-neg", type=int, default=4)
+    p.add_argument("--temperature", type=float, default=0.1)
+
+    # temporal split (Readme: global cutoff percentile 80/90, đã chốt)
+    p.add_argument("--train-percentile", type=int, default=80)
+    p.add_argument("--val-percentile", type=int, default=90)
+
+    # training
+    p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
+    p.add_argument("--seed", type=int, default=0)
+
+    return p.parse_args()
