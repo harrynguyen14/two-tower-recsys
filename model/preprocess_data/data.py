@@ -23,11 +23,15 @@ Model: openai/clip-vit-base-patch32 (qua HuggingFace transformers, chạy CPU ho
 Ảnh phải tải về trước bằng ds-down/download_images.py (đã sửa trỏ Kindle_Store, có
 MAX_IMAGES để giới hạn khi test cục bộ).
 
-Chạy: python data.py --meta-file <path> --image-dir <path> --out-dir <path> [--limit N]
+Chạy 1 GPU/CPU: python data.py --meta-file <path> --image-dir <path> --out-dir <path> [--limit N]
+Chạy nhiều GPU (Kaggle T4x2): thêm --gpus "0,1" — tự spawn 1 process/GPU (multiprocessing,
+mỗi process 1 CUDA context riêng biệt), chạy song song rồi TỰ GỘP kết quả vào --out-dir.
+Không cần mở nhiều lệnh shell tay (Kaggle notebook chỉ chạy được 1 cell tuần tự).
 """
 
 import argparse
 import json
+import multiprocessing as mp
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -54,13 +58,11 @@ def parse_args():
     p.add_argument("--device", type=str, default=None, help="Mặc định: cuda nếu có, ngược lại cpu")
     p.add_argument("--num-workers", type=int, default=4,
                    help="Số worker đọc/decode ảnh song song (overlap I/O với GPU compute)")
-    p.add_argument("--num-shards", type=int, default=1,
-                   help="Chia items thành N shard để chạy song song nhiều GPU (mỗi process 1 shard)")
-    p.add_argument("--shard-id", type=int, default=0,
-                   help="Shard xử lý bởi process này (0-indexed, dùng với --num-shards trên "
-                        "Kaggle T4x2: 2 process --device cuda:0 --shard-id 0 --num-shards 2 và "
-                        "--device cuda:1 --shard-id 1 --num-shards 2 chạy song song, out-dir "
-                        "khác nhau rồi gộp lại sau)")
+    p.add_argument("--gpus", type=str, default=None,
+                   help="VD '0,1' — tự spawn 1 process/GPU, mỗi process 1 shard rời rạc, chạy "
+                        "song song rồi TỰ GỘP kết quả vào --out-dir (không cần chạy tay 2 lệnh "
+                        "shell, dùng khi Kaggle T4x2 có 2 GPU). Bỏ trống = chạy 1 device duy "
+                        "nhất (--device, mặc định cuda nếu có).")
     return p.parse_args()
 
 
@@ -163,35 +165,24 @@ def embed_batch(model, processor, device, use_amp, texts, images):
     return text_emb.cpu().numpy(), image_emb.cpu().numpy(), has_image
 
 
-def main():
-    args = parse_args()
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+def run_shard(shard_items, meta_args, device, out_dir):
+    """Embed đúng shard_items (list[(global_idx, item)]) trên 1 device, lưu .npy/.json vào
+    out_dir. Dùng chung cho cả đường chạy 1-device (shard = toàn bộ items) và multi-GPU
+    (mỗi process con gọi hàm này với 1 shard rời rạc, xem run_multi_gpu)."""
     use_amp = device.startswith("cuda")
-    print(f"Device: {device}  AMP: {use_amp}")
-
-    print("Loading CLIP model...")
+    print(f"[{device}] Loading CLIP model...")
     model = CLIPModel.from_pretrained(CLIP_MODEL_NAME).to(device).eval()
     processor = CLIPProcessor.from_pretrained(CLIP_MODEL_NAME)
 
-    print(f"Loading items from {args.meta_file} (limit={args.limit})...")
-    items = load_items(args.meta_file, limit=args.limit)
-    print(f"Total items: {len(items):,}")
-
-    # Sharding: mỗi process chỉ xử lý items[shard_id::num_shards] — chạy 2 process song
-    # song (--device cuda:0 --shard-id 0 --num-shards 2 và cuda:1 --shard-id 1 --num-shards 2)
-    # trên Kaggle T4x2. global_idx GIỮ NGUYÊN vị trí gốc trong toàn bộ items (không phải vị
-    # trí cục bộ trong shard) để asin_to_idx.json của các shard gộp lại không bị trùng/lệch.
-    shard_items = [(i, it) for i, it in enumerate(items) if i % args.num_shards == args.shard_id]
-    print(f"Shard {args.shard_id}/{args.num_shards}: {len(shard_items):,} items")
-
-    image_dir = Path(args.image_dir)
+    image_dir = Path(meta_args["image_dir"])
     all_text_emb, all_image_emb, all_has_image = [], [], []
     asin_to_idx = {}
 
-    loader_pool = ImageLoaderPool(args.num_workers)
+    loader_pool = ImageLoaderPool(meta_args["num_workers"])
     try:
-        for start in tqdm(range(0, len(shard_items), args.batch_size), desc="Embedding items"):
-            batch = shard_items[start:start + args.batch_size]
+        desc = f"Embedding items [{device}]"
+        for start in tqdm(range(0, len(shard_items), meta_args["batch_size"]), desc=desc):
+            batch = shard_items[start:start + meta_args["batch_size"]]
             texts = [it["text"] for _, it in batch]
             image_paths = [find_image_path(image_dir, it["asin"]) for _, it in batch]
             images = loader_pool.load_many(image_paths)  # overlap I/O với GPU compute batch trước
@@ -207,15 +198,74 @@ def main():
     finally:
         loader_pool.close()
 
-    text_embeddings = np.concatenate(all_text_emb, axis=0)
-    image_embeddings = np.concatenate(all_image_emb, axis=0)
+    text_embeddings = np.concatenate(all_text_emb, axis=0) if all_text_emb else np.zeros((0, 512), dtype="f4")
+    image_embeddings = np.concatenate(all_image_emb, axis=0) if all_image_emb else np.zeros((0, 512), dtype="f4")
     has_image_arr = np.array(all_has_image, dtype=bool)
 
-    n_with_image = int(has_image_arr.sum())
-    print(f"Items with real image used: {n_with_image}/{len(items)}")
-    print(f"text_embeddings shape: {text_embeddings.shape}  image_embeddings shape: {image_embeddings.shape}")
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    np.save(out_dir / "text_embeddings.npy", text_embeddings)
+    np.save(out_dir / "image_embeddings.npy", image_embeddings)
+    np.save(out_dir / "has_image.npy", has_image_arr)
+    with open(out_dir / "asin_to_idx.json", "w", encoding="utf-8") as f:
+        json.dump(asin_to_idx, f)
+    print(f"[{device}] Done: {len(shard_items):,} items -> {out_dir}")
 
-    out_dir = Path(args.out_dir)
+
+def _shard_worker(shard_items, meta_args, device, shard_out_dir):
+    """Entry point cho multiprocessing.Process — mỗi process con có CUDA context riêng
+    biệt gắn với đúng 1 GPU (an toàn hơn threading, vốn không tách CUDA context tốt cho
+    nhiều GPU trong cùng 1 process)."""
+    run_shard(shard_items, meta_args, device, shard_out_dir)
+
+
+def run_multi_gpu(items, meta_args, gpu_ids, out_dir):
+    """Tự spawn 1 process/GPU (--gpus '0,1'), mỗi process nhận 1 shard rời rạc
+    (items[i::n] theo global index gốc), chạy song song, rồi GỘP kết quả lại thành đúng 1
+    bộ .npy/.json ở out_dir — không cần người dùng tự mở nhiều shell (Kaggle notebook chỉ
+    chạy được 1 cell tuần tự, xem lý do đổi hướng ở đầu module)."""
+    n = len(gpu_ids)
+    out_dir = Path(out_dir)
+    shard_dirs = [out_dir / f"_shard{shard_id}" for shard_id in range(n)]
+
+    procs = []
+    for shard_id, gpu_id in enumerate(gpu_ids):
+        shard_items = [(i, it) for i, it in enumerate(items) if i % n == shard_id]
+        device = f"cuda:{gpu_id}"
+        p = mp.Process(target=_shard_worker, args=(shard_items, meta_args, device, shard_dirs[shard_id]))
+        p.start()
+        procs.append(p)
+
+    for p in procs:
+        p.join()
+    failed = [p for p in procs if p.exitcode != 0]
+    if failed:
+        raise RuntimeError(f"{len(failed)}/{n} shard process(es) thất bại — xem log ở trên")
+
+    print("Merging shard outputs...")
+    text_parts, image_parts, has_image_parts = [], [], []
+    asin_to_idx = {}
+    for shard_dir in shard_dirs:
+        text_parts.append(np.load(shard_dir / "text_embeddings.npy"))
+        image_parts.append(np.load(shard_dir / "image_embeddings.npy"))
+        has_image_parts.append(np.load(shard_dir / "has_image.npy"))
+        with open(shard_dir / "asin_to_idx.json", encoding="utf-8") as f:
+            asin_to_idx.update(json.load(f))
+
+    # asin_to_idx dùng GLOBAL index gốc (xem run_multi_gpu/run_shard) nên ghép trực tiếp
+    # theo đúng thứ tự index đó, không phụ thuộc thứ tự các shard hoàn thành trước/sau.
+    n_items = len(items)
+    dim = text_parts[0].shape[1]
+    text_embeddings = np.zeros((n_items, dim), dtype="f4")
+    image_embeddings = np.zeros((n_items, dim), dtype="f4")
+    has_image_arr = np.zeros(n_items, dtype=bool)
+    for shard_id in range(n):
+        shard_items = [(i, it) for i, it in enumerate(items) if i % n == shard_id]
+        for row, (global_idx, _) in enumerate(shard_items):
+            text_embeddings[global_idx] = text_parts[shard_id][row]
+            image_embeddings[global_idx] = image_parts[shard_id][row]
+            has_image_arr[global_idx] = has_image_parts[shard_id][row]
+
     out_dir.mkdir(parents=True, exist_ok=True)
     np.save(out_dir / "text_embeddings.npy", text_embeddings)
     np.save(out_dir / "image_embeddings.npy", image_embeddings)
@@ -223,10 +273,38 @@ def main():
     with open(out_dir / "asin_to_idx.json", "w", encoding="utf-8") as f:
         json.dump(asin_to_idx, f)
 
+    n_with_image = int(has_image_arr.sum())
+    print(f"Items with real image used: {n_with_image}/{n_items}")
+    print(f"text_embeddings shape: {text_embeddings.shape}  image_embeddings shape: {image_embeddings.shape}")
     print(f"Saved -> {out_dir / 'text_embeddings.npy'}")
     print(f"Saved -> {out_dir / 'image_embeddings.npy'}")
     print(f"Saved -> {out_dir / 'has_image.npy'}")
     print(f"Saved -> {out_dir / 'asin_to_idx.json'}")
+
+
+def main():
+    args = parse_args()
+
+    print(f"Loading items from {args.meta_file} (limit={args.limit})...")
+    items = load_items(args.meta_file, limit=args.limit)
+    print(f"Total items: {len(items):,}")
+
+    meta_args = {
+        "image_dir": args.image_dir,
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+    }
+
+    if args.gpus:
+        gpu_ids = [g.strip() for g in args.gpus.split(",") if g.strip()]
+        print(f"Multi-GPU: {len(gpu_ids)} process(es) trên GPU {gpu_ids} — tự điều phối, không "
+              f"cần chạy tay nhiều lệnh shell.")
+        run_multi_gpu(items, meta_args, gpu_ids, args.out_dir)
+    else:
+        device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Device: {device}")
+        shard_items = list(enumerate(items))
+        run_shard(shard_items, meta_args, device, args.out_dir)
 
 
 if __name__ == "__main__":
