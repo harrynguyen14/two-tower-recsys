@@ -228,11 +228,17 @@ def run_multi_gpu(items, meta_args, gpu_ids, out_dir):
     out_dir = Path(out_dir)
     shard_dirs = [out_dir / f"_shard{shard_id}" for shard_id in range(n)]
 
+    # QUAN TRỌNG: PyTorch CUDA không cho phép re-init context trong process con tạo bằng
+    # fork (mặc định trên Linux/Kaggle) nếu CUDA đã init ở process cha trước đó — crash
+    # "Cannot re-initialize CUDA in forked subprocess" (lỗi thật đã gặp khi chạy trên
+    # Kaggle T4x2). Bắt buộc dùng context "spawn" (tạo process hoàn toàn mới, import lại
+    # module từ đầu, không kế thừa CUDA context của cha).
+    ctx = mp.get_context("spawn")
     procs = []
     for shard_id, gpu_id in enumerate(gpu_ids):
         shard_items = [(i, it) for i, it in enumerate(items) if i % n == shard_id]
         device = f"cuda:{gpu_id}"
-        p = mp.Process(target=_shard_worker, args=(shard_items, meta_args, device, shard_dirs[shard_id]))
+        p = ctx.Process(target=_shard_worker, args=(shard_items, meta_args, device, shard_dirs[shard_id]))
         p.start()
         procs.append(p)
 
