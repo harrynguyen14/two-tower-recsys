@@ -121,14 +121,25 @@ def load_image(path):
 
 
 class ImageLoaderPool:
-    """Đọc ảnh của batch N+1 song song trong lúc GPU đang encode batch N — tránh CPU I/O
-    (mở/decode file ảnh) làm nghẽn GPU vốn rất nhanh với CLIP-ViT-B/32 (~150M params)."""
+    """Đọc ảnh của batch N+1 song song TRONG LÚC GPU đang encode batch N — tránh CPU I/O
+    (mở/decode file ảnh) làm nghẽn GPU vốn rất nhanh với CLIP-ViT-B/32 (~150M params).
+
+    submit_many() trả về ngay (không block) — caller gọi nó TRƯỚC khi encode batch hiện
+    tại, rồi .result() ở batch kế tiếp mới thật sự đợi (lúc đó ảnh thường đã đọc xong rồi
+    vì GPU encode mất nhiều thời gian hơn đọc ảnh). Bug đã sửa: bản trước dùng load_many()
+    gọi executor.map(...).list() ngay lập tức — dù đọc song song bên trong nhưng caller vẫn
+    BLOCK đợi xong toàn bộ trước khi encode, nên GPU vẫn phải chờ CPU tuần tự y hệt không
+    có prefetch gì cả (lỗi thật: GPU 0%/40% dù batch-size=128, VRAM chỉ dùng ~6.6%)."""
 
     def __init__(self, num_workers):
         self.executor = ThreadPoolExecutor(max_workers=max(1, num_workers))
 
-    def load_many(self, image_paths):
-        return list(self.executor.map(load_image, image_paths))
+    def submit_many(self, image_paths):
+        futures = [self.executor.submit(load_image, p) for p in image_paths]
+        return futures
+
+    def resolve(self, futures):
+        return [f.result() for f in futures]
 
     def close(self):
         self.executor.shutdown(wait=True)
@@ -192,15 +203,31 @@ def run_shard(shard_items, meta_args, device, out_dir):
     all_text_emb, all_image_emb, all_has_image = [], [], []
     asin_to_idx = {}
 
+    batch_size = meta_args["batch_size"]
+    batches = [shard_items[i:i + batch_size] for i in range(0, len(shard_items), batch_size)]
+
     loader_pool = ImageLoaderPool(meta_args["num_workers"])
     try:
-        desc = f"Embedding items [{device}]"
-        for start in tqdm(range(0, len(shard_items), meta_args["batch_size"]), desc=desc):
-            batch = shard_items[start:start + meta_args["batch_size"]]
-            texts = [it["text"] for _, it in batch]
-            image_paths = [find_image_path(image_dir, it["asin"]) for _, it in batch]
-            images = loader_pool.load_many(image_paths)  # overlap I/O với GPU compute batch trước
+        def image_paths_of(batch):
+            return [find_image_path(image_dir, it["asin"]) for _, it in batch]
 
+        # Pipeline thật: submit đọc ảnh batch 0 trước vòng lặp, rồi ở MỖI lần lặp submit
+        # tiếp batch kế trước khi .resolve() (đợi) ảnh của batch hiện tại — trong lúc GPU
+        # encode batch hiện tại (embed_batch bên dưới), ThreadPoolExecutor đã đang đọc ảnh
+        # batch kế tiếp song song. Khác bản cũ (đã sửa): gọi load_many() ngay lập tức luôn
+        # block caller đợi xong hết mới encode, GPU không có gì overlap (lỗi thật: GPU
+        # 0%/40% dù batch-size=128, VRAM chỉ ~6.6%).
+        pending_futures = loader_pool.submit_many(image_paths_of(batches[0])) if batches else []
+
+        desc = f"Embedding items [{device}]"
+        for i in tqdm(range(len(batches)), desc=desc):
+            batch = batches[i]
+            images = loader_pool.resolve(pending_futures)  # ảnh batch này (đã đọc song song ở vòng trước)
+
+            if i + 1 < len(batches):
+                pending_futures = loader_pool.submit_many(image_paths_of(batches[i + 1]))  # prefetch batch kế
+
+            texts = [it["text"] for _, it in batch]
             text_emb, image_emb, has_image = embed_batch(model, processor, device, use_amp, texts, images)
 
             for global_idx, it in batch:
