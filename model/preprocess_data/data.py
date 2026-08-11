@@ -32,6 +32,7 @@ Không cần mở nhiều lệnh shell tay (Kaggle notebook chỉ chạy đượ
 import argparse
 import json
 import multiprocessing as mp
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -293,11 +294,17 @@ def run_multi_gpu(items, meta_args, gpu_ids, out_dir):
     text_parts, image_parts, has_image_parts = [], [], []
     asin_to_idx = {}
     for shard_dir in shard_dirs:
+        # np.load KHÔNG mmap mặc định nên load xong là đã có bản copy trong RAM — xoá file
+        # trên disk NGAY sau khi đọc (không đợi tới lúc ghi xong file gộp) để tránh giữ
+        # đồng thời cả _shard0/_shard1 (~50% dữ liệu mỗi cái) VÀ bản gộp cuối (100%) cùng
+        # lúc trên /kaggle/working — đỉnh dung lượng tạm thời từng gấp ~2x mức cần thiết
+        # (~13GB thay vì ~6.5GB), rủi ro tràn quota /kaggle/working (thường ~20GB).
         text_parts.append(np.load(shard_dir / "text_embeddings.npy"))
         image_parts.append(np.load(shard_dir / "image_embeddings.npy"))
         has_image_parts.append(np.load(shard_dir / "has_image.npy"))
         with open(shard_dir / "asin_to_idx.json", encoding="utf-8") as f:
             asin_to_idx.update(json.load(f))
+        shutil.rmtree(shard_dir)
 
     # asin_to_idx dùng GLOBAL index gốc (xem run_multi_gpu/run_shard) nên ghép trực tiếp
     # theo đúng thứ tự index đó, không phụ thuộc thứ tự các shard hoàn thành trước/sau.
