@@ -134,6 +134,20 @@ class ImageLoaderPool:
         self.executor.shutdown(wait=True)
 
 
+def _as_tensor(output):
+    """model.get_text_features/get_image_features NÊN trả thẳng Tensor theo API CLIP chuẩn,
+    nhưng một số phiên bản/config transformers trả về object output (BaseModelOutputWithPooling)
+    thay vì Tensor trực tiếp — lỗi thật gặp trên Kaggle (AttributeError: ... has no attribute
+    'float'). Tự trích đúng tensor bất kể dạng trả về nào, ưu tiên pooler_output."""
+    if torch.is_tensor(output):
+        return output
+    if hasattr(output, "pooler_output") and output.pooler_output is not None:
+        return output.pooler_output
+    if hasattr(output, "last_hidden_state"):
+        return output.last_hidden_state[:, 0, :]  # CLS token, fallback hiếm khi cần tới
+    raise TypeError(f"Không nhận diện được kiểu output từ CLIP: {type(output)}")
+
+
 def embed_batch(model, processor, device, use_amp, texts, images):
     """Trả về (text_emb, image_emb, has_image) — 3 mảng riêng biệt, KHÔNG trộn.
     image_emb là vector 0 cho item thiếu ảnh (không suy đoán/giả lập ảnh nào).
@@ -143,7 +157,7 @@ def embed_batch(model, processor, device, use_amp, texts, images):
     text_inputs = processor(text=texts, return_tensors="pt", padding=True, truncation=True).to(device)
     with torch.no_grad(), torch.autocast(device_type="cuda", enabled=use_amp):
         text_emb = model.get_text_features(**text_inputs)  # [batch, dim]
-    text_emb = text_emb.float()
+    text_emb = _as_tensor(text_emb).float()
 
     dim = text_emb.shape[1]
     image_emb = torch.zeros(len(texts), dim, device=device)
@@ -154,7 +168,7 @@ def embed_batch(model, processor, device, use_amp, texts, images):
         image_inputs = processor(images=real_images, return_tensors="pt").to(device)
         with torch.no_grad(), torch.autocast(device_type="cuda", enabled=use_amp):
             image_feats = model.get_image_features(**image_inputs)  # [n_real, dim]
-        image_feats = image_feats.float()
+        image_feats = _as_tensor(image_feats).float()
         j = 0
         for i, img in enumerate(images):
             if img is not None:
