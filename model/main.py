@@ -432,7 +432,7 @@ def main():
         # train) mất ~8 phút mỗi lần chạy — cache ra 1 file .pkl trong --cache-dir để lần
         # sau (kể cả --resume) không phải build lại. Key theo max_seq_len vì kết quả phụ
         # thuộc trực tiếp tham số này (seq_before bị cắt theo max_seq_len).
-        positives_cache_path = Path(args.cache_dir) / f"positives_cache_seq{args.max_seq_len}.pkl"
+        positives_cache_path = Path(args.positives_cache_dir) / f"positives_cache_seq{args.max_seq_len}.pkl"
         if positives_cache_path.exists():
             print(f"Loading cached positives from {positives_cache_path} ...")
             with open(positives_cache_path, "rb") as f:

@@ -18,6 +18,12 @@ def parse_args():
                     help="Thư mục chứa metadata.npy/by_user.npy/train_interactions.npy/... "
                          "(xuất bởi model/preprocess_data/build_cache.py). None = tự quét lại "
                          "toàn bộ JSONL mỗi lần chạy (chậm, chỉ dùng khi chưa có cache).")
+    p.add_argument("--positives-cache-dir", type=str, default=".",
+                    help="Thư mục ghi positives_cache_seq{N}.pkl (build_positives_from_array "
+                         "mất ~8 phút mỗi lần chạy trên full data). Mặc định thư mục hiện tại "
+                         "(cùng chỗ với --checkpoint-path) vì --cache-dir có thể read-only "
+                         "(vd Kaggle input dataset) — trên Kaggle nên để mặc định, thư mục "
+                         "hiện tại sẽ là /kaggle/working, luôn ghi được.")
     p.add_argument("--checkpoint-path", type=str, default="checkpoint.pt",
                     help="File lưu model/optimizer state_dict + epoch sau mỗi epoch (để resume).")
     p.add_argument("--best-checkpoint-path", type=str, default="best_model.pt",
