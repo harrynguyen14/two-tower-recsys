@@ -57,17 +57,31 @@ class TwoTowerModel(torch.nn.Module):
         return user_vector, pos_vector, neg_vectors
 
 
-def info_nce_loss(user_vector, pos_vector, neg_vectors, temperature=0.1):
+def info_nce_loss(user_vector, pos_vector, neg_vectors, temperature=0.1, use_in_batch_neg=False):
     """InfoNCE multi-negative đã chốt: 1 positive + K negative (hard+soft trộn sẵn ở
     neg_vectors, xem preprocess.py) trong cùng 1 softmax.
 
     user_vector : [batch, dim]
     pos_vector  : [batch, dim]
     neg_vectors : [batch, K, dim]
-    """
+
+    use_in_batch_neg: thêm pos_vector CỦA SAMPLE KHÁC trong cùng batch làm negative bổ
+    sung (kỹ thuật chuẩn của NVIDIA Merlin two-tower) — tận dụng item_pos đã encode sẵn
+    trong forward pass, không tốn thêm CPU sample/GPU encode nào. Chỉ 1 phép nhân ma trận
+    [batch,dim] @ [dim,batch] có sẵn, mask bỏ đường chéo (chính nó không phải negative
+    của chính nó). Giữ nguyên hard/soft-negative hiện có — đây là TÍN HIỆU BỔ SUNG, không
+    thay thế (in-batch neg thường "dễ" hơn hard-neg nên không đủ để học cold-start 1 mình)."""
     pos_score = (user_vector * pos_vector).sum(dim=-1, keepdim=True) / temperature  # [batch, 1]
     neg_scores = torch.einsum("bd,bkd->bk", user_vector, neg_vectors) / temperature  # [batch, K]
 
-    logits = torch.cat([pos_score, neg_scores], dim=1)  # [batch, 1+K], vị trí 0 = positive
+    logits = [pos_score, neg_scores]
+    if use_in_batch_neg:
+        batch = user_vector.size(0)
+        in_batch_scores = (user_vector @ pos_vector.t()) / temperature  # [batch, batch]
+        diag_mask = torch.eye(batch, dtype=torch.bool, device=user_vector.device)
+        in_batch_scores = in_batch_scores.masked_fill(diag_mask, float("-inf"))
+        logits.append(in_batch_scores)
+
+    logits = torch.cat(logits, dim=1)  # [batch, 1+K(+batch)], vị trí 0 = positive
     labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
     return F.cross_entropy(logits, labels)

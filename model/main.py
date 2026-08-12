@@ -294,7 +294,27 @@ def build_positives_from_array(interactions_arr, cache, max_seq_len, label=None)
 
 
 def to_device(item_emb_tuple, device):
-    return tuple(t.to(device) for t in item_emb_tuple)
+    return tuple(t.to(device, non_blocking=True) for t in item_emb_tuple)
+
+
+try:
+    import pynvml
+    pynvml.nvmlInit()
+    _NVML_HANDLE = pynvml.nvmlDeviceGetHandleByIndex(0)
+except Exception:
+    _NVML_HANDLE = None
+
+
+def gpu_util_str(device):
+    """util%/VRAM dùng cho tqdm postfix — GPU util THẬT (nvidia-smi qua pynvml) khi có,
+    ngược lại fallback về VRAM allocated (torch.cuda.memory_allocated, luôn sẵn có,
+    không cần pynvml) — vẫn hữu ích để thấy pipeline có nghẽn CPU hay không (VRAM đứng
+    yên trong lúc train = GPU đang chờ batch, xem thảo luận GPU 0% dù model đang chạy)."""
+    mem_gb = torch.cuda.memory_allocated(device) / 1e9
+    if _NVML_HANDLE is not None:
+        util = pynvml.nvmlDeviceGetUtilizationRates(_NVML_HANDLE)
+        return f"{util.gpu}% {mem_gb:.2f}GB"
+    return f"{mem_gb:.2f}GB (cài pynvml để xem % util)"
 
 
 def run_eval_scores(model, loader, device):
@@ -454,30 +474,49 @@ def main():
     loader_kwargs = dict(
         batch_size=args.batch_size, collate_fn=collate, num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"), persistent_workers=(args.num_workers > 0),
+        prefetch_factor=(args.prefetch_factor if args.num_workers > 0 else None),
     )
+    # val_warm/test_warm/test_cold chỉ dùng 1 lần (final eval) — num_workers thấp hơn,
+    # KHÔNG persistent_workers/prefetch sâu. Mỗi worker của mỗi DataLoader giữ riêng 1 bản
+    # item_emb_store (text+image embeddings toàn bộ item, vài GB) do collate_fn/Dataset
+    # đóng closure quanh nó — 5 loader x persistent_workers cộng dồn RAM là nguyên nhân
+    # OOM-restart đã gặp trên Kaggle. val_cold_loader (chạy mỗi epoch) vẫn dùng
+    # loader_kwargs đầy đủ vì lặp lại nhiều lần, đáng giữ worker sống.
+    eval_loader_kwargs = dict(loader_kwargs)
+    eval_loader_kwargs.update(num_workers=min(args.num_workers, 2),
+                               persistent_workers=False, prefetch_factor=None)
+
     train_loader = DataLoader(make_dataset(train_pos), shuffle=True, **loader_kwargs)
-    # val_cold_loader dùng MỖI EPOCH trong training loop (mục tiêu chính là cold-start).
-    # val_warm/test_warm/test_cold chỉ dùng ở final evaluation sau khi train xong.
     val_cold_loader = DataLoader(make_dataset(val_cold_pos), shuffle=False, **loader_kwargs)
-    val_warm_loader = DataLoader(make_dataset(val_warm_pos), shuffle=False, **loader_kwargs)
-    test_warm_loader = DataLoader(make_dataset(test_warm_pos), shuffle=False, **loader_kwargs)
-    test_cold_loader = DataLoader(make_dataset(test_cold_pos), shuffle=False, **loader_kwargs)
+    val_warm_loader = DataLoader(make_dataset(val_warm_pos), shuffle=False, **eval_loader_kwargs)
+    test_warm_loader = DataLoader(make_dataset(test_warm_pos), shuffle=False, **eval_loader_kwargs)
+    test_cold_loader = DataLoader(make_dataset(test_cold_pos), shuffle=False, **eval_loader_kwargs)
+
+    use_amp = args.amp and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     for epoch in range(start_epoch, args.epochs):
         model.train()
         total_loss = 0.0
-        for user_batch, pos_item_emb, neg_item_emb, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", leave=False):
-            user_batch = {k: v.to(device) for k, v in user_batch.items()}
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", leave=False)
+        for step, (user_batch, pos_item_emb, neg_item_emb, _) in enumerate(pbar):
+            user_batch = {k: v.to(device, non_blocking=True) for k, v in user_batch.items()}
             pos_item_emb = to_device(pos_item_emb, device)
             neg_item_emb = to_device(neg_item_emb, device)
 
-            user_vec, pos_vec, neg_vecs = model(user_batch, pos_item_emb, neg_item_emb)
-            loss = info_nce_loss(user_vec, pos_vec, neg_vecs, temperature=args.temperature)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type="cuda", enabled=use_amp):
+                user_vec, pos_vec, neg_vecs = model(user_batch, pos_item_emb, neg_item_emb)
+                loss = info_nce_loss(user_vec, pos_vec, neg_vecs, temperature=args.temperature,
+                                      use_in_batch_neg=args.in_batch_neg)
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             total_loss += loss.item()
+
+            if device.type == "cuda" and step % 20 == 0:
+                pbar.set_postfix(gpu=gpu_util_str(device), refresh=False)
 
         print(f"Epoch {epoch+1}/{args.epochs}  train_loss={total_loss/len(train_loader):.4f}")
         cold_metrics = run_eval_cold(model, val_cold_loader, device)

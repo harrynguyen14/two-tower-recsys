@@ -40,6 +40,11 @@ def parse_args():
     p.add_argument("--n-hard-neg", type=int, default=4)
     p.add_argument("--n-soft-neg", type=int, default=4)
     p.add_argument("--temperature", type=float, default=0.1)
+    p.add_argument("--in-batch-neg", action="store_true",
+                    help="Thêm pos_vector của sample khác trong cùng batch làm negative bổ "
+                         "sung (kỹ thuật NVIDIA Merlin two-tower) — miễn phí về CPU/GPU vì "
+                         "item_pos đã encode sẵn trong forward pass, chỉ thêm 1 phép nhân "
+                         "ma trận. Không thay thế hard/soft-negative hiện có.")
 
     # temporal split (Readme: global cutoff percentile 80/90, đã chốt)
     p.add_argument("--train-percentile", type=int, default=80)
@@ -50,6 +55,13 @@ def parse_args():
     p.add_argument("--num-workers", type=int, default=4,
                     help="DataLoader worker process — song song hoá __getitem__ (soft-negative "
                          "sampling + sequence lookup) trên CPU trong lúc GPU train batch trước.")
+    p.add_argument("--prefetch-factor", type=int, default=4,
+                    help="Số batch mỗi worker prefetch trước — tăng để worker luôn có sẵn "
+                         "batch chờ GPU, giảm thời gian GPU idle giữa các step.")
+    p.add_argument("--amp", action="store_true",
+                    help="Bật mixed precision (autocast + GradScaler) cho vòng train chính "
+                         "— tận dụng Tensor Core trên GPU (T4/V100+), không ảnh hưởng "
+                         "data loading (bottleneck riêng, xem --num-workers).")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
