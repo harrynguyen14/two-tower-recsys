@@ -270,13 +270,22 @@ def build_positives_from_array(interactions_arr, cache, max_seq_len, label=None)
     label: "cold" | "warm" | None — gán CỐ ĐỊNH cho toàn bộ interactions_arr thay vì đọc
     từ mảng, vì giờ warm/cold đã được build_cache.py tách sẵn thành 2 file riêng
     (val_warm_interactions.npy / val_cold_interactions.npy) — truyền None khi gọi cho
-    train_interactions.npy hoặc val/test_interactions.npy đầy đủ (không cần label)."""
+    train_interactions.npy hoặc val/test_interactions.npy đầy đủ (không cần label).
+
+    Cache cache.user_seq(uid) theo uid trong dict cục bộ — nhiều dòng trong interactions_arr
+    thuộc cùng 1 user (mỗi user thường có nhiều review), nếu không cache thì user_seq() bị
+    tính lại (slice + list-comprehension) mỗi dòng, biến vòng lặp 17M dòng train thành hàng
+    giờ. seq bất biến trong suốt hàm này (cache không thay đổi giữa các dòng) nên cache an toàn."""
     positives = []
-    for row in interactions_arr:
+    user_seq_cache = {}
+    for row in tqdm(interactions_arr, desc="Building positives"):
         uid = cache.user_vocab[int(row["user_idx"])]
         asin = cache.asin_vocab[int(row["item_idx"])]
         ts = int(row["timestamp"])
-        seq = cache.user_seq(uid)
+        seq = user_seq_cache.get(uid)
+        if seq is None:
+            seq = cache.user_seq(uid)
+            user_seq_cache[uid] = seq
         seq_before = [s for s in seq if s[0] <= cache.train_cutoff and s[0] < ts][-max_seq_len:]
         hard_neg_pool = [a for (_, a, r, _) in seq if r <= 2]
         positives.append((uid, asin, seq_before, hard_neg_pool, label))
