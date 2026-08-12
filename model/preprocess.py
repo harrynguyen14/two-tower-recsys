@@ -172,19 +172,45 @@ def sample_soft_negative(item_pos, category_leaf, decile_of, cat_decile_index, u
     4. Sample uniform 1 item.
 
     Trả về None nếu không tìm được candidate nào trong toàn bộ category_leaf đó (cực hiếm,
-    cần log lại tần suất khi chạy thật — xem Readme)."""
+    cần log lại tần suất khi chạy thật — xem Readme).
+
+    Rejection sampling thay vì materialize candidate set rồi sorted(): đo thật trên data
+    thật cho thấy radius=0 gần như luôn đủ (2000/2000 sample thử) nhưng bucket (leaf, decile)
+    trung bình có tới 34,016 asin — sorted(candidates) + set-subtract trên set cỡ đó chiếm
+    >99% thời gian __getitem__ (~40ms/sample), làm GPU idle chờ CPU build batch (xem
+    profile_getitem.py). user_seen chỉ ~10-50 phần tử nên random-pick-rồi-check-reject trực
+    tiếp trên list gốc của candidate_pool (không qua set/sort) gần như luôn trúng ngay lần
+    đầu — phân phối vẫn uniform trên đúng candidate universe cũ vì mọi phần tử hợp lệ có
+    xác suất được chọn bằng nhau, chỉ khác cách hiện thực."""
     leaf = category_leaf.get(item_pos)
     center_decile = decile_of.get(item_pos)
     if leaf is None or center_decile is None:
         return None
 
+    seen_deciles = set()
+    candidate_pool = []
     for radius in range(0, 10):
-        candidates = set()
-        for d in range(max(1, center_decile - radius), min(10, center_decile + radius) + 1):
-            candidates.update(cat_decile_index.get((leaf, d), []))
-        candidates -= user_seen
-        candidates.discard(item_pos)
-        if candidates:
-            candidates = sorted(candidates)  # deterministic trước khi sample
-            return candidates[rng.randrange(len(candidates))]
+        lo, hi = max(1, center_decile - radius), min(10, center_decile + radius)
+        for d in range(lo, hi + 1):
+            if d not in seen_deciles:
+                seen_deciles.add(d)
+                candidate_pool.extend(cat_decile_index.get((leaf, d), []))
+
+        if not candidate_pool:
+            continue
+
+        # Rejection sampling: random index trực tiếp trên list, retry nếu trúng
+        # user_seen/item_pos. Cap số lần thử để tránh vòng lặp vô hạn khi candidate_pool
+        # gần như hoàn toàn nằm trong user_seen (cực hiếm) — rơi xuống fallback set-based.
+        max_tries = min(50, len(candidate_pool) * 2)
+        for _ in range(max_tries):
+            pick = candidate_pool[rng.randrange(len(candidate_pool))]
+            if pick != item_pos and pick not in user_seen:
+                return pick
+
+        remaining = set(candidate_pool) - user_seen
+        remaining.discard(item_pos)
+        if remaining:
+            remaining = sorted(remaining)
+            return remaining[rng.randrange(len(remaining))]
     return None
