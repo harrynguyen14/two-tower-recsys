@@ -404,6 +404,16 @@ def main():
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
+    start_epoch = 0
+    best_auc = -1.0
+    if args.resume and Path(args.checkpoint_path).exists():
+        ckpt = torch.load(args.checkpoint_path, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        start_epoch = ckpt["epoch"] + 1
+        best_auc = ckpt.get("best_auc", -1.0)
+        print(f"Resumed from {args.checkpoint_path} at epoch {start_epoch} (best_auc={best_auc:.4f})")
+
     precomputed_item_vectors = PrecomputedItemVectors(model.item_tower, item_emb_store, device)
 
     if using_cache:
@@ -439,7 +449,7 @@ def main():
     test_warm_loader = DataLoader(make_dataset(test_warm_pos), batch_size=args.batch_size, shuffle=False, collate_fn=collate)
     test_cold_loader = DataLoader(make_dataset(test_cold_pos), batch_size=args.batch_size, shuffle=False, collate_fn=collate)
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         total_loss = 0.0
         for user_batch, pos_item_emb, neg_item_emb, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", leave=False):
@@ -460,6 +470,15 @@ def main():
         auc = f"{cold_metrics['auc']:.4f}" if cold_metrics["auc"] is not None else "n/a"
         pr_auc = f"{cold_metrics['pr_auc']:.4f}" if cold_metrics["pr_auc"] is not None else "n/a"
         print(f"  val_cold  AUC={auc}  PR-AUC={pr_auc}  (n={cold_metrics['n']})")
+
+        if cold_metrics["auc"] is not None and cold_metrics["auc"] > best_auc:
+            best_auc = cold_metrics["auc"]
+            torch.save({"model": model.state_dict(), "epoch": epoch, "best_auc": best_auc},
+                       args.best_checkpoint_path)
+            print(f"  -> new best (AUC={best_auc:.4f}), saved to {args.best_checkpoint_path}")
+
+        torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                    "epoch": epoch, "best_auc": best_auc}, args.checkpoint_path)
 
     print("\nFinal evaluation (val, đủ warm+cold):")
     print(format_report(run_eval_full(model, val_warm_loader, val_cold_loader, device)))

@@ -18,6 +18,12 @@ def parse_args():
                     help="Thư mục chứa metadata.npy/by_user.npy/train_interactions.npy/... "
                          "(xuất bởi model/preprocess_data/build_cache.py). None = tự quét lại "
                          "toàn bộ JSONL mỗi lần chạy (chậm, chỉ dùng khi chưa có cache).")
+    p.add_argument("--checkpoint-path", type=str, default="checkpoint.pt",
+                    help="File lưu model/optimizer state_dict + epoch sau mỗi epoch (để resume).")
+    p.add_argument("--best-checkpoint-path", type=str, default="best_model.pt",
+                    help="File lưu model state_dict mỗi khi val_cold AUC cải thiện.")
+    p.add_argument("--resume", action="store_true",
+                    help="Load lại --checkpoint-path (nếu tồn tại) và tiếp tục train từ epoch kế tiếp.")
 
     # sequence / user-tower (Readme: max_seq_len=10 đã chốt)
     p.add_argument("--max-seq-len", type=int, default=10)
