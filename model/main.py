@@ -12,7 +12,6 @@ lúc khởi động (xem PrecomputedItemVectors dưới), tương tự cách 1 e
 được "freeze" trong lúc dùng làm input sequence cho tower khác.
 """
 
-import pickle
 import random
 from pathlib import Path
 
@@ -428,32 +427,11 @@ def main():
     precomputed_item_vectors = PrecomputedItemVectors(model.item_tower, item_emb_store, device)
 
     if using_cache:
-        # build_positives_from_array quét toàn bộ train/val/test interactions (~17.5M dòng
-        # train) mất ~8 phút mỗi lần chạy — cache ra 1 file .pkl trong --cache-dir để lần
-        # sau (kể cả --resume) không phải build lại. Key theo max_seq_len vì kết quả phụ
-        # thuộc trực tiếp tham số này (seq_before bị cắt theo max_seq_len).
-        positives_cache_path = Path(args.positives_cache_dir) / f"positives_cache_seq{args.max_seq_len}.pkl"
-        if positives_cache_path.exists():
-            print(f"Loading cached positives from {positives_cache_path} ...")
-            with open(positives_cache_path, "rb") as f:
-                cached = pickle.load(f)
-            train_pos = cached["train_pos"]
-            val_warm_pos = cached["val_warm_pos"]
-            val_cold_pos = cached["val_cold_pos"]
-            test_warm_pos = cached["test_warm_pos"]
-            test_cold_pos = cached["test_cold_pos"]
-        else:
-            train_pos = build_positives_from_array(train_arr, cache, args.max_seq_len)
-            val_warm_pos = build_positives_from_array(val_warm_arr, cache, args.max_seq_len, label="warm")
-            val_cold_pos = build_positives_from_array(val_cold_arr, cache, args.max_seq_len, label="cold")
-            test_warm_pos = build_positives_from_array(test_warm_arr, cache, args.max_seq_len, label="warm")
-            test_cold_pos = build_positives_from_array(test_cold_arr, cache, args.max_seq_len, label="cold")
-            print(f"Caching positives to {positives_cache_path} ...")
-            with open(positives_cache_path, "wb") as f:
-                pickle.dump({
-                    "train_pos": train_pos, "val_warm_pos": val_warm_pos, "val_cold_pos": val_cold_pos,
-                    "test_warm_pos": test_warm_pos, "test_cold_pos": test_cold_pos,
-                }, f, protocol=pickle.HIGHEST_PROTOCOL)
+        train_pos = build_positives_from_array(train_arr, cache, args.max_seq_len)
+        val_warm_pos = build_positives_from_array(val_warm_arr, cache, args.max_seq_len, label="warm")
+        val_cold_pos = build_positives_from_array(val_cold_arr, cache, args.max_seq_len, label="cold")
+        test_warm_pos = build_positives_from_array(test_warm_arr, cache, args.max_seq_len, label="warm")
+        test_cold_pos = build_positives_from_array(test_cold_arr, cache, args.max_seq_len, label="cold")
     else:
         train_pos = build_positives(by_user, train_cutoff, val_cutoff, first_seen_by_item, "train", args.max_seq_len)
         val_pos = build_positives(by_user, train_cutoff, val_cutoff, first_seen_by_item, "val", args.max_seq_len)
