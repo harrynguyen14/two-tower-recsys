@@ -50,4 +50,3 @@ def format_report(result):
         pr_auc = f"{m['pr_auc']:.4f}" if m["pr_auc"] is not None else "n/a"
         lines.append(f"  {slice_name:<5} AUC={auc}  PR-AUC={pr_auc}  (n={m['n']})")
     return "\n".join(lines)
-    print(format_report(result))

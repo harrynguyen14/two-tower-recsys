@@ -96,7 +96,8 @@ class ColdStartDataset(Dataset):
     def __getitem__(self, idx):
         uid, item_pos, seq_before, hard_neg_pool, label = self.positives[idx]
 
-        seq_items = [self.precomputed_item_vectors.get([asin])[0].tolist() for _, asin, _, _ in seq_before]
+        seq_asins = [asin for _, asin, _, _ in seq_before]
+        seq_items = list(self.precomputed_item_vectors.get(seq_asins)) if seq_asins else []
         seq_ratings = [r for _, _, r, _ in seq_before]
 
         static = self.static_features_fn(uid)
@@ -149,14 +150,14 @@ def make_collate(item_emb_store, max_seq_len):
         pos_text, pos_image, pos_has_image = item_emb_store.get([b["pos_asin"] for b in batch])
         pos_item_emb = (pos_text, pos_image, pos_has_image)
 
-        neg_text_list, neg_image_list, neg_has_image_list = [], [], []
-        for b in batch:
-            t, i, h = item_emb_store.get(b["neg_asins"])
-            neg_text_list.append(t)
-            neg_image_list.append(i)
-            neg_has_image_list.append(h)
+        # 1 lệnh get() cho toàn bộ batch*K neg_asins thay vì loop Python gọi get() riêng mỗi
+        # sample — cùng bug round-trip nhỏ lẻ như seq_items đã sửa trước đó (mỗi lệnh get()
+        # tạo tensor + index riêng, nhân với batch_size chạy trong collate_fn/worker).
+        k = len(batch[0]["neg_asins"])
+        flat_neg_asins = [a for b in batch for a in b["neg_asins"]]
+        neg_text, neg_image, neg_has_image = item_emb_store.get(flat_neg_asins)
         neg_item_emb = (
-            torch.stack(neg_text_list), torch.stack(neg_image_list), torch.stack(neg_has_image_list)
+            neg_text.view(len(batch), k, -1), neg_image.view(len(batch), k, -1), neg_has_image.view(len(batch), k)
         )
 
         labels = [b["label"] for b in batch]
@@ -450,13 +451,17 @@ def main():
         )
 
     collate = make_collate(item_emb_store, args.max_seq_len)
-    train_loader = DataLoader(make_dataset(train_pos), batch_size=args.batch_size, shuffle=True, collate_fn=collate)
+    loader_kwargs = dict(
+        batch_size=args.batch_size, collate_fn=collate, num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"), persistent_workers=(args.num_workers > 0),
+    )
+    train_loader = DataLoader(make_dataset(train_pos), shuffle=True, **loader_kwargs)
     # val_cold_loader dùng MỖI EPOCH trong training loop (mục tiêu chính là cold-start).
     # val_warm/test_warm/test_cold chỉ dùng ở final evaluation sau khi train xong.
-    val_cold_loader = DataLoader(make_dataset(val_cold_pos), batch_size=args.batch_size, shuffle=False, collate_fn=collate)
-    val_warm_loader = DataLoader(make_dataset(val_warm_pos), batch_size=args.batch_size, shuffle=False, collate_fn=collate)
-    test_warm_loader = DataLoader(make_dataset(test_warm_pos), batch_size=args.batch_size, shuffle=False, collate_fn=collate)
-    test_cold_loader = DataLoader(make_dataset(test_cold_pos), batch_size=args.batch_size, shuffle=False, collate_fn=collate)
+    val_cold_loader = DataLoader(make_dataset(val_cold_pos), shuffle=False, **loader_kwargs)
+    val_warm_loader = DataLoader(make_dataset(val_warm_pos), shuffle=False, **loader_kwargs)
+    test_warm_loader = DataLoader(make_dataset(test_warm_pos), shuffle=False, **loader_kwargs)
+    test_cold_loader = DataLoader(make_dataset(test_cold_pos), shuffle=False, **loader_kwargs)
 
     for epoch in range(start_epoch, args.epochs):
         model.train()

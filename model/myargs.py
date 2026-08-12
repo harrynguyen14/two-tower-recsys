@@ -47,6 +47,9 @@ def parse_args():
 
     # training
     p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--num-workers", type=int, default=4,
+                    help="DataLoader worker process — song song hoá __getitem__ (soft-negative "
+                         "sampling + sequence lookup) trên CPU trong lúc GPU train batch trước.")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
