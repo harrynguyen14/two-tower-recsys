@@ -85,13 +85,24 @@ class ItemTower(nn.Module):
 
 class ItemEmbeddingStore:
     """Load text_embeddings.npy + image_embeddings.npy + has_image.npy (Giai đoạn 1,
-    xem model/preprocess_data/data.py) + mapping asin -> row index."""
+    xem model/preprocess_data/data.py) + mapping asin -> row index.
 
-    def __init__(self, npy_dir, asin_to_idx=None):
+    device: khi truyền (vd "cuda"), giữ luôn text/image_embeddings TRÊN GPU thay vì CPU
+    — .get() trả về gather trực tiếp trên GPU, loại bỏ hẳn round-trip CPU->GPU transfer
+    mỗi batch cho pos/neg item embeddings (tương tự cách NVTabular giữ toàn bộ tensor trên
+    GPU xuyên suốt training). Với model nhẹ, transfer PCIe mỗi batch chiếm tỷ trọng lớn
+    hơn hẳn compute — đây là chỗ đáng tối ưu nhất.
+
+    RÀNG BUỘC: chỉ dùng được với num_workers=0 — CUDA tensor không thể chia sẻ an toàn
+    qua DataLoader worker process khác (mỗi worker có CUDA context riêng, không kế thừa
+    được tensor GPU từ main process qua fork/pickle). main.py tự enforce điều này."""
+
+    def __init__(self, npy_dir, asin_to_idx=None, device=None):
         npy_dir = str(npy_dir)
-        self.text_embeddings = torch.from_numpy(np.load(f"{npy_dir}/text_embeddings.npy")).float()
-        self.image_embeddings = torch.from_numpy(np.load(f"{npy_dir}/image_embeddings.npy")).float()
-        self.has_image = torch.from_numpy(np.load(f"{npy_dir}/has_image.npy"))
+        self.device = device
+        self.text_embeddings = torch.from_numpy(np.load(f"{npy_dir}/text_embeddings.npy")).float().to(device)
+        self.image_embeddings = torch.from_numpy(np.load(f"{npy_dir}/image_embeddings.npy")).float().to(device)
+        self.has_image = torch.from_numpy(np.load(f"{npy_dir}/has_image.npy")).to(device)
 
         if asin_to_idx is None:
             with open(f"{npy_dir}/asin_to_idx.json", encoding="utf-8") as f:
@@ -107,5 +118,5 @@ class ItemEmbeddingStore:
         return self.image_embeddings.shape[1]
 
     def get(self, asins):
-        idx = torch.tensor([self.asin_to_idx[a] for a in asins], dtype=torch.long)
+        idx = torch.tensor([self.asin_to_idx[a] for a in asins], dtype=torch.long, device=self.device)
         return self.text_embeddings[idx], self.image_embeddings[idx], self.has_image[idx]

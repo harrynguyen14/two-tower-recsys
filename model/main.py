@@ -51,8 +51,9 @@ class PrecomputedItemVectors:
                 batch_asins = all_asins[start:start + batch_size]
                 text_emb, image_emb, has_image = item_emb_store.get(batch_asins)
                 vec = item_tower(text_emb.to(device), image_emb.to(device), has_image.to(device))
-                vectors.append(vec.cpu())
-        self.vectors = torch.cat(vectors, dim=0)  # [n_items, item_out_dim]
+                vectors.append(vec)  # giữ trên device — không .cpu() nữa (xem docstring lớp)
+        self.vectors = torch.cat(vectors, dim=0)  # [n_items, item_out_dim], trên device
+        self.device = device
         self.asin_to_idx = {a: i for i, a in enumerate(all_asins)}
 
     @property
@@ -60,7 +61,7 @@ class PrecomputedItemVectors:
         return self.vectors.shape[1]
 
     def get(self, asins):
-        idx = torch.tensor([self.asin_to_idx[a] for a in asins], dtype=torch.long)
+        idx = torch.tensor([self.asin_to_idx[a] for a in asins], dtype=torch.long, device=self.device)
         return self.vectors[idx]
 
 
@@ -137,15 +138,20 @@ class ColdStartDataset(Dataset):
         }
 
 
-def make_collate(item_emb_store, max_seq_len):
+def make_collate(item_emb_store, max_seq_len, item_out_dim, device=None):
     def collate(batch):
         seq_items = [b["seq_items"] for b in batch]
         seq_ratings = [b["seq_ratings"] for b in batch]
-        item_embs, mask = pad_and_mask(seq_items, max_seq_len)
-        ratings, _ = pad_and_mask(seq_ratings, max_seq_len)
+        # vector_dim=item_out_dim tường minh (không đoán qua sample không rỗng) — batch có
+        # thể toàn user N=0 lịch sử (mọi seq_items rỗng), lúc đó không còn sample nào để suy
+        # luận dim, dẫn tới item_embs 2D thay vì 3D và crash ở SequenceEncoder (bug thật).
+        # device=device: seq_items là Tensor GPU (precomputed_item_vectors giữ trên GPU),
+        # padded/mask phải cùng device để torch.stack không lỗi mismatch.
+        item_embs, mask = pad_and_mask(seq_items, max_seq_len, vector_dim=item_out_dim, device=device)
+        ratings, _ = pad_and_mask(seq_ratings, max_seq_len, device=device)
 
-        static_features = torch.tensor([b["static"] for b in batch], dtype=torch.float32)
-        cat_dist = torch.tensor([b["cat_dist"] for b in batch], dtype=torch.float32)
+        static_features = torch.tensor([b["static"] for b in batch], dtype=torch.float32, device=device)
+        cat_dist = torch.tensor([b["cat_dist"] for b in batch], dtype=torch.float32, device=device)
 
         pos_text, pos_image, pos_has_image = item_emb_store.get([b["pos_asin"] for b in batch])
         pos_item_emb = (pos_text, pos_image, pos_has_image)
@@ -418,9 +424,20 @@ def main():
             "has_image.npy/asin_to_idx.json (Giai đoạn 1, xem model/preprocess_data/data.py). "
             "Pipeline này không tự encode ảnh/text."
         )
-    item_emb_store = ItemEmbeddingStore(args.item_emb_dir)
-
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda" and args.num_workers > 0:
+        raise SystemExit(
+            "--num-workers > 0 không tương thích với item embeddings trên GPU: mỗi "
+            "DataLoader worker là process riêng, không thể chia sẻ CUDA tensor với main "
+            "process (CUDA context không kế thừa qua fork/pickle). Chạy với --num-workers 0 "
+            "khi dùng GPU (item_emb_store giờ luôn load thẳng lên device để loại bỏ "
+            "CPU->GPU transfer mỗi batch — model nhẹ nên transfer PCIe là bottleneck chính, "
+            "không phải compute)."
+        )
+    # item_emb_store load thẳng lên device (không phải CPU rồi .to() mỗi batch) — xem
+    # docstring ItemEmbeddingStore. Yêu cầu num_workers=0 (enforce ở trên).
+    item_emb_store = ItemEmbeddingStore(args.item_emb_dir, device=device)
+
     model = TwoTowerModel(
         item_tower_kwargs=dict(text_dim=item_emb_store.text_dim, image_dim=item_emb_store.image_dim,
                                 out_dim=args.item_out_dim, mlp_hidden_dim=args.mlp_hidden_dim,
@@ -470,10 +487,14 @@ def main():
             args.n_hard_neg, args.n_soft_neg, seed=args.seed,
         )
 
-    collate = make_collate(item_emb_store, args.max_seq_len)
+    collate = make_collate(item_emb_store, args.max_seq_len, args.item_out_dim, device=device)
+    # pin_memory=False: batch giờ được build thẳng trên GPU trong collate_fn (item_emb_store
+    # + precomputed_item_vectors giữ trên device, num_workers=0 bắt buộc — xem enforce ở
+    # trên) — không còn CPU tensor nào cần pin để transfer async nữa, pin_memory=True lúc
+    # này vô nghĩa (hoặc lỗi khi PyTorch cố pin tensor đã ở GPU).
     loader_kwargs = dict(
         batch_size=args.batch_size, collate_fn=collate, num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"), persistent_workers=(args.num_workers > 0),
+        pin_memory=False, persistent_workers=(args.num_workers > 0),
         prefetch_factor=(args.prefetch_factor if args.num_workers > 0 else None),
     )
     # val_warm/test_warm/test_cold chỉ dùng 1 lần (final eval) — num_workers thấp hơn,
