@@ -64,6 +64,10 @@ def parse_args():
                          "data loading (bottleneck riêng, xem --num-workers).")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--log-every", type=int, default=50,
+                    help="In loss (+ GPU util nếu cuda) mỗi N step trong lúc train, thay vì "
+                         "chỉ biết train_loss trung bình ở cuối epoch (epoch dài hàng giờ thì "
+                         "quá chậm để debug NaN/theo dõi tiến độ theo cách đó).")
     p.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
     p.add_argument("--seed", type=int, default=0)
 

@@ -25,10 +25,7 @@ from preprocess import (
     load_reviews_by_user,
     load_item_meta,
     compute_cutoffs,
-    compute_popularity_deciles,
     compute_static_features,
-    build_category_decile_index,
-    sample_soft_negative,
 )
 from item_tower import ItemEmbeddingStore
 from two_tower_model import TwoTowerModel, info_nce_loss
@@ -67,28 +64,30 @@ class PrecomputedItemVectors:
 
 class ColdStartDataset(Dataset):
     """1 sample = 1 positive (user, item_pos, rating>=4) + sequence lịch sử trước item_pos
-    + N_HARD_NEG hard-negative (rating<=2 thật của chính user đó) + N_SOFT_NEG soft-negative
-    (thuật toán đã chốt, preprocess.sample_soft_negative).
+    + N_HARD_NEG hard-negative (rating<=2 thật của chính user đó). Soft-negative KHÔNG còn
+    sample ở đây nữa — chuyển sang uniform random trong collate_fn (xem make_collate), theo
+    đúng cách NVIDIA Merlin/Mixed Negative Sampling (Yang et al., WWW'20) làm: uniform random
+    negative + in-batch negative, KHÔNG dùng rejection sampling category/popularity-decile
+    per-sample. Lý do đổi (bug hiệu năng thật đã gặp): sample_soft_negative dù đã tối ưu
+    (rejection sampling, không sort/set) vẫn là Python loop per-sample chạy N_SOFT_NEG lần
+    MỖI sample — với num_workers=0 bắt buộc (GPU embedding, xem ItemEmbeddingStore), đây là
+    bottleneck chính khiến 1 epoch ~6h dù model rất nhẹ (GPU util chỉ ~6%). Merlin đạt tốc độ
+    cao vì KHÔNG làm rejection sampling có điều kiện — chấp nhận negative "thô" hơn (uniform
+    + in-batch) đổi lấy vector hoá hoàn toàn, không còn vòng lặp Python nào trong đường train.
 
     user_seq_fn(uid) -> list[(ts, asin, rating, helpful_vote)], static_features_fn(uid) ->
     dict|None: callable, nhận CacheAccessor.user_seq/static_features_of khi có --cache-dir,
     hoặc by_user.__getitem__/static_features.get khi tự quét JSONL — cùng 1 Dataset dùng
-    được cho cả 2 nguồn. category_leaf/decile_of vẫn là dict thật (1.59M entry — đủ nhỏ để
-    giữ trong RAM, không như by_user 5.6M user từng gây MemoryError, xem build_cache.py)."""
+    được cho cả 2 nguồn."""
 
-    def __init__(self, positives, static_features_fn, category_leaf, decile_of,
-                 cat_decile_index, item_emb_store, precomputed_item_vectors,
-                 category_vocab_size, n_hard_neg, n_soft_neg, seed=0):
+    def __init__(self, positives, static_features_fn, category_vocab_size,
+                 item_emb_store, precomputed_item_vectors, n_hard_neg, seed=0):
         self.positives = positives  # list[(uid, item_pos, seq_before, hard_neg_pool, label)]
         self.static_features_fn = static_features_fn
-        self.category_leaf = category_leaf
-        self.decile_of = decile_of
-        self.cat_decile_index = cat_decile_index
         self.item_emb_store = item_emb_store
         self.precomputed_item_vectors = precomputed_item_vectors
         self.category_vocab_size = category_vocab_size
         self.n_hard_neg = n_hard_neg
-        self.n_soft_neg = n_soft_neg
         self.rng = random.Random(seed)
 
     def __len__(self):
@@ -110,22 +109,11 @@ class ColdStartDataset(Dataset):
                           static["total_reviews"], static["avg_page_count"]]
             cat_dist = static["category_distribution"]
 
-        user_seen = {asin for _, asin, _, _ in seq_before} | {item_pos}
         hard_negs = self.rng.sample(hard_neg_pool, min(len(hard_neg_pool), self.n_hard_neg))
         while len(hard_negs) < self.n_hard_neg and hard_neg_pool:
             hard_negs.append(self.rng.choice(hard_neg_pool))
-
-        soft_negs = []
-        for _ in range(self.n_soft_neg):
-            neg = sample_soft_negative(
-                item_pos, self.category_leaf, self.decile_of, self.cat_decile_index,
-                user_seen, self.rng,
-            )
-            soft_negs.append(neg)
-
-        neg_asins = [a for a in (hard_negs + soft_negs) if a is not None]
-        while len(neg_asins) < self.n_hard_neg + self.n_soft_neg:
-            neg_asins.append(item_pos)  # fallback cực hiếm — xem Readme mục Soft-negative
+        while len(hard_negs) < self.n_hard_neg:
+            hard_negs.append(item_pos)  # fallback cực hiếm — user không có hard-neg nào
 
         return {
             "seq_items": seq_items,
@@ -133,12 +121,18 @@ class ColdStartDataset(Dataset):
             "static": static_vec,
             "cat_dist": cat_dist,
             "pos_asin": item_pos,
-            "neg_asins": neg_asins,
+            "hard_neg_asins": hard_negs,  # soft-negative sample uniform random ở collate_fn
             "label": label,  # "cold" | "warm" — chỉ dùng lúc eval (xem Readme Temporal split)
         }
 
 
-def make_collate(item_emb_store, max_seq_len, item_out_dim, device=None):
+def make_collate(item_emb_store, max_seq_len, item_out_dim, n_soft_neg, device=None):
+    """n_soft_neg: số uniform-random negative thêm vào MỖI sample, sample VECTOR HOÁ 1 lần
+    cho cả batch bằng torch.randint (xem lý do đổi từ sample_soft_negative per-sample sang
+    uniform random ở docstring ColdStartDataset — kỹ thuật NVIDIA Merlin/Mixed Negative
+    Sampling). Không loại trừ item_pos/user_seen khi sample (khác hẳn rejection sampling cũ)
+    — chấp nhận hiếm khi trúng false negative, đổi lấy vector hoá hoàn toàn: xác suất trùng
+    ~n_soft_neg/n_items cực nhỏ với catalog lớn (Merlin cũng chấp nhận đánh đổi này)."""
     def collate(batch):
         seq_items = [b["seq_items"] for b in batch]
         seq_ratings = [b["seq_ratings"] for b in batch]
@@ -156,15 +150,36 @@ def make_collate(item_emb_store, max_seq_len, item_out_dim, device=None):
         pos_text, pos_image, pos_has_image = item_emb_store.get([b["pos_asin"] for b in batch])
         pos_item_emb = (pos_text, pos_image, pos_has_image)
 
-        # 1 lệnh get() cho toàn bộ batch*K neg_asins thay vì loop Python gọi get() riêng mỗi
-        # sample — cùng bug round-trip nhỏ lẻ như seq_items đã sửa trước đó (mỗi lệnh get()
-        # tạo tensor + index riêng, nhân với batch_size chạy trong collate_fn/worker).
-        k = len(batch[0]["neg_asins"])
-        flat_neg_asins = [a for b in batch for a in b["neg_asins"]]
-        neg_text, neg_image, neg_has_image = item_emb_store.get(flat_neg_asins)
-        neg_item_emb = (
-            neg_text.view(len(batch), k, -1), neg_image.view(len(batch), k, -1), neg_has_image.view(len(batch), k)
-        )
+        # Hard-negative: vẫn 1 lệnh get() cho toàn bộ batch*n_hard_neg (đã tối ưu trước đó,
+        # xem comment gốc — mỗi get() riêng lẻ tạo tensor + index nhân với batch_size).
+        batch_size = len(batch)
+        n_hard_neg = len(batch[0]["hard_neg_asins"])
+        flat_hard_asins = [a for b in batch for a in b["hard_neg_asins"]]
+        hard_text, hard_image, hard_has_image = item_emb_store.get(flat_hard_asins)
+
+        # Soft-negative: uniform random index vào TOÀN BỘ catalog, sample 1 lần cho cả batch
+        # bằng torch.randint — không còn vòng lặp Python/rejection sampling nào (khác biệt
+        # cốt lõi so với sample_soft_negative cũ, xem docstring hàm).
+        soft_idx = torch.randint(0, item_emb_store.n_items, (batch_size * n_soft_neg,),
+                                  device=item_emb_store.device)
+        soft_text, soft_image, soft_has_image = item_emb_store.get_by_idx(soft_idx)
+
+        # Reshape RIÊNG từng phần về (batch, n_x, dim) trước khi cat theo dim=1 (chiều K) —
+        # cat trực tiếp theo dim=0 rồi view(batch, k, -1) sẽ sai thứ tự (buffer phẳng
+        # [tất cả hard của mọi sample][tất cả soft của mọi sample] không tương ứng
+        # 1-1 với [sample_i: hard rồi soft] mà view ngầm giả định — bug thật phát hiện khi
+        # tự kiểm tra lại logic, chưa từng chạy).
+        hard_text = hard_text.view(batch_size, n_hard_neg, -1)
+        hard_image = hard_image.view(batch_size, n_hard_neg, -1)
+        hard_has_image = hard_has_image.view(batch_size, n_hard_neg)
+        soft_text = soft_text.view(batch_size, n_soft_neg, -1)
+        soft_image = soft_image.view(batch_size, n_soft_neg, -1)
+        soft_has_image = soft_has_image.view(batch_size, n_soft_neg)
+
+        neg_text = torch.cat([hard_text, soft_text], dim=1)  # [batch, n_hard+n_soft, dim]
+        neg_image = torch.cat([hard_image, soft_image], dim=1)
+        neg_has_image = torch.cat([hard_has_image, soft_has_image], dim=1)
+        neg_item_emb = (neg_text, neg_image, neg_has_image)
 
         labels = [b["label"] for b in batch]
 
@@ -374,12 +389,12 @@ def main():
     if using_cache:
         print(f"Loading preprocess cache from {args.cache_dir} ...")
         cache = CacheAccessor(args.cache_dir)
-        # category_leaf/decile_of dựng lại dạng dict (~1.59M entry, an toàn RAM — khác hẳn
-        # by_user 5.6M user đã gây MemoryError, xem build_cache.py) để tái dùng đúng
-        # preprocess.sample_soft_negative/build_category_decile_index không sửa API.
+        # category_leaf dựng lại dạng dict (~1.59M entry, an toàn RAM — khác hẳn by_user
+        # 5.6M user đã gây MemoryError, xem build_cache.py) — chỉ còn dùng cho
+        # category_vocab/category_distribution, KHÔNG còn cho soft-negative sampling nữa
+        # (đã đổi sang uniform random trong make_collate, xem ColdStartDataset). decile_of/
+        # cat_decile_index (chỉ phục vụ sample_soft_negative cũ) đã bỏ hẳn.
         category_leaf = {asin: cache.category_of(asin) for asin in cache.asin_vocab}
-        decile_of = {asin: cache.decile_of_asin(asin) for asin in cache.asin_vocab}
-        cat_decile_index = build_category_decile_index(category_leaf, decile_of)
         category_vocab = cache.category_vocab
         train_cutoff, val_cutoff = cache.train_cutoff, cache.val_cutoff
         static_features_fn = cache.static_features_of
@@ -398,10 +413,8 @@ def main():
               f"test_warm={len(test_warm_arr):,} test_cold={len(test_cold_arr):,})")
     else:
         print("Loading reviews + meta (no --cache-dir, quét lại toàn bộ JSONL — chậm)...")
-        by_user, sorted_ts, item_review_count = load_reviews_by_user()
+        by_user, sorted_ts, _ = load_reviews_by_user()
         category_leaf, page_count = load_item_meta()
-        decile_of = compute_popularity_deciles(item_review_count)
-        cat_decile_index = build_category_decile_index(category_leaf, decile_of)
         category_vocab = sorted(set(category_leaf.values()))
 
         train_cutoff, val_cutoff = compute_cutoffs(sorted_ts)
@@ -482,12 +495,12 @@ def main():
 
     def make_dataset(positives):
         return ColdStartDataset(
-            positives, static_features_fn, category_leaf, decile_of, cat_decile_index,
-            item_emb_store, precomputed_item_vectors, len(category_vocab),
-            args.n_hard_neg, args.n_soft_neg, seed=args.seed,
+            positives, static_features_fn, len(category_vocab),
+            item_emb_store, precomputed_item_vectors, args.n_hard_neg, seed=args.seed,
         )
 
-    collate = make_collate(item_emb_store, args.max_seq_len, args.item_out_dim, device=device)
+    collate = make_collate(item_emb_store, args.max_seq_len, args.item_out_dim,
+                            args.n_soft_neg, device=device)
     # pin_memory=False: batch giờ được build thẳng trên GPU trong collate_fn (item_emb_store
     # + precomputed_item_vectors giữ trên device, num_workers=0 bắt buộc — xem enforce ở
     # trên) — không còn CPU tensor nào cần pin để transfer async nữa, pin_memory=True lúc
@@ -516,9 +529,13 @@ def main():
     use_amp = args.amp and device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
+    log_every = args.log_every
+
     for epoch in range(start_epoch, args.epochs):
         model.train()
         total_loss = 0.0
+        running_loss = 0.0  # tổng loss trong window hiện tại (reset mỗi lần log, xem dưới)
+        n_in_window = 0  # số step đã cộng vào running_loss kể từ lần reset gần nhất
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", leave=False)
         for step, (user_batch, pos_item_emb, neg_item_emb, _) in enumerate(pbar):
             user_batch = {k: v.to(device, non_blocking=True) for k, v in user_batch.items()}
@@ -534,10 +551,37 @@ def main():
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-            total_loss += loss.item()
+            loss_value = loss.item()
+            total_loss += loss_value
+            running_loss += loss_value
+            n_in_window += 1
 
-            if device.type == "cuda" and step % 20 == 0:
-                pbar.set_postfix(gpu=gpu_util_str(device), refresh=False)
+            if not torch.isfinite(loss).item():
+                # Dừng NGAY khi thấy NaN/Inf thay vì chạy hết epoch (có thể mất hàng giờ) rồi
+                # mới biết qua train_loss trung bình cuối epoch — với epoch ~6h, phát hiện
+                # sớm ở đúng step tiết kiệm rất nhiều thời gian debug (bug thật đã gặp:
+                # train_loss=nan chỉ lộ ra ở cuối epoch 1, sau khi đã chạy xong toàn bộ).
+                raise SystemExit(
+                    f"Loss không hữu hạn ({loss_value}) ở epoch {epoch+1} step {step} "
+                    f"— dừng ngay để debug thay vì chạy tiếp lãng phí thời gian."
+                )
+
+            # Log mỗi log_every step: postfix của tqdm (xem tại chỗ, mất khi cell scroll) +
+            # print() xuống dòng thật (giữ lại trong log/output cell Kaggle để xem lại sau).
+            # n_in_window đếm tường minh số step kể từ lần reset gần nhất — không suy luận
+            # từ step % log_every (bug đã gặp khi viết: tại đúng step chia hết log_every,
+            # step % log_every luôn = 0 nên biểu thức đó luôn ra 1, sai hoàn toàn cho các
+            # window sau lần đầu).
+            if n_in_window == log_every or step == 0:
+                avg_running = running_loss / n_in_window
+                postfix = dict(loss=f"{loss_value:.4f}", avg=f"{avg_running:.4f}")
+                if device.type == "cuda":
+                    postfix["gpu"] = gpu_util_str(device)
+                pbar.set_postfix(postfix, refresh=False)
+                print(f"  Epoch {epoch+1} step {step}/{len(train_loader)}  "
+                      f"loss={loss_value:.4f}  avg_loss={avg_running:.4f}")
+                running_loss = 0.0
+                n_in_window = 0
 
         print(f"Epoch {epoch+1}/{args.epochs}  train_loss={total_loss/len(train_loader):.4f}")
         cold_metrics = run_eval_cold(model, val_cold_loader, device)

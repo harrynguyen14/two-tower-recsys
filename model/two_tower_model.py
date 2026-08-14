@@ -54,6 +54,16 @@ class TwoTowerModel(torch.nn.Module):
         )
         neg_vectors = neg_flat.reshape(batch, k, -1)  # [batch, K, out_dim]
 
+        # L2-normalize trước khi trả về — InfoNCE/contrastive chuẩn dùng cosine similarity
+        # (dot product của vector ĐÃ normalize), không phải dot product thô trên vector MLP
+        # output tuỳ ý norm. Thiếu normalize: (1) dot_product/temperature (temperature=0.1,
+        # rất nhỏ) có thể vượt dải float16 (~65504) khi norm vector lớn -> NaN ngay cả
+        # KHÔNG có in_batch_neg (bug gốc thật, độc lập với bug -inf ở info_nce_loss); (2) độ
+        # lớn embedding không kiểm soát khiến loss scale không ổn định giữa các batch.
+        user_vector = F.normalize(user_vector, dim=-1)
+        pos_vector = F.normalize(pos_vector, dim=-1)
+        neg_vectors = F.normalize(neg_vectors, dim=-1)
+
         return user_vector, pos_vector, neg_vectors
 
 
@@ -79,7 +89,12 @@ def info_nce_loss(user_vector, pos_vector, neg_vectors, temperature=0.1, use_in_
         batch = user_vector.size(0)
         in_batch_scores = (user_vector @ pos_vector.t()) / temperature  # [batch, batch]
         diag_mask = torch.eye(batch, dtype=torch.bool, device=user_vector.device)
-        in_batch_scores = in_batch_scores.masked_fill(diag_mask, float("-inf"))
+        # float("-inf") thật gây train_loss=nan dưới torch.autocast (float16 không biểu
+        # diễn -inf ổn định qua log_softmax nội bộ của cross_entropy — bug thật đã gặp).
+        # Dùng torch.finfo(dtype).min (số âm hữu hạn lớn nhất có thể) thay thế — vẫn đủ để
+        # softmax gán xác suất ~0 cho vị trí bị mask, nhưng an toàn dưới cả fp16 lẫn fp32.
+        neg_inf = torch.finfo(in_batch_scores.dtype).min
+        in_batch_scores = in_batch_scores.masked_fill(diag_mask, neg_inf)
         logits.append(in_batch_scores)
 
     logits = torch.cat(logits, dim=1)  # [batch, 1+K(+batch)], vị trí 0 = positive

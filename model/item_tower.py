@@ -119,4 +119,16 @@ class ItemEmbeddingStore:
 
     def get(self, asins):
         idx = torch.tensor([self.asin_to_idx[a] for a in asins], dtype=torch.long, device=self.device)
+        return self.get_by_idx(idx)
+
+    def get_by_idx(self, idx):
+        """Gather trực tiếp bằng index integer (Tensor hoặc array-like), bỏ qua bước tra
+        asin_to_idx — dùng cho uniform random negative sampling (index sinh ra thẳng bằng
+        torch.randint trên collate_fn, không có asin string nào để tra, xem make_collate)."""
+        if not torch.is_tensor(idx):
+            idx = torch.tensor(idx, dtype=torch.long, device=self.device)
         return self.text_embeddings[idx], self.image_embeddings[idx], self.has_image[idx]
+
+    @property
+    def n_items(self):
+        return self.text_embeddings.shape[0]
