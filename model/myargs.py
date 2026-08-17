@@ -63,6 +63,13 @@ def parse_args():
                          "— tận dụng Tensor Core trên GPU (T4/V100+), không ảnh hưởng "
                          "data loading (bottleneck riêng, xem --num-workers).")
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--warmup-steps", type=int, default=500,
+                    help="Số step LR tăng tuyến tính từ 0 lên --lr, sau đó cosine decay về 0 "
+                         "hết training — chuẩn cho contrastive loss (CLIP/SimCLR đều dùng). "
+                         "Tránh gradient explosion ở vài chục step đầu khi weight còn random "
+                         "và LR full ngay từ đầu (nguyên nhân NaN thật đã gặp, xem "
+                         "clip_grad_norm_ trong main.py — 2 biện pháp bổ trợ nhau, không "
+                         "thay thế nhau).")
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--log-every", type=int, default=50,
                     help="In loss (+ GPU util nếu cuda) mỗi N step trong lúc train, thay vì "

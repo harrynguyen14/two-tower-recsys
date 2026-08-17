@@ -466,12 +466,14 @@ def main():
 
     start_epoch = 0
     best_auc = -1.0
+    resume_ckpt = None  # giữ lại để load scheduler.state_dict sau khi scheduler được tạo
+                         # (scheduler cần len(train_loader), tạo sau đoạn resume model/optimizer)
     if args.resume and Path(args.checkpoint_path).exists():
-        ckpt = torch.load(args.checkpoint_path, map_location=device)
-        model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        start_epoch = ckpt["epoch"] + 1
-        best_auc = ckpt.get("best_auc", -1.0)
+        resume_ckpt = torch.load(args.checkpoint_path, map_location=device)
+        model.load_state_dict(resume_ckpt["model"])
+        optimizer.load_state_dict(resume_ckpt["optimizer"])
+        start_epoch = resume_ckpt["epoch"] + 1
+        best_auc = resume_ckpt.get("best_auc", -1.0)
         print(f"Resumed from {args.checkpoint_path} at epoch {start_epoch} (best_auc={best_auc:.4f})")
 
     precomputed_item_vectors = PrecomputedItemVectors(model.item_tower, item_emb_store, device)
@@ -526,18 +528,44 @@ def main():
     test_warm_loader = DataLoader(make_dataset(test_warm_pos), shuffle=False, **eval_loader_kwargs)
     test_cold_loader = DataLoader(make_dataset(test_cold_pos), shuffle=False, **eval_loader_kwargs)
 
+    # LR schedule: warmup tuyến tính (0 -> args.lr trong args.warmup_steps step đầu) rồi
+    # cosine decay (args.lr -> 0 hết các step còn lại) — chuẩn contrastive learning
+    # (CLIP/SimCLR). Bổ trợ cho clip_grad_norm_ (không thay thế): warmup tránh việc LR full
+    # ngay từ step 0 khi weight còn random dễ gây gradient lớn (nguyên nhân NaN thật đã gặp,
+    # loss giảm bất thường nhanh rồi NaN quanh step 185).
+    total_steps = len(train_loader) * args.epochs
+    warmup_steps = min(args.warmup_steps, total_steps)
+
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.5 * (1.0 + torch.cos(torch.tensor(progress * 3.141592653589793)).item())
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    if resume_ckpt is not None and "scheduler" in resume_ckpt:
+        scheduler.load_state_dict(resume_ckpt["scheduler"])
+
     use_amp = args.amp and device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     log_every = args.log_every
+
+    # 1 progress bar DUY NHẤT xuyên suốt toàn bộ training (giống HuggingFace Trainer) —
+    # thay vì tqdm mới mỗi epoch (nhìn như nhiều thanh bar nối tiếp nhau). Log (loss/lr/gpu)
+    # in bằng tqdm.write() phía TRÊN bar thay vì print() thường — print() thường sẽ chen vào
+    # giữa bar đang render và làm hỏng layout terminal (bar bị lặp/nhảy dòng lộn xộn).
+    pbar = tqdm(total=total_steps, desc="Training", initial=start_epoch * len(train_loader))
+    last_auc = None  # AUC val_cold gần nhất — chỉ tính cuối mỗi epoch (xem run_eval_cold),
+                      # log theo step vẫn hiển thị giá trị này để luôn thấy AUC mới nhất
 
     for epoch in range(start_epoch, args.epochs):
         model.train()
         total_loss = 0.0
         running_loss = 0.0  # tổng loss trong window hiện tại (reset mỗi lần log, xem dưới)
         n_in_window = 0  # số step đã cộng vào running_loss kể từ lần reset gần nhất
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", leave=False)
-        for step, (user_batch, pos_item_emb, neg_item_emb, _) in enumerate(pbar):
+        pbar.set_description(f"Epoch {epoch+1}/{args.epochs}")
+        for step, (user_batch, pos_item_emb, neg_item_emb, _) in enumerate(train_loader):
             user_batch = {k: v.to(device, non_blocking=True) for k, v in user_batch.items()}
             pos_item_emb = to_device(pos_item_emb, device)
             neg_item_emb = to_device(neg_item_emb, device)
@@ -549,8 +577,18 @@ def main():
                                       use_in_batch_neg=args.in_batch_neg)
 
             scaler.scale(loss).backward()
+            # Gradient clipping — thiếu bước này là nguyên nhân NaN thật đã gặp (loss giảm
+            # rất nhanh vài chục step đầu rồi NaN đột ngột: dấu hiệu điển hình gradient
+            # explosion, không phải lỗi numeric overflow như 2 bug trước ở info_nce_loss).
+            # unscale_ TRƯỚC khi clip vì scaler.scale() đã nhân loss lên hệ số lớn cho AMP —
+            # clip trên gradient CHƯA unscale sẽ clip sai ngưỡng (ngưỡng thật bị nhân theo
+            # scale factor, max_norm=1.0 gần như luôn bị vi phạm/vô nghĩa).
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
             scaler.step(optimizer)
             scaler.update()
+            scheduler.step()
+            pbar.update(1)
             loss_value = loss.item()
             total_loss += loss_value
             running_loss += loss_value
@@ -566,37 +604,46 @@ def main():
                     f"— dừng ngay để debug thay vì chạy tiếp lãng phí thời gian."
                 )
 
-            # Log mỗi log_every step: postfix của tqdm (xem tại chỗ, mất khi cell scroll) +
-            # print() xuống dòng thật (giữ lại trong log/output cell Kaggle để xem lại sau).
+            # Log mỗi log_every step: postfix của tqdm (xem tại chỗ) + pbar.write() in dòng
+            # thật PHÍA TRÊN bar (giữ log lại trong output cell Kaggle để xem sau) — dùng
+            # pbar.write() thay vì print() thường vì print() sẽ chen ngang bar đang render và
+            # làm hỏng layout terminal (bar bị lặp dòng/nhảy lộn xộn, xem comment ở pbar).
             # n_in_window đếm tường minh số step kể từ lần reset gần nhất — không suy luận
             # từ step % log_every (bug đã gặp khi viết: tại đúng step chia hết log_every,
             # step % log_every luôn = 0 nên biểu thức đó luôn ra 1, sai hoàn toàn cho các
             # window sau lần đầu).
             if n_in_window == log_every or step == 0:
                 avg_running = running_loss / n_in_window
-                postfix = dict(loss=f"{loss_value:.4f}", avg=f"{avg_running:.4f}")
+                auc_str = f"{last_auc:.4f}" if last_auc is not None else "n/a"
+                postfix = dict(loss=f"{loss_value:.4f}", avg=f"{avg_running:.4f}",
+                                grad_norm=f"{grad_norm:.4f}", auc=auc_str)
                 if device.type == "cuda":
                     postfix["gpu"] = gpu_util_str(device)
                 pbar.set_postfix(postfix, refresh=False)
-                print(f"  Epoch {epoch+1} step {step}/{len(train_loader)}  "
-                      f"loss={loss_value:.4f}  avg_loss={avg_running:.4f}")
+                pbar.write(f"  Epoch {epoch+1} step {step}/{len(train_loader)}  "
+                           f"loss={loss_value:.4f}  avg_loss={avg_running:.4f}  "
+                           f"grad_norm={grad_norm:.4f}  val_cold_auc={auc_str}")
                 running_loss = 0.0
                 n_in_window = 0
 
-        print(f"Epoch {epoch+1}/{args.epochs}  train_loss={total_loss/len(train_loader):.4f}")
+        pbar.write(f"Epoch {epoch+1}/{args.epochs}  train_loss={total_loss/len(train_loader):.4f}")
         cold_metrics = run_eval_cold(model, val_cold_loader, device)
+        last_auc = cold_metrics["auc"]  # log per-step sẽ dùng giá trị này cho đến epoch kế
         auc = f"{cold_metrics['auc']:.4f}" if cold_metrics["auc"] is not None else "n/a"
         pr_auc = f"{cold_metrics['pr_auc']:.4f}" if cold_metrics["pr_auc"] is not None else "n/a"
-        print(f"  val_cold  AUC={auc}  PR-AUC={pr_auc}  (n={cold_metrics['n']})")
+        pbar.write(f"  val_cold  AUC={auc}  PR-AUC={pr_auc}  (n={cold_metrics['n']})")
 
         if cold_metrics["auc"] is not None and cold_metrics["auc"] > best_auc:
             best_auc = cold_metrics["auc"]
             torch.save({"model": model.state_dict(), "epoch": epoch, "best_auc": best_auc},
                        args.best_checkpoint_path)
-            print(f"  -> new best (AUC={best_auc:.4f}), saved to {args.best_checkpoint_path}")
+            pbar.write(f"  -> new best (AUC={best_auc:.4f}), saved to {args.best_checkpoint_path}")
 
         torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
                     "epoch": epoch, "best_auc": best_auc}, args.checkpoint_path)
+
+    pbar.close()
 
     print("\nFinal evaluation (val, đủ warm+cold):")
     print(format_report(run_eval_full(model, val_warm_loader, val_cold_loader, device)))
