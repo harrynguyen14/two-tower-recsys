@@ -555,7 +555,12 @@ def main():
     # thay vì tqdm mới mỗi epoch (nhìn như nhiều thanh bar nối tiếp nhau). Log (loss/lr/gpu)
     # in bằng tqdm.write() phía TRÊN bar thay vì print() thường — print() thường sẽ chen vào
     # giữa bar đang render và làm hỏng layout terminal (bar bị lặp/nhảy dòng lộn xộn).
-    pbar = tqdm(total=total_steps, desc="Training", initial=start_epoch * len(train_loader))
+    # total=total_steps là TOÀN BỘ training (tất cả epoch cộng lại) — ETA hiển thị trên bar
+    # do đó là ETA cho HẾT 15 epoch, KHÔNG PHẢI ETA 1 epoch (dễ hiểu lầm: 8.97 it/s x 34295
+    # step/epoch ~ 64 phút/epoch thật, ETA "~16h" là 15 epoch x 64 phút, không phải 1 epoch
+    # chậm đi). desc mỗi epoch có ghi rõ "Epoch X/Y" để phân biệt.
+    pbar = tqdm(total=total_steps, desc="Training (ETA = toàn bộ epochs)",
+                initial=start_epoch * len(train_loader))
     last_auc = None  # AUC val_cold gần nhất — chỉ tính cuối mỗi epoch (xem run_eval_cold),
                       # log theo step vẫn hiển thị giá trị này để luôn thấy AUC mới nhất
 
