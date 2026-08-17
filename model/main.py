@@ -469,7 +469,11 @@ def main():
     resume_ckpt = None  # giữ lại để load scheduler.state_dict sau khi scheduler được tạo
                          # (scheduler cần len(train_loader), tạo sau đoạn resume model/optimizer)
     if args.resume and Path(args.checkpoint_path).exists():
-        resume_ckpt = torch.load(args.checkpoint_path, map_location=device)
+        # weights_only=False: mặc định PyTorch 2.6+ đổi thành True (chặn pickle chứa object
+        # tuỳ ý vì lý do bảo mật) — checkpoint của chính pipeline này chứa numpy scalar
+        # (best_auc dạng numpy.float64) nên bị chặn nếu để mặc định. An toàn vì checkpoint
+        # tự tạo ra (không phải tải từ nguồn ngoài không tin cậy).
+        resume_ckpt = torch.load(args.checkpoint_path, map_location=device, weights_only=False)
         model.load_state_dict(resume_ckpt["model"])
         optimizer.load_state_dict(resume_ckpt["optimizer"])
         start_epoch = resume_ckpt["epoch"] + 1
@@ -529,7 +533,7 @@ def main():
     test_cold_loader = DataLoader(make_dataset(test_cold_pos), shuffle=False, **eval_loader_kwargs)
 
     # LR schedule: warmup tuyến tính (0 -> args.lr trong args.warmup_steps step đầu) rồi
-    # cosine decay (args.lr -> 0 hết các step còn lại) — chuẩn contrastive learning
+    # cosine decatuâny (args.lr -> 0 hết các step còn lại) — chuẩn contrastive learning
     # (CLIP/SimCLR). Bổ trợ cho clip_grad_norm_ (không thay thế): warmup tránh việc LR full
     # ngay từ step 0 khi weight còn random dễ gây gradient lớn (nguyên nhân NaN thật đã gặp,
     # loss giảm bất thường nhanh rồi NaN quanh step 185).
