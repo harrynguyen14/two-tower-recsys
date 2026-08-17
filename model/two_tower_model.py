@@ -60,9 +60,17 @@ class TwoTowerModel(torch.nn.Module):
         # rất nhỏ) có thể vượt dải float16 (~65504) khi norm vector lớn -> NaN ngay cả
         # KHÔNG có in_batch_neg (bug gốc thật, độc lập với bug -inf ở info_nce_loss); (2) độ
         # lớn embedding không kiểm soát khiến loss scale không ổn định giữa các batch.
-        user_vector = F.normalize(user_vector, dim=-1)
-        pos_vector = F.normalize(pos_vector, dim=-1)
-        neg_vectors = F.normalize(neg_vectors, dim=-1)
+        #
+        # eps=1e-6 THAY VÌ mặc định F.normalize (1e-12) — bug NaN thật thứ 3 đã gặp (grad_norm
+        # vẫn nhỏ/bình thường ngay trước khi NaN, loại trừ gradient explosion): 1e-12 bị làm
+        # tròn về 0.0 TUYỆT ĐỐI trong float16 (torch.finfo(float16).tiny ~6.1e-5) — dưới
+        # torch.autocast, F.normalize(x, eps=1e-12) với x là vector gần-0 thật (vd
+        # user_vector của user N=0 lịch sử, xem SequenceEncoder "pooled = pooled * has_any"
+        # ép về 0) tính ra x / (norm + 0.0) = NaN. eps=1e-6 vẫn biểu diễn được an toàn ở fp16
+        # (> tiny) nên phép chia luôn có mẫu số khác 0 thật.
+        user_vector = F.normalize(user_vector, dim=-1, eps=1e-6)
+        pos_vector = F.normalize(pos_vector, dim=-1, eps=1e-6)
+        neg_vectors = F.normalize(neg_vectors, dim=-1, eps=1e-6)
 
         return user_vector, pos_vector, neg_vectors
 
