@@ -563,6 +563,19 @@ class DatasetAccessor:
         self.user_static_features = np.load(dataset_dir / "user_static_features.npy")
         self.user_category_distribution = np.load(dataset_dir / "user_category_distribution.npy")
 
+        # Tương thích ngược: dataset build bằng bản build_dataset.py CŨ (trước khi đổi tên
+        # field mean_rating/std_rating/total_reviews/avg_page_count -> thêm prefix "user_")
+        # lưu user_static_features.npy KHÔNG có prefix, và còn thừa field
+        # helpful_votes_mean (đã bỏ khỏi feature set — xem docstring user_tower.py, train/
+        # serve skew). Dò field name có mặt thay vì giả định 1 kiểu cố định.
+        names = self.user_static_features.dtype.names
+        self._static_field = {
+            "mean_rating": "user_mean_rating" if "user_mean_rating" in names else "mean_rating",
+            "std_rating": "user_std_rating" if "user_std_rating" in names else "std_rating",
+            "total_reviews": "user_total_reviews" if "user_total_reviews" in names else "total_reviews",
+            "avg_page_count": "user_avg_page_count" if "user_avg_page_count" in names else "avg_page_count",
+        }
+
         self.category_vocab = self.metadata["category_vocab"]
         # Tương thích ngược: dataset build bằng bản build_dataset.py CŨ (trước khi đổi tên
         # biến train_cutoff/val_cutoff -> train_temporal_boundary/val_temporal_boundary) lưu
@@ -614,16 +627,20 @@ class DatasetAccessor:
 
     def static_features_of(self, uid):
         """Trả về dict CÙNG SHAPE với static_features[uid] cũ, hoặc None nếu user N=0
-        hoàn toàn (user_total_reviews=0, xem build_dataset.py build_user_static_features)."""
+        hoàn toàn (user_total_reviews=0, xem build_dataset.py build_user_static_features).
+
+        Đọc field qua self._static_field (dò tên field thật ở __init__) — tương thích cả
+        dataset build bằng bản build_dataset.py cũ (field không prefix "user_")."""
         uidx = self.user_to_idx[uid]
         row = self.user_static_features[uidx]
-        if int(row["user_total_reviews"]) == 0:
+        f = self._static_field
+        if int(row[f["total_reviews"]]) == 0:
             return None
         return {
-            "user_mean_rating": float(row["user_mean_rating"]),
-            "user_std_rating": float(row["user_std_rating"]),
-            "user_total_reviews": int(row["user_total_reviews"]),
-            "user_avg_page_count": float(row["user_avg_page_count"]),
+            "user_mean_rating": float(row[f["mean_rating"]]),
+            "user_std_rating": float(row[f["std_rating"]]),
+            "user_total_reviews": int(row[f["total_reviews"]]),
+            "user_avg_page_count": float(row[f["avg_page_count"]]),
             "category_distribution": self.user_category_distribution[uidx].tolist(),
         }
 
