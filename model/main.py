@@ -564,8 +564,20 @@ class DatasetAccessor:
         self.user_category_distribution = np.load(dataset_dir / "user_category_distribution.npy")
 
         self.category_vocab = self.metadata["category_vocab"]
-        self.train_temporal_boundary = self.metadata["train_temporal_boundary"]
-        self.val_temporal_boundary = self.metadata["val_temporal_boundary"]
+        # Tương thích ngược: dataset build bằng bản build_dataset.py CŨ (trước khi đổi tên
+        # biến train_cutoff/val_cutoff -> train_temporal_boundary/val_temporal_boundary) lưu
+        # metadata.npy với key cũ. Không build lại dataset (tốn hàng giờ) — chỉ đọc theo cả
+        # 2 tên key, ưu tiên tên mới nếu có.
+        self.train_temporal_boundary = self.metadata.get(
+            "train_temporal_boundary", self.metadata.get("train_cutoff"))
+        self.val_temporal_boundary = self.metadata.get(
+            "val_temporal_boundary", self.metadata.get("val_cutoff"))
+        if self.train_temporal_boundary is None or self.val_temporal_boundary is None:
+            raise KeyError(
+                "metadata.npy thiếu cả train_temporal_boundary/val_temporal_boundary lẫn "
+                "train_cutoff/val_cutoff (tên key cũ) — dataset có thể build từ phiên bản "
+                "build_dataset.py khác/hỏng."
+            )
 
     def user_seq(self, uid):
         """Trả về list[(timestamp, asin, rating, helpful_vote)] — CÙNG ĐỊNH DẠNG với
