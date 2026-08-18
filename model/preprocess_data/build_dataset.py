@@ -1,13 +1,13 @@
-"""
-Cache hóa kết quả preprocess (xem Readme.md mục "Temporal split", "Soft-negative sampling",
-"Static/Pseudo-Static Features") — chạy 1 LẦN, quét toàn bộ Kindle_Store.jsonl (25.6M dòng)
-+ meta_Kindle_Store.jsonl (1.59M item), xuất ra .npy để main.py load lại nhanh thay vì
-quét lại từ đầu mỗi lần thử nghiệm hyperparameter.
+﻿"""
+Build dataset từ kết quả preprocess (xem Readme.md mục "Temporal split", "Soft-negative
+sampling", "Static/Pseudo-Static Features") — chạy 1 LẦN, quét toàn bộ Kindle_Store.jsonl
+(25.6M dòng) + meta_Kindle_Store.jsonl (1.59M item), xuất ra .npy để main.py load lại nhanh
+thay vì quét lại từ đầu mỗi lần thử nghiệm hyperparameter.
 
 Xuất (tất cả trong --out-dir):
   metadata.npy            dict (allow_pickle, NHỎ — an toàn pickle): n_users, n_items,
-                           n_categories, category_vocab (list[str]), train_cutoff,
-                           val_cutoff, train/val/test size
+                           n_categories, category_vocab (list[str]), train_temporal_boundary,
+                           val_temporal_boundary, train/val/test size
   user_vocab.npy           array[str], user_vocab[i] = user_id gốc — giải mã user_idx
                            (int32) trong các mảng dưới về lại string.
   asin_vocab.npy           array[str], asin_vocab[i] = asin gốc — tương tự cho item_idx.
@@ -22,8 +22,8 @@ Xuất (tất cả trong --out-dir):
   user_review_offsets.npy  int64[n_users+1]. Review của user_idx=i nằm ở
                            user_review_sequence[user_review_offsets[i]:user_review_offsets[i+1]]
                            (đã sort theo timestamp trong từng đoạn này).
-  user_static_features.npy  structured array [n_users]: mean_rating, std_rating,
-                           total_reviews, helpful_votes_mean, avg_page_count (index theo
+  user_static_features.npy  structured array [n_users]: user_mean_rating, user_std_rating,
+                           user_total_reviews, user_avg_page_count (index theo
                            user_idx). category_distribution KHÔNG nằm trong mảng này (kích
                            thước n_categories khác nhau/user quá lớn để flatten gọn) — lưu
                            riêng ở user_category_distribution.npy (float32[n_users, n_categories]).
@@ -75,7 +75,7 @@ Xuất (tất cả trong --out-dir):
                            item_popularity_decile.npy (đã chốt: soft-negative cần random mỗi
                            epoch để đa dạng, không đóng băng negative cố định).
 
-Chạy: python build_cache.py [--out-dir <path>]
+Chạy: python build_dataset.py [--out-dir <path>]
 """
 
 import argparse
@@ -97,7 +97,7 @@ from preprocess import (
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Build preprocess cache (.npy) từ Kindle_Store")
+    p = argparse.ArgumentParser(description="Build preprocess dataset (.npy) từ Kindle_Store")
     p.add_argument("--out-dir", type=str, default=str(Path(__file__).parent))
     return p.parse_args()
 
@@ -112,8 +112,8 @@ REVIEW_DTYPE = [
 ]
 
 STATIC_FEATURE_DTYPE = [
-    ("mean_rating", "f4"), ("std_rating", "f4"), ("total_reviews", "i4"),
-    ("helpful_votes_mean", "f4"), ("avg_page_count", "f4"),
+    ("user_mean_rating", "f4"), ("user_std_rating", "f4"), ("user_total_reviews", "i4"),
+    ("user_avg_page_count", "f4"),
 ]
 
 
@@ -148,17 +148,17 @@ def build_user_review_sequence(by_user, user_vocab, user_to_idx, asin_to_idx):
     return user_review_sequence, user_review_offsets
 
 
-def _keep_interaction(ts, rating, split, train_cutoff, val_cutoff):
-    if split == "train" and ts > train_cutoff:
+def _keep_interaction(ts, rating, split, train_temporal_boundary, val_temporal_boundary):
+    if split == "train" and ts > train_temporal_boundary:
         return False
-    if split == "val" and not (train_cutoff < ts <= val_cutoff):
+    if split == "val" and not (train_temporal_boundary < ts <= val_temporal_boundary):
         return False
-    if split == "test" and ts <= val_cutoff:
+    if split == "test" and ts <= val_temporal_boundary:
         return False
     return rating >= 4
 
 
-def build_interactions_array(by_user, train_cutoff, val_cutoff, split, user_to_idx, asin_to_idx):
+def build_interactions_array(by_user, train_temporal_boundary, val_temporal_boundary, split, user_to_idx, asin_to_idx):
     """split: "train" | "val" | "test". Không gán cold/warm ở đây nữa — xem
     split_warm_cold() (val/test tách sẵn thành 2 file riêng, xem QUYẾT ĐỊNH (3)).
 
@@ -170,7 +170,7 @@ def build_interactions_array(by_user, train_cutoff, val_cutoff, split, user_to_i
     n_matched = 0
     for seq in by_user.values():
         for ts, _, rating, _ in seq:
-            if _keep_interaction(ts, rating, split, train_cutoff, val_cutoff):
+            if _keep_interaction(ts, rating, split, train_temporal_boundary, val_temporal_boundary):
                 n_matched += 1
 
     arr = np.empty(n_matched, dtype=INTERACTION_DTYPE)
@@ -178,21 +178,27 @@ def build_interactions_array(by_user, train_cutoff, val_cutoff, split, user_to_i
     for uid, seq in by_user.items():
         uidx = user_to_idx[uid]
         for ts, asin, rating, _ in seq:
-            if _keep_interaction(ts, rating, split, train_cutoff, val_cutoff):
+            if _keep_interaction(ts, rating, split, train_temporal_boundary, val_temporal_boundary):
                 arr[pos] = (uidx, asin_to_idx[asin], ts, rating)
                 pos += 1
 
     return arr
 
 
-def split_warm_cold(interactions_arr, train_cutoff, first_seen_by_item, asin_vocab):
-    """cold = item_pos chưa từng xuất hiện ở train (first_seen None hoặc > train_cutoff);
-    warm = ngược lại (xem metrics.py docstring). Trả về (warm_arr, cold_arr)."""
+def split_warm_cold(interactions_arr, train_temporal_boundary, first_seen_by_item, asin_vocab):
+    """cold = item_pos chưa từng xuất hiện ở train (first_seen None hoặc > train_temporal_boundary);
+    warm = ngược lại. Trả về (warm_arr, cold_arr).
+
+    Định nghĩa (trước đây nằm ở metrics.py, file đó đã xoá vì AUC/PR-AUC bị thay bằng
+    retrieval metrics — xem model/ranking_metrics.py):
+      cold = item_pos chưa từng xuất hiện ở train (first-seen nằm trong val/test).
+      warm = item_pos đã xuất hiện ở train trước đó — dùng làm ĐỐI CHỨNG để phát hiện
+             model "ăn gian" bằng memorization thay vì học content thật."""
     is_cold = np.empty(len(interactions_arr), dtype=bool)
     for i, row in enumerate(interactions_arr):
         asin = asin_vocab[int(row["item_idx"])]
         first_seen = first_seen_by_item.get(asin)
-        is_cold[i] = first_seen is None or first_seen > train_cutoff
+        is_cold[i] = first_seen is None or first_seen > train_temporal_boundary
     return interactions_arr[~is_cold], interactions_arr[is_cold]
 
 
@@ -224,8 +230,8 @@ def build_user_static_features(static_features, user_vocab, category_vocab):
         if feat is None:
             continue
         user_static_features_arr[i] = (
-            feat["mean_rating"], feat["std_rating"], feat["total_reviews"],
-            feat["helpful_votes_mean"], feat["avg_page_count"],
+            feat["user_mean_rating"], feat["user_std_rating"], feat["user_total_reviews"],
+            feat["user_avg_page_count"],
         )
         user_category_distribution[i] = feat["category_distribution"]
 
@@ -243,8 +249,8 @@ def main():
     decile_of = compute_popularity_deciles(item_review_count)
     category_vocab = sorted(set(category_leaf.values()))
 
-    train_cutoff, val_cutoff = compute_cutoffs(sorted_ts)
-    print(f"Train cutoff: {train_cutoff}  Val cutoff: {val_cutoff}")
+    train_temporal_boundary, val_temporal_boundary = compute_cutoffs(sorted_ts)
+    print(f"Train cutoff: {train_temporal_boundary}  Val cutoff: {val_temporal_boundary}")
 
     first_seen_by_item = {}
     for seq in tqdm(by_user.values(), desc="Computing item first-seen"):
@@ -253,7 +259,7 @@ def main():
                 first_seen_by_item[asin] = ts
 
     static_features = compute_static_features(
-        by_user, train_cutoff, category_leaf, page_count, category_vocab
+        by_user, train_temporal_boundary, category_leaf, page_count, category_vocab
     )
 
     print("Building user_id/asin vocab (int index thay vì string thô, xem docstring module)...")
@@ -263,9 +269,9 @@ def main():
     user_review_sequence, user_review_offsets = build_user_review_sequence(by_user, user_vocab, user_to_idx, asin_to_idx)
 
     print("Building train/val/test interaction arrays...")
-    train_arr = build_interactions_array(by_user, train_cutoff, val_cutoff, "train", user_to_idx, asin_to_idx)
-    val_arr = build_interactions_array(by_user, train_cutoff, val_cutoff, "val", user_to_idx, asin_to_idx)
-    test_arr = build_interactions_array(by_user, train_cutoff, val_cutoff, "test", user_to_idx, asin_to_idx)
+    train_arr = build_interactions_array(by_user, train_temporal_boundary, val_temporal_boundary, "train", user_to_idx, asin_to_idx)
+    val_arr = build_interactions_array(by_user, train_temporal_boundary, val_temporal_boundary, "val", user_to_idx, asin_to_idx)
+    test_arr = build_interactions_array(by_user, train_temporal_boundary, val_temporal_boundary, "test", user_to_idx, asin_to_idx)
     print(f"train={len(train_arr):,}  val={len(val_arr):,}  test={len(test_arr):,}")
 
     # by_user (dict 5.6M user -> list tuple) là cấu trúc nặng nhất trong toàn bộ pipeline —
@@ -281,9 +287,9 @@ def main():
     print("Building static feature arrays...")
     user_static_features_arr, user_category_distribution = build_user_static_features(static_features, user_vocab, category_vocab)
 
-    print("Splitting val/test thành warm/cold (xem metrics.py mục Temporal split)...")
-    val_warm_arr, val_cold_arr = split_warm_cold(val_arr, train_cutoff, first_seen_by_item, asin_vocab)
-    test_warm_arr, test_cold_arr = split_warm_cold(test_arr, train_cutoff, first_seen_by_item, asin_vocab)
+    print("Splitting val/test thành warm/cold (xem split_warm_cold docstring)...")
+    val_warm_arr, val_cold_arr = split_warm_cold(val_arr, train_temporal_boundary, first_seen_by_item, asin_vocab)
+    test_warm_arr, test_cold_arr = split_warm_cold(test_arr, train_temporal_boundary, first_seen_by_item, asin_vocab)
     print(f"val: warm={len(val_warm_arr):,} cold={len(val_cold_arr):,}  "
           f"test: warm={len(test_warm_arr):,} cold={len(test_cold_arr):,}")
 
@@ -292,14 +298,14 @@ def main():
         "n_items": len(asin_vocab),
         "n_categories": len(category_vocab),
         "category_vocab": category_vocab,
-        "train_cutoff": train_cutoff,
-        "val_cutoff": val_cutoff,
+        "train_temporal_boundary": train_temporal_boundary,
+        "val_temporal_boundary": val_temporal_boundary,
         "train_size": len(train_arr),
         "val_size": len(val_arr),
         "test_size": len(test_arr),
     }
 
-    print(f"Saving cache to {out_dir} ...")
+    print(f"Saving dataset to {out_dir} ...")
     np.save(out_dir / "metadata.npy", metadata, allow_pickle=True)
     np.save(out_dir / "user_vocab.npy", np.array(user_vocab, dtype=object))
     np.save(out_dir / "asin_vocab.npy", np.array(asin_vocab, dtype=object))

@@ -4,3 +4,4 @@ fairness/
 ds-down/
 .claude/
 model/preprocess_data/user-tower/
+test_*

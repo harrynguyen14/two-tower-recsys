@@ -75,7 +75,8 @@ class TwoTowerModel(torch.nn.Module):
         return user_vector, pos_vector, neg_vectors
 
 
-def info_nce_loss(user_vector, pos_vector, neg_vectors, temperature=0.1, use_in_batch_neg=False):
+def info_nce_loss(user_vector, pos_vector, neg_vectors, temperature=0.1, use_in_batch_neg=False,
+                  log_q=None, pos_idx=None):
     """InfoNCE multi-negative đã chốt: 1 positive + K negative (hard+soft trộn sẵn ở
     neg_vectors, xem preprocess.py) trong cùng 1 softmax.
 
@@ -88,7 +89,38 @@ def info_nce_loss(user_vector, pos_vector, neg_vectors, temperature=0.1, use_in_
     trong forward pass, không tốn thêm CPU sample/GPU encode nào. Chỉ 1 phép nhân ma trận
     [batch,dim] @ [dim,batch] có sẵn, mask bỏ đường chéo (chính nó không phải negative
     của chính nó). Giữ nguyên hard/soft-negative hiện có — đây là TÍN HIỆU BỔ SUNG, không
-    thay thế (in-batch neg thường "dễ" hơn hard-neg nên không đủ để học cold-start 1 mình)."""
+    thay thế (in-batch neg thường "dễ" hơn hard-neg nên không đủ để học cold-start 1 mình).
+
+    log_q, pos_idx: SAMPLED SOFTMAX CORRECTION cho in-batch negative (bắt buộc về mặt lý
+    thuyết khi use_in_batch_neg=True — Bengio & Senécal 2008; Yi et al. 2019 "Sampling-Bias-
+    Corrected Neural Modeling for Large Corpus Item Recommendations", chính là cách NVIDIA
+    Merlin làm).
+      log_q  : [n_items] float — log xác suất một item được lấy làm in-batch negative,
+               ước lượng bằng log(count_train(i) / tổng_interaction). None = tắt correction.
+      pos_idx: [batch] long — index item_pos của từng sample, CÙNG KHÔNG GIAN INDEX với
+               log_q (xem cảnh báo index ở main()).
+
+    VÌ SAO CẦN: in-batch negative lấy pos_vector của sample khác trong batch, mà batch được
+    sample từ dòng interaction thật -> xác suất một item làm negative TỈ LỆ VỚI ĐỘ PHỔ BIẾN
+    của nó. Sách bán chạy bị đẩy ra xa hàng nghìn lần mỗi epoch, sách hiếm gần như không bao
+    giờ. Softmax khi đó xấp xỉ P(i|u) ∝ exp(s) * 1/Q(i), tức model bị dạy để DÌM item phổ
+    biến — ngược hẳn mục tiêu retrieval. Trừ log Q(i) khỏi logit khử đúng phần thiên lệch đó:
+        s'(u,i) = s(u,i)/T - log Q(i)
+    Với cold-start còn có lợi phụ: item cold có Q rất nhỏ -> -log Q dương lớn -> logit của
+    item cold được NÂNG lên, đúng nhóm item dự án này quan tâm.
+
+    CHỈ áp cho in-batch. hard/soft-negative KHÔNG được sửa: soft-neg lấy bằng torch.randint
+    UNIFORM nên Q là hằng số, trừ một hằng vào mọi logit thì softmax bất biến (cross_entropy
+    chỉ phụ thuộc hiệu các logit) — sửa thêm chỉ là no-op tốn tính toán. hard-neg lấy từ
+    lịch sử rating<=2 của chính user, không phải phân phối sampling nên log Q không định
+    nghĩa được ở đó.
+
+    Correction áp lên CỘT (item bị làm negative), không phải hàng: in_batch_scores[i][j] là
+    score của user i với item_pos của sample j, nên phải trừ log_q của item j -> trừ theo
+    vector hàng broadcast trên dim=1. Trừ theo hàng (log_q của item i) là sai và sẽ tự triệt
+    tiêu trong softmax vì nó là hằng số trên mỗi hàng.
+
+    Vị trí positive (cột 0) KHÔNG trừ: nó không phải mẫu sampled từ Q, nó là nhãn thật."""
     pos_score = (user_vector * pos_vector).sum(dim=-1, keepdim=True) / temperature  # [batch, 1]
     neg_scores = torch.einsum("bd,bkd->bk", user_vector, neg_vectors) / temperature  # [batch, K]
 
@@ -96,6 +128,14 @@ def info_nce_loss(user_vector, pos_vector, neg_vectors, temperature=0.1, use_in_
     if use_in_batch_neg:
         batch = user_vector.size(0)
         in_batch_scores = (user_vector @ pos_vector.t()) / temperature  # [batch, batch]
+
+        if log_q is not None:
+            if pos_idx is None:
+                raise ValueError("log_q cần pos_idx để biết item nào ứng với mỗi cột in-batch")
+            # [batch] -> broadcast trên dim=1 (theo CỘT j = item_pos của sample j)
+            lq = log_q.to(in_batch_scores.device, in_batch_scores.dtype)[pos_idx]
+            in_batch_scores = in_batch_scores - lq.unsqueeze(0)
+
         diag_mask = torch.eye(batch, dtype=torch.bool, device=user_vector.device)
         # float("-inf") thật gây train_loss=nan dưới torch.autocast (float16 không biểu
         # diễn -inf ổn định qua log_softmax nội bộ của cross_entropy — bug thật đã gặp).

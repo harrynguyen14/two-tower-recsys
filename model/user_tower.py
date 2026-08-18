@@ -7,11 +7,13 @@ masking. max_seq_len=10 đã chốt (coverage 93.34%, xem Readme).
 
 Static features theo đúng thứ tự ưu tiên đã chốt:
   - user_mean_rating, user_std_rating (ưu tiên cao nhất — autocorrelation r=0.341)
-  - total_reviews_count, helpful_votes_mean (trung bình)
+  - user_total_reviews (trung bình)
   - user_avg_page_count (trung bình, coverage 93.3%)
   - category_distribution (yếu, chỉ bổ trợ — 46.9% lặp lại, gần random)
-Đã loại: verified_purchase_ratio, time-gap, hour-of-day, weekday, price/description-based
-(xem Readme bảng "Static/Pseudo-Static Features").
+Đã loại: helpful_votes_mean (train/serve skew — helpful_vote tích luỹ dần sau khi đăng
+review, review mới ở serving-time luôn ≈0 trong khi review cũ lúc train đã "chín"),
+verified_purchase_ratio, time-gap, hour-of-day, weekday, price/description-based (xem
+Readme bảng "Static/Pseudo-Static Features").
 """
 
 import torch

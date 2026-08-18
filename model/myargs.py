@@ -14,10 +14,10 @@ def parse_args():
     p.add_argument("--item-emb-dir", type=str, default=None,
                     help="Thư mục chứa text_embeddings.npy/image_embeddings.npy/has_image.npy/"
                          "asin_to_idx.json (Giai đoạn 1, xem model/preprocess_data/data.py)")
-    p.add_argument("--cache-dir", type=str, default=None,
+    p.add_argument("--dataset-dir", type=str, default=None,
                     help="Thư mục chứa metadata.npy/by_user.npy/train_interactions.npy/... "
-                         "(xuất bởi model/preprocess_data/build_cache.py). None = tự quét lại "
-                         "toàn bộ JSONL mỗi lần chạy (chậm, chỉ dùng khi chưa có cache).")
+                         "(xuất bởi model/preprocess_data/build_dataset.py). None = tự quét lại "
+                         "toàn bộ JSONL mỗi lần chạy (chậm, chỉ dùng khi chưa build dataset).")
     p.add_argument("--checkpoint-path", type=str, default="checkpoint.pt",
                     help="File lưu model/optimizer state_dict + epoch sau mỗi epoch (để resume).")
     p.add_argument("--best-checkpoint-path", type=str, default="best_model.pt",
@@ -50,6 +50,24 @@ def parse_args():
     p.add_argument("--train-percentile", type=int, default=80)
     p.add_argument("--val-percentile", type=int, default=90)
 
+    # ranking stage (chạy SAU retrieval, xem ranker.py) — DIN-style cross-attention +
+    # listwise loss trên candidate list = retrieval top-N thật, fine-tune joint với 2 tower.
+    p.add_argument("--enable-ranker", action="store_true",
+                    help="Bật ranking stage: train thêm RankerModel (target-attention kiểu "
+                         "DIN) trên candidate list lấy từ retrieval top-N thật mỗi epoch. "
+                         "Mặc định TẮT — không đổi hành vi/tốc độ pipeline retrieval hiện có.")
+    p.add_argument("--rank-candidate-n", type=int, default=100,
+                    help="N candidate/user cho ranker (retrieval top-N + ground-truth chèn "
+                         "nếu thiếu). Lớn hơn = ranker học rerank trên phạm vi rộng hơn "
+                         "nhưng build_ranker_candidates mỗi epoch tốn hơn (topk_over_catalog).")
+    p.add_argument("--lambda-rank", type=float, default=0.3,
+                    help="Trọng số loss ranking khi cộng vào loss retrieval: "
+                         "total = info_nce_loss + lambda_rank * listwise_loss. Nhỏ để loss "
+                         "ranking KHÔNG lấn át mục tiêu retrieval gốc (fine-tune joint có "
+                         "rủi ro catastrophic forgetting nếu lambda quá lớn).")
+    p.add_argument("--rank-attn-hidden-dim", type=int, default=64)
+    p.add_argument("--rank-mlp-hidden-dim", type=int, default=256)
+
     # training
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--num-workers", type=int, default=4,
@@ -62,6 +80,20 @@ def parse_args():
                     help="Bật mixed precision (autocast + GradScaler) cho vòng train chính "
                          "— tận dụng Tensor Core trên GPU (T4/V100+), không ảnh hưởng "
                          "data loading (bottleneck riêng, xem --num-workers).")
+    # retrieval eval (Recall/Hit/NDCG/MRR@K trên full catalog — thay AUC/PR-AUC,
+    # xem ranking_metrics.py)
+    p.add_argument("--eval-ks", type=int, nargs="+", default=[10, 50, 100],
+                    help="Các giá trị K để tính Recall/Hit/NDCG/MRR. K ĐẦU TIÊN là metric "
+                         "chọn best checkpoint (Recall@K trên full catalog).")
+    p.add_argument("--eval-batch-size", type=int, default=128,
+                    help="Batch user cho retrieval eval. Nhỏ hơn --batch-size vì mỗi user "
+                         "phải xếp hạng toàn catalog: score chunk = eval_batch_size x "
+                         "item_chunk. 128 x 200k fp32 = 0.10 GB/chunk (an toàn).")
+    p.add_argument("--item-chunk", type=int, default=200_000,
+                    help="Số item xử lý mỗi lần khi xếp hạng full catalog — chunk để không "
+                         "bao giờ materialize ma trận [n_users, 1.59M] (batch=256 x 1.59M "
+                         "fp32 = 1.6 GB/batch, OOM). Giảm nếu VRAM chật.")
+
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--warmup-steps", type=int, default=500,
                     help="Số step LR tăng tuyến tính từ 0 lên --lr, sau đó cosine decay về 0 "

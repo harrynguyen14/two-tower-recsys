@@ -1,6 +1,6 @@
-"""
-Preprocess — xem Readme.md mục "Soft-negative sampling", "Temporal split", "Static/
-Pseudo-Static Features cho User Tower".
+﻿"""
+Preprocess — xem Readme.md mục "Temporal split", "Static/Pseudo-Static Features cho User
+Tower".
 
 Pipeline (single streaming pass qua Kindle_Store.jsonl + meta_Kindle_Store.jsonl, theo
 đúng pattern của các script analyze_*.py đã có ở ds-down/ — không load toàn bộ vào RAM
@@ -11,12 +11,15 @@ Pipeline (single streaming pass qua Kindle_Store.jsonl + meta_Kindle_Store.jsonl
 3. Temporal split: global timestamp cutoff percentile 80/90 (train/val/test).
 4. Với mỗi positive (rating>=4) nằm ngoài train (val/test): gắn nhãn cold/warm theo
    first-seen của item_pos so với cutoff train.
-5. Soft-negative: thuật toán category+popularity_decile matched, fallback nới decile.
-6. Static features: user_mean_rating, user_std_rating, total_reviews_count,
-   helpful_votes_mean, user_avg_page_count, category_distribution — CHỈ tính từ review
-   TRƯỚC cutoff train của chính split đang xử lý (fit/transform tách biệt, xem Readme
-   mục "Ghi chú kỹ thuật từ NVIDIA Merlin" — tránh leakage).
-"""
+5. Static features: user_mean_rating, user_std_rating, user_total_reviews,
+   user_avg_page_count, category_distribution — CHỈ tính từ review TRƯỚC cutoff train
+   của chính split đang xử lý (fit/transform tách biệt, xem Readme mục "Ghi chú kỹ thuật
+   từ NVIDIA Merlin" — tránh leakage).
+
+Soft-negative sampling (category+popularity_decile matched) đã bị bỏ khỏi module này —
+main.py giờ dùng uniform random negative trong collate_fn (xem ColdStartDataset/
+make_collate ở main.py để biết lý do đổi: rejection sampling per-sample là bottleneck
+hiệu năng chính của pipeline train)."""
 
 import json
 import re
@@ -32,8 +35,6 @@ PAGE_RE = re.compile(r"([\d,]+)\s*pages", re.IGNORECASE)
 
 TRAIN_PERCENTILE = 80
 VAL_PERCENTILE = 90
-N_HARD_NEG = 4
-N_SOFT_NEG = 4
 
 
 # ── item meta: category_leaf + popularity decile ────────────────────────────────
@@ -98,24 +99,24 @@ def load_reviews_by_user():
 def compute_cutoffs(sorted_ts):
     """Global timestamp cutoff theo percentile 80/90 (đã chốt ở Readme mục Temporal split)."""
     n = len(sorted_ts)
-    train_cutoff = sorted_ts[int(n * TRAIN_PERCENTILE / 100) - 1]
-    val_cutoff = sorted_ts[int(n * VAL_PERCENTILE / 100) - 1]
-    return train_cutoff, val_cutoff
+    train_temporal_boundary = sorted_ts[int(n * TRAIN_PERCENTILE / 100) - 1]
+    val_temporal_boundary = sorted_ts[int(n * VAL_PERCENTILE / 100) - 1]
+    return train_temporal_boundary, val_temporal_boundary
 
 
 # ── static features (fit CHỈ trên phần train, xem docstring module) ─────────────
 
-def compute_static_features(by_user, train_cutoff, category_leaf, page_count, category_vocab):
-    """Trả về dict[user_id] -> {mean_rating, std_rating, total_reviews, helpful_votes_mean,
-    avg_page_count, category_distribution (list[float], len=len(category_vocab))}.
+def compute_static_features(by_user, train_temporal_boundary, category_leaf, page_count, category_vocab):
+    """Trả về dict[user_id] -> {user_mean_rating, user_std_rating, user_total_reviews,
+    user_avg_page_count, category_distribution (list[float], len=len(category_vocab))}.
 
-    CHỈ dùng review có timestamp <= train_cutoff — đây là "fit" trên train, áp dụng cho
+    CHỈ dùng review có timestamp <= train_temporal_boundary — đây là "fit" trên train, áp dụng cho
     mọi split (train/val/test) để tránh leakage (nguyên tắc NVTabular fit/transform)."""
     cat_index = {c: i for i, c in enumerate(category_vocab)}
     features = {}
 
     for uid, seq in by_user.items():
-        train_part = [s for s in seq if s[0] <= train_cutoff]
+        train_part = [s for s in seq if s[0] <= train_temporal_boundary]
         if not train_part:
             features[uid] = None  # user cold hoàn toàn (N=0), xử lý ở Dataset layer
             continue
@@ -124,9 +125,6 @@ def compute_static_features(by_user, train_cutoff, category_leaf, page_count, ca
         mean_rating = sum(ratings) / len(ratings)
         var = sum((x - mean_rating) ** 2 for x in ratings) / len(ratings)
         std_rating = var ** 0.5
-
-        helpful = [s[3] for s in train_part]
-        helpful_mean = sum(helpful) / len(helpful)
 
         pages = [page_count[asin] for _, asin, _, _ in train_part if asin in page_count]
         avg_pages = sum(pages) / len(pages) if pages else 0.0
@@ -142,75 +140,10 @@ def compute_static_features(by_user, train_cutoff, category_leaf, page_count, ca
             cat_dist = [c / n_with_cat for c in cat_dist]
 
         features[uid] = {
-            "mean_rating": mean_rating,
-            "std_rating": std_rating,
-            "total_reviews": len(train_part),
-            "helpful_votes_mean": helpful_mean,
-            "avg_page_count": avg_pages,
+            "user_mean_rating": mean_rating,
+            "user_std_rating": std_rating,
+            "user_total_reviews": len(train_part),
+            "user_avg_page_count": avg_pages,
             "category_distribution": cat_dist,
         }
     return features
-
-
-# ── soft-negative sampling: thuật toán đã chốt ───────────────────────────────────
-
-def build_category_decile_index(category_leaf, decile_of):
-    """dict[(category_leaf, decile)] -> list[asin], để sample soft-neg nhanh."""
-    index = defaultdict(list)
-    for asin, leaf in category_leaf.items():
-        d = decile_of.get(asin)
-        if d is not None:
-            index[(leaf, d)].append(asin)
-    return index
-
-
-def sample_soft_negative(item_pos, category_leaf, decile_of, cat_decile_index, user_seen, rng):
-    """Thuật toán đã chốt ở Readme mục "Soft-negative sampling":
-    1. category_leaf + popularity_decile của item_pos.
-    2. Candidate = cùng leaf + cùng decile, loại item user đã tương tác.
-    3. Nếu rỗng: nới decile +-1, +-2... (giữ nguyên category).
-    4. Sample uniform 1 item.
-
-    Trả về None nếu không tìm được candidate nào trong toàn bộ category_leaf đó (cực hiếm,
-    cần log lại tần suất khi chạy thật — xem Readme).
-
-    Rejection sampling thay vì materialize candidate set rồi sorted(): đo thật trên data
-    thật cho thấy radius=0 gần như luôn đủ (2000/2000 sample thử) nhưng bucket (leaf, decile)
-    trung bình có tới 34,016 asin — sorted(candidates) + set-subtract trên set cỡ đó chiếm
-    >99% thời gian __getitem__ (~40ms/sample), làm GPU idle chờ CPU build batch (xem
-    profile_getitem.py). user_seen chỉ ~10-50 phần tử nên random-pick-rồi-check-reject trực
-    tiếp trên list gốc của candidate_pool (không qua set/sort) gần như luôn trúng ngay lần
-    đầu — phân phối vẫn uniform trên đúng candidate universe cũ vì mọi phần tử hợp lệ có
-    xác suất được chọn bằng nhau, chỉ khác cách hiện thực."""
-    leaf = category_leaf.get(item_pos)
-    center_decile = decile_of.get(item_pos)
-    if leaf is None or center_decile is None:
-        return None
-
-    seen_deciles = set()
-    candidate_pool = []
-    for radius in range(0, 10):
-        lo, hi = max(1, center_decile - radius), min(10, center_decile + radius)
-        for d in range(lo, hi + 1):
-            if d not in seen_deciles:
-                seen_deciles.add(d)
-                candidate_pool.extend(cat_decile_index.get((leaf, d), []))
-
-        if not candidate_pool:
-            continue
-
-        # Rejection sampling: random index trực tiếp trên list, retry nếu trúng
-        # user_seen/item_pos. Cap số lần thử để tránh vòng lặp vô hạn khi candidate_pool
-        # gần như hoàn toàn nằm trong user_seen (cực hiếm) — rơi xuống fallback set-based.
-        max_tries = min(50, len(candidate_pool) * 2)
-        for _ in range(max_tries):
-            pick = candidate_pool[rng.randrange(len(candidate_pool))]
-            if pick != item_pos and pick not in user_seen:
-                return pick
-
-        remaining = set(candidate_pool) - user_seen
-        remaining.discard(item_pos)
-        if remaining:
-            remaining = sorted(remaining)
-            return remaining[rng.randrange(len(remaining))]
-    return None
