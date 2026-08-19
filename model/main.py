@@ -90,7 +90,8 @@ class PrecomputedItemVectors:
         vectors = []
         with torch.no_grad():
             for start in tqdm(range(0, len(self._all_asins), self._batch_size),
-                               desc="Precompute item vectors", leave=False, position=1):
+                               desc="Precompute item vectors", leave=False, position=1,
+                               mininterval=1.0):
                 batch_asins = self._all_asins[start:start + self._batch_size]
                 text_emb, image_emb, has_image = item_emb_store.get(batch_asins)
                 vec = item_tower(text_emb.to(self.device), image_emb.to(self.device),
@@ -401,7 +402,7 @@ def build_ranker_candidates(positives, model, precomputed_item_vectors, item_mat
     candidate_idx = []
     with torch.no_grad():
         for start in tqdm(range(0, len(positives), batch_size), desc="Build ranker candidates",
-                         leave=False, position=1):
+                         leave=False, position=1, mininterval=1.0):
             chunk = positives[start:start + batch_size]
             seq_items_list, seq_ratings_list, static_list, cat_list, seen_list = [], [], [], [], []
             for uid, _item_pos, seq_before, _hp, _lb, _ts in chunk:
@@ -664,7 +665,7 @@ def build_positives_from_array(interactions_arr, dataset, max_seq_len, label=Non
     toàn."""
     positives = []
     user_seq_cache = {}
-    for row in tqdm(interactions_arr, desc="Building positives"):
+    for row in tqdm(interactions_arr, desc="Building positives", mininterval=1.0):
         uid = dataset.user_vocab[int(row["user_idx"])]
         asin = dataset.asin_vocab[int(row["item_idx"])]
         ts = int(row["timestamp"])
@@ -814,7 +815,7 @@ def encode_all_items(item_tower, item_emb_store, all_asins, device, batch_size=1
     vectors = []
     with torch.no_grad():
         for start in tqdm(range(0, len(all_asins), batch_size),
-                          desc="Encode catalog", leave=False, position=1):
+                          desc="Encode catalog", leave=False, position=1, mininterval=1.0):
             text_emb, image_emb, has_image = item_emb_store.get(all_asins[start:start + batch_size])
             # .to(device) tường minh — item_emb_store thật (ItemEmbeddingStore) luôn tự load
             # sẵn lên device nên .get() vốn đã đúng device, nhưng tham số device của hàm này
@@ -864,7 +865,8 @@ def run_retrieval_eval(model, loader, item_matrix, device, ks=(10, 50, 100),
 
     all_topk, all_gt = [], []
     with torch.no_grad():
-        for user_batch, gts, seens in tqdm(loader, desc="Retrieval eval", leave=False, position=1):
+        for user_batch, gts, seens in tqdm(loader, desc="Retrieval eval", leave=False, position=1,
+                                            mininterval=1.0):
             user_batch = {k: v.to(device, non_blocking=True) for k, v in user_batch.items()}
             user_vec = F.normalize(model.encode_user(**user_batch), dim=-1, eps=1e-6)
 
@@ -929,7 +931,8 @@ def run_ranker_eval(model, ranker, loader, item_matrix, item_emb_store, all_asin
 
     all_topk_before, all_topk_after, all_gt = [], [], []
     with torch.no_grad():
-        for user_batch, gts, seens in tqdm(loader, desc="Ranker eval", leave=False, position=1):
+        for user_batch, gts, seens in tqdm(loader, desc="Ranker eval", leave=False, position=1,
+                                            mininterval=1.0):
             user_batch = {k: v.to(device, non_blocking=True) for k, v in user_batch.items()}
             user_vec = F.normalize(model.encode_user(**user_batch), dim=-1, eps=1e-6)
 
@@ -1015,7 +1018,7 @@ def main():
         print(f"Train cutoff: {train_temporal_boundary}  Val cutoff: {val_temporal_boundary}")
 
         first_seen_by_item = {}
-        for seq in tqdm(by_user.values(), desc="Computing item first-seen"):
+        for seq in tqdm(by_user.values(), desc="Computing item first-seen", mininterval=1.0):
             for ts, asin, _, _ in seq:
                 if asin not in first_seen_by_item or ts < first_seen_by_item[asin]:
                     first_seen_by_item[asin] = ts
@@ -1152,7 +1155,7 @@ def main():
         # hoạt động nhiều.
         seen_uid = set()
         raw_rows = []
-        for uid, *_rest in tqdm(train_pos, desc="Fit static scaler"):
+        for uid, *_rest in tqdm(train_pos, desc="Fit static scaler", mininterval=1.0):
             if uid in seen_uid:
                 continue
             seen_uid.add(uid)
