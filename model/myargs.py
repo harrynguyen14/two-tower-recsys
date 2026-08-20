@@ -95,6 +95,13 @@ def parse_args():
                          "fp32 = 1.6 GB/batch, OOM). Giảm nếu VRAM chật.")
 
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--weight-decay", type=float, default=0.0,
+                    help="L2 regularization cho Adam (torch.optim.Adam weight_decay). Mặc "
+                         "định 0 (hành vi cũ, không đổi) — model không có regularization nào "
+                         "ngoài --dropout, dễ overfit trên train set lớn (val_cold Recall đạt "
+                         "đỉnh sớm rồi giảm dần qua epoch dù train loss tiếp tục giảm, đã "
+                         "quan sát thật: đỉnh epoch 3 rồi giảm liên tục tới epoch 6). Thử "
+                         "1e-5 ~ 1e-4 nếu gặp hiện tượng này.")
     p.add_argument("--warmup-steps", type=int, default=500,
                     help="Số step LR tăng tuyến tính từ 0 lên --lr, sau đó cosine decay về 0 "
                          "hết training — chuẩn cho contrastive loss (CLIP/SimCLR đều dùng). "

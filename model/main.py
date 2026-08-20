@@ -1083,7 +1083,7 @@ def main():
         # 2 LẦN cho cùng 1 param mỗi step (bug thật nếu không tách riêng, xem set() dưới).
         seen_ids = {id(p) for p in all_params}
         all_params += [p for p in ranker.parameters() if id(p) not in seen_ids]
-    optimizer = torch.optim.Adam(all_params, lr=args.lr)
+    optimizer = torch.optim.Adam(all_params, lr=args.lr, weight_decay=args.weight_decay)
 
     start_epoch = 0
     best_recall = -1.0  # metric chọn checkpoint: Recall@K trên full catalog (thay best_auc)
