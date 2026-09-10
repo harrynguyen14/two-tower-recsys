@@ -1,9 +1,9 @@
-model/preprocess_data/cache_test
+two-tower-model/preprocess_data/cache_test
 __pycache__/
 fairness/
 ds-down/
 .claude/
-model/preprocess_data/user-tower/
+two-tower-model/preprocess_data/user-tower/
 test_*
 gen-recsys/preprocess_data/output
 gen-recsys/preprocess_data/test_pipeline_smoke.py
