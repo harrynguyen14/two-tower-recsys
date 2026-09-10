@@ -1,8 +1,15 @@
 """Pass 3.5 (chạy trên Kaggle, KHÔNG chạy local) — encode caption tiếng Trung qua
-multilingual-e5-base (frozen, không fine-tune) thành embedding 768 chiều, dùng làm nhánh
-text OPTIONAL trong content_branch (GMU, xem item_embedding.py). Benchmark CPU local:
-67.3 caption/s -> ~5.5 ngày cho 32M caption -> CHẠY TRÊN KAGGLE (GPU T4/P100 miễn phí)
-để rút ngắn còn vài giờ.
+multilingual-e5-small (frozen, không fine-tune) thành embedding 384 chiều, dùng làm nhánh
+text OPTIONAL trong content_branch (GMU, xem item_embedding.py).
+
+[CHỐT 2026-09-10] Đã thử Alibaba-NLP/gte-multilingual-base (tối ưu tiếng Trung tốt hơn)
+nhưng gặp lỗi CUDA "index out of bounds" trong custom code của kiến trúc đó khi chạy qua
+multi-GPU pool trên Kaggle thật (2xT4) — lỗi không tái hiện trên CPU đơn, chỉ xảy ra khi
+kết hợp custom RoPE/token_type_ids code + multi-process pool. QUAY LẠI multilingual-e5
+(kiến trúc chuẩn, không cần trust_remote_code, đã verify multi-GPU pool hoạt động đúng) —
+đổi từ base (278M, 768-dim) sang small (118M, 384-dim) để nhanh hơn ~2-3x. Benchmark CPU
+local (bản base): 67.3 caption/s -> ~5.5 ngày cho 32M caption -> CHẠY TRÊN KAGGLE (GPU
+T4/P100 miễn phí) để rút ngắn còn vài giờ.
 
 Cách dùng trên Kaggle:
 1. Tạo Kaggle Dataset chỉ chứa kuairand_video_captions.csv (944MB, tải từ
@@ -13,7 +20,7 @@ Cách dùng trên Kaggle:
 3. Sau khi chạy xong, tải file caption_embeddings.npy từ /kaggle/working/ về, đặt vào
    D:\\ama-rs\\gen-recsys\\preprocess_data\\output\\ (cùng chỗ với item_static.npy).
 
-Output: caption_embeddings.npy (num_items, 768) float32 — index i tương ứng video_id=i
+Output: caption_embeddings.npy (num_items, 384) float32 — index i tương ứng video_id=i
 (giống item_static.npy, identity mapping, ĐÃ XÁC NHẬN video_id liên tục 0..N-1). Item
 không có trong file caption gốc (nếu có) được điền vector 0 (GMU sẽ tự mask qua
 has_caption, không dùng nhánh text cho các dòng này).
@@ -27,7 +34,7 @@ import pandas as pd
 from sentence_transformers import SentenceTransformer
 
 NUM_ITEMS = 32_038_725  # tổng số item KuaiRand-27K, đã xác nhận video_id liên tục 0..N-1
-MODEL_NAME = "intfloat/multilingual-e5-base"
+MODEL_NAME = "intfloat/multilingual-e5-small"
 
 
 # Model nào cần prefix "passage: "/"query: " trước mỗi câu (chuẩn E5-style asymmetric
