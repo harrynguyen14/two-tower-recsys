@@ -25,7 +25,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sentence_transformers import SentenceTransformer
-from tqdm import tqdm
 
 NUM_ITEMS = 32_038_725  # tổng số item KuaiRand-27K, đã xác nhận video_id liên tục 0..N-1
 MODEL_NAME = "intfloat/multilingual-e5-base"
@@ -86,8 +85,14 @@ def encode_all_captions(
         # cho tốc độ ~277 caption/s, CHẬM HƠN CPU đơn luồng 67 caption/s — vì số lần gọi pool
         # quá nhiều, 1602 lần, overhead lấn át lợi ích multi-GPU). Chunk lớn hơn nhiều giảm số
         # lần gọi pool xuống ~32 lần, để mỗi lần pool xử lý đủ khối lượng bù overhead khởi tạo.
+        # KHÔNG bọc `reader` bằng tqdm ở đây — model.encode(show_progress_bar=True) đã tự vẽ
+        # 1 thanh tqdm "Batches" bên trong mỗi chunk. 2 thanh tqdm lồng nhau (chunk-level +
+        # batch-level) tranh nhau dòng terminal (\r) gây giật/đè lên nhau, KHÔNG mượt hơn —
+        # đã xác nhận qua log thật. Chỉ in mốc chunk đơn giản, để tqdm nội bộ là nguồn tiến
+        # độ chi tiết duy nhất.
         remaining_chunks = (num_items - rows_done + chunk_size - 1) // chunk_size
-        for chunk in tqdm(reader, total=remaining_chunks, unit="chunk", desc="[encode_captions] chunks"):
+        for chunk_idx, chunk in enumerate(reader):
+            print(f"[encode_captions] chunk {chunk_idx + 1}/{remaining_chunks} ({rows_done} dòng đã xong)")
             video_ids = chunk["final_video_id"].to_numpy()
             captions = chunk["caption"].fillna("").astype(str).tolist()
             # multilingual-e5 yêu cầu prefix "passage: " cho document embedding (khác "query: ")
