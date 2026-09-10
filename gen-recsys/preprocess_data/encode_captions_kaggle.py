@@ -40,6 +40,12 @@ def encode_all_captions(
     chunk_size: int = 1_000_000,
     multi_gpu: bool = True,
 ) -> None:
+    """Checkpoint/resume: sau MỖI chunk, ghi số dòng đã xử lý vào {output_dir}/
+    encode_progress.json. Nếu file này đã tồn tại lúc bắt đầu (session Kaggle trước bị
+    ngắt do giới hạn 12h), tự động mở lại 2 file .npy đã có (mode="r+", KHÔNG tạo mới —
+    tránh mất tiến độ cũ) và pd.read_csv(..., skiprows=...) bỏ qua phần đã encode."""
+    import json
+
     import torch
 
     num_gpus = torch.cuda.device_count()
@@ -57,22 +63,31 @@ def encode_all_captions(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / "caption_embeddings.npy"
-    embeddings_mm = np.lib.format.open_memmap(out_path, mode="w+", dtype=np.float32, shape=(num_items, embed_dim))
-    has_caption_mm = np.lib.format.open_memmap(
-        output_dir / "caption_has_caption.npy", mode="w+", dtype=np.bool_, shape=(num_items,)
-    )
-    has_caption_mm[:] = False  # mặc định KHÔNG có caption, chỉ bật True cho dòng thật xử lý được
+    has_caption_path = output_dir / "caption_has_caption.npy"
+    progress_path = output_dir / "encode_progress.json"
+
+    if progress_path.exists():
+        rows_done = json.loads(progress_path.read_text())["rows_done"]
+        print(f"[encode_captions] resume: {rows_done} dòng đã xử lý ở session trước, bỏ qua.")
+        embeddings_mm = np.lib.format.open_memmap(out_path, mode="r+")
+        has_caption_mm = np.lib.format.open_memmap(has_caption_path, mode="r+")
+    else:
+        rows_done = 0
+        embeddings_mm = np.lib.format.open_memmap(out_path, mode="w+", dtype=np.float32, shape=(num_items, embed_dim))
+        has_caption_mm = np.lib.format.open_memmap(has_caption_path, mode="w+", dtype=np.bool_, shape=(num_items,))
+        has_caption_mm[:] = False  # mặc định KHÔNG có caption, chỉ bật True cho dòng thật xử lý được
 
     try:
-        reader = pd.read_csv(input_csv, chunksize=chunk_size)
+        # skiprows bỏ qua đúng số dòng ĐÃ encode ở session trước — CSV có header nên
+        # pandas tự hiểu skiprows áp dụng SAU header (không cần cộng thêm 1).
+        reader = pd.read_csv(input_csv, chunksize=chunk_size, skiprows=range(1, rows_done + 1) if rows_done else None)
         # chunk_size LỚN (mặc định 1 triệu) — mỗi lần gọi encode(pool=...) qua process
         # boundary có overhead khởi tạo/serialize đáng kể (đã đo thực tế: chunk_size=20_000
         # cho tốc độ ~277 caption/s, CHẬM HƠN CPU đơn luồng 67 caption/s — vì số lần gọi pool
         # quá nhiều, 1602 lần, overhead lấn át lợi ích multi-GPU). Chunk lớn hơn nhiều giảm số
         # lần gọi pool xuống ~32 lần, để mỗi lần pool xử lý đủ khối lượng bù overhead khởi tạo.
-        # Progress bar giờ theo tqdm(total=len(captions)) BÊN TRONG encode(), không phải theo
-        # chunk — vẫn thấy tiến độ mượt dù chunk lớn.
-        for chunk in tqdm(reader, total=(num_items + chunk_size - 1) // chunk_size, unit="chunk", desc="[encode_captions] chunks"):
+        remaining_chunks = (num_items - rows_done + chunk_size - 1) // chunk_size
+        for chunk in tqdm(reader, total=remaining_chunks, unit="chunk", desc="[encode_captions] chunks"):
             video_ids = chunk["final_video_id"].to_numpy()
             captions = chunk["caption"].fillna("").astype(str).tolist()
             # multilingual-e5 yêu cầu prefix "passage: " cho document embedding (khác "query: ")
@@ -93,12 +108,16 @@ def encode_all_captions(
 
             nonempty = chunk["caption"].fillna("").astype(str).str.len() > 0
             has_caption_mm[video_ids[nonempty.to_numpy()]] = True
+
+            rows_done += len(chunk)
+            embeddings_mm.flush()
+            has_caption_mm.flush()
+            progress_path.write_text(json.dumps({"rows_done": rows_done}))
     finally:
         if pool is not None:
             model.stop_multi_process_pool(pool)
 
-    embeddings_mm.flush()
-    has_caption_mm.flush()
+    progress_path.unlink(missing_ok=True)  # xóa checkpoint khi đã xong HẲN, tránh resume nhầm lần sau
     print(f"[encode_captions] DONE -> {out_path}")
 
 
