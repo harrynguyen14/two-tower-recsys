@@ -17,13 +17,21 @@ Cách dùng trên Kaggle:
 2. Tạo Notebook mới, add dataset vừa tạo, BẬT GPU (Settings -> Accelerator -> GPU T4 x2
    hoặc P100), copy nội dung file này vào 1 cell, chạy với đúng --input-csv/--output-dir
    (xem ví dụ lệnh ở cuối file).
-3. Sau khi chạy xong, tải file caption_embeddings.npy từ /kaggle/working/ về, đặt vào
-   D:\\ama-rs\\gen-recsys\\preprocess_data\\output\\ (cùng chỗ với item_static.npy).
+3. Sau khi chạy xong, tải TỪNG file caption_embeddings_shard{i}.npy từ /kaggle/working/ về
+   (xem giải thích sharding bên dưới), đặt cùng vào D:\\ama-rs\\gen-recsys\\preprocess_data\\
+   output\\ (cùng chỗ với item_static.npy).
 
-Output: caption_embeddings.npy (num_items, 384) float32 — index i tương ứng video_id=i
-(giống item_static.npy, identity mapping, ĐÃ XÁC NHẬN video_id liên tục 0..N-1). Item
-không có trong file caption gốc (nếu có) được điền vector 0 (GMU sẽ tự mask qua
-has_caption, không dùng nhánh text cho các dòng này).
+[CHỐT 2026-09-10 — SHARDING] 1 file caption_embeddings.npy duy nhất (num_items=32,038,725 x
+384 x float32) nặng ~49.2GB — VƯỢT giới hạn output 20GB của Kaggle notebook. Chia thành
+`num_shards` file nhỏ hơn (mặc định 4, mỗi file ~12.3GB), mỗi shard chứa 1 dải video_id
+LIÊN TỤC: shard k chứa video_id trong [k*shard_size, (k+1)*shard_size). Tải về từng file
+riêng (Kaggle cho phép tải nhiều lần, không giới hạn tổng dung lượng tải xuống — chỉ giới
+hạn dung lượng LƯU trong 1 lần commit output).
+
+Output: caption_embeddings_shard{k}.npy (shard_size, 384) float32 với k=0..num_shards-1,
+mỗi shard tự chứa cả video_id range của nó — dùng chung has_caption (1 file, nhỏ, không cần
+sharding). Item không có trong file caption gốc (nếu có) được điền vector 0 (GMU sẽ tự mask
+qua has_caption, không dùng nhánh text cho các dòng này).
 """
 
 import argparse
@@ -46,6 +54,40 @@ MODELS_REQUIRE_PASSAGE_PREFIX = {"intfloat/multilingual-e5-base", "intfloat/mult
 MODELS_REQUIRE_TRUST_REMOTE_CODE = {"Alibaba-NLP/gte-multilingual-base"}
 
 
+class ShardedEmbeddingWriter:
+    """N file .npy nhỏ thay vì 1 file khổng lồ (49.2GB cho num_items=32,038,725 x 384 x
+    float32 — VƯỢT giới hạn output 20GB của Kaggle notebook). Shard k chứa video_id trong
+    [k*shard_size, (k+1)*shard_size) — route ghi bằng __setitem__ giống 1 mảng thống nhất,
+    người gọi (encode_all_captions) không cần biết chi tiết sharding.
+    """
+
+    def __init__(self, output_dir: Path, num_items: int, embed_dim: int, num_shards: int, mode: str):
+        self.num_items = num_items
+        self.num_shards = num_shards
+        self.shard_size = (num_items + num_shards - 1) // num_shards
+        self.shards = []
+        for k in range(num_shards):
+            path = output_dir / f"caption_embeddings_shard{k}.npy"
+            start = k * self.shard_size
+            this_shard_len = min(self.shard_size, num_items - start)
+            if mode == "w+":
+                mm = np.lib.format.open_memmap(path, mode="w+", dtype=np.float32, shape=(this_shard_len, embed_dim))
+            else:
+                mm = np.lib.format.open_memmap(path, mode="r+")
+            self.shards.append(mm)
+
+    def __setitem__(self, video_ids: np.ndarray, values: np.ndarray) -> None:
+        shard_idx = video_ids // self.shard_size
+        local_idx = video_ids % self.shard_size
+        for k in np.unique(shard_idx):
+            mask = shard_idx == k
+            self.shards[k][local_idx[mask]] = values[mask]
+
+    def flush(self) -> None:
+        for mm in self.shards:
+            mm.flush()
+
+
 def encode_all_captions(
     input_csv: Path,
     output_dir: Path,
@@ -54,6 +96,7 @@ def encode_all_captions(
     batch_size: int = 256,
     chunk_size: int = 1_000_000,
     multi_gpu: bool = True,
+    num_shards: int = 4,
 ) -> None:
     """Checkpoint/resume: sau MỖI chunk, ghi số dòng đã xử lý vào {output_dir}/
     encode_progress.json. Nếu file này đã tồn tại lúc bắt đầu (session Kaggle trước bị
@@ -80,18 +123,17 @@ def encode_all_captions(
     pool = model.start_multi_process_pool() if use_pool else None
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    out_path = output_dir / "caption_embeddings.npy"
     has_caption_path = output_dir / "caption_has_caption.npy"
     progress_path = output_dir / "encode_progress.json"
 
     if progress_path.exists():
         rows_done = json.loads(progress_path.read_text())["rows_done"]
         print(f"[encode_captions] resume: {rows_done} dòng đã xử lý ở session trước, bỏ qua.")
-        embeddings_mm = np.lib.format.open_memmap(out_path, mode="r+")
+        embeddings_mm = ShardedEmbeddingWriter(output_dir, num_items, embed_dim, num_shards, mode="r+")
         has_caption_mm = np.lib.format.open_memmap(has_caption_path, mode="r+")
     else:
         rows_done = 0
-        embeddings_mm = np.lib.format.open_memmap(out_path, mode="w+", dtype=np.float32, shape=(num_items, embed_dim))
+        embeddings_mm = ShardedEmbeddingWriter(output_dir, num_items, embed_dim, num_shards, mode="w+")
         has_caption_mm = np.lib.format.open_memmap(has_caption_path, mode="w+", dtype=np.bool_, shape=(num_items,))
         has_caption_mm[:] = False  # mặc định KHÔNG có caption, chỉ bật True cho dòng thật xử lý được
 
@@ -143,7 +185,7 @@ def encode_all_captions(
             model.stop_multi_process_pool(pool)
 
     progress_path.unlink(missing_ok=True)  # xóa checkpoint khi đã xong HẲN, tránh resume nhầm lần sau
-    print(f"[encode_captions] DONE -> {out_path}")
+    print(f"[encode_captions] DONE -> {num_shards} shard(s) trong {output_dir}")
 
 
 if __name__ == "__main__":
@@ -159,6 +201,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--chunk-size", type=int, default=1_000_000)
     parser.add_argument("--single-gpu", action="store_true", help="Tắt multi-GPU pool, chỉ dùng 1 GPU/CPU")
+    parser.add_argument("--num-shards", type=int, default=4, help="Chia output thành N file .npy nhỏ (mặc định 4, ~12.3GB/shard)")
     args = parser.parse_args()
 
     encode_all_captions(
@@ -169,4 +212,5 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         multi_gpu=not args.single_gpu,
         chunk_size=args.chunk_size,
+        num_shards=args.num_shards,
     )
