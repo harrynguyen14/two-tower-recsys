@@ -37,7 +37,7 @@ def encode_all_captions(
     num_items: int = NUM_ITEMS,
     model_name: str = MODEL_NAME,
     batch_size: int = 256,
-    chunk_size: int = 20_000,
+    chunk_size: int = 1_000_000,
     multi_gpu: bool = True,
 ) -> None:
     import torch
@@ -65,18 +65,30 @@ def encode_all_captions(
 
     try:
         reader = pd.read_csv(input_csv, chunksize=chunk_size)
-        # chunk_size nhỏ hơn (20k thay vì 200k) để progress bar nhích thường xuyên hơn —
-        # mỗi lần update tương ứng ~1 lượt encode xong, không phải chờ cả trăm nghìn dòng.
-        for chunk in tqdm(reader, total=(num_items + chunk_size - 1) // chunk_size, unit="chunk", desc="[encode_captions]"):
+        # chunk_size LỚN (mặc định 1 triệu) — mỗi lần gọi encode(pool=...) qua process
+        # boundary có overhead khởi tạo/serialize đáng kể (đã đo thực tế: chunk_size=20_000
+        # cho tốc độ ~277 caption/s, CHẬM HƠN CPU đơn luồng 67 caption/s — vì số lần gọi pool
+        # quá nhiều, 1602 lần, overhead lấn át lợi ích multi-GPU). Chunk lớn hơn nhiều giảm số
+        # lần gọi pool xuống ~32 lần, để mỗi lần pool xử lý đủ khối lượng bù overhead khởi tạo.
+        # Progress bar giờ theo tqdm(total=len(captions)) BÊN TRONG encode(), không phải theo
+        # chunk — vẫn thấy tiến độ mượt dù chunk lớn.
+        for chunk in tqdm(reader, total=(num_items + chunk_size - 1) // chunk_size, unit="chunk", desc="[encode_captions] chunks"):
             video_ids = chunk["final_video_id"].to_numpy()
             captions = chunk["caption"].fillna("").astype(str).tolist()
             # multilingual-e5 yêu cầu prefix "passage: " cho document embedding (khác "query: ")
             captions = [f"passage: {c}" for c in captions]
 
             if pool is not None:
-                emb = model.encode_multi_process(captions, pool, batch_size=batch_size)
+                # sentence-transformers >=3.2 gộp multi-process vào encode(pool=...), bản cũ
+                # hơn (đã xác nhận local đang có 3.0.1) chỉ có encode_multi_process() riêng —
+                # Kaggle có thể cài bản khác local, thử API mới trước, rơi về API cũ nếu
+                # TypeError (tham số pool không tồn tại).
+                try:
+                    emb = model.encode(captions, pool=pool, batch_size=batch_size, show_progress_bar=True)
+                except TypeError:
+                    emb = model.encode_multi_process(captions, pool, batch_size=batch_size)
             else:
-                emb = model.encode(captions, batch_size=batch_size, show_progress_bar=False, convert_to_numpy=True)
+                emb = model.encode(captions, batch_size=batch_size, show_progress_bar=True, convert_to_numpy=True)
             embeddings_mm[video_ids] = emb.astype(np.float32)
 
             nonempty = chunk["caption"].fillna("").astype(str).str.len() > 0
@@ -101,7 +113,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-items", type=int, default=NUM_ITEMS)
     parser.add_argument("--model-name", type=str, default=MODEL_NAME)
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--chunk-size", type=int, default=20_000)
+    parser.add_argument("--chunk-size", type=int, default=1_000_000)
     parser.add_argument("--single-gpu", action="store_true", help="Tắt multi-GPU pool, chỉ dùng 1 GPU/CPU")
     args = parser.parse_args()
 
