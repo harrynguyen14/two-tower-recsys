@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sentence_transformers import SentenceTransformer
+from tqdm import tqdm
 
 NUM_ITEMS = 32_038_725  # tổng số item KuaiRand-27K, đã xác nhận video_id liên tục 0..N-1
 MODEL_NAME = "intfloat/multilingual-e5-base"
@@ -55,8 +56,8 @@ def encode_all_captions(
     has_caption_mm[:] = False  # mặc định KHÔNG có caption, chỉ bật True cho dòng thật xử lý được
 
     reader = pd.read_csv(input_csv, chunksize=chunk_size)
-    total_processed = 0
-    for chunk_idx, chunk in enumerate(reader):
+    progress = tqdm(total=num_items, unit="caption", desc="[encode_captions]")
+    for chunk in reader:
         video_ids = chunk["final_video_id"].to_numpy()
         captions = chunk["caption"].fillna("").astype(str).tolist()
         # multilingual-e5 yêu cầu prefix "passage: " cho document embedding (khác "query: ")
@@ -68,8 +69,8 @@ def encode_all_captions(
         nonempty = chunk["caption"].fillna("").astype(str).str.len() > 0
         has_caption_mm[video_ids[nonempty.to_numpy()]] = True
 
-        total_processed += len(chunk)
-        print(f"[encode_captions] chunk {chunk_idx}: {total_processed}/{num_items} processed")
+        progress.update(len(chunk))
+    progress.close()
 
     embeddings_mm.flush()
     has_caption_mm.flush()
