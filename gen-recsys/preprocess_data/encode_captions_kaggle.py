@@ -37,15 +37,23 @@ def encode_all_captions(
     num_items: int = NUM_ITEMS,
     model_name: str = MODEL_NAME,
     batch_size: int = 256,
-    chunk_size: int = 200_000,
+    chunk_size: int = 20_000,
+    multi_gpu: bool = True,
 ) -> None:
     import torch
 
+    num_gpus = torch.cuda.device_count()
+    use_pool = multi_gpu and num_gpus > 1
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[encode_captions] device = {device}")
+    print(f"[encode_captions] device={device} num_gpus={num_gpus} multi_gpu_pool={use_pool}")
 
     model = SentenceTransformer(model_name, device=device)
     embed_dim = model.get_sentence_embedding_dimension()
+
+    # start_multi_process_pool: chia batch qua từng process/GPU riêng (API chính thức
+    # sentence-transformers cho multi-GPU) — CHỈ có lợi khi >1 GPU, vì mỗi process tốn thời
+    # gian khởi động riêng, không đáng với 1 GPU (xem cảnh báo GPU thứ 2 rảnh 0% ở Kaggle).
+    pool = model.start_multi_process_pool() if use_pool else None
 
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / "caption_embeddings.npy"
@@ -55,22 +63,27 @@ def encode_all_captions(
     )
     has_caption_mm[:] = False  # mặc định KHÔNG có caption, chỉ bật True cho dòng thật xử lý được
 
-    reader = pd.read_csv(input_csv, chunksize=chunk_size)
-    progress = tqdm(total=num_items, unit="caption", desc="[encode_captions]")
-    for chunk in reader:
-        video_ids = chunk["final_video_id"].to_numpy()
-        captions = chunk["caption"].fillna("").astype(str).tolist()
-        # multilingual-e5 yêu cầu prefix "passage: " cho document embedding (khác "query: ")
-        captions = [f"passage: {c}" for c in captions]
+    try:
+        reader = pd.read_csv(input_csv, chunksize=chunk_size)
+        # chunk_size nhỏ hơn (20k thay vì 200k) để progress bar nhích thường xuyên hơn —
+        # mỗi lần update tương ứng ~1 lượt encode xong, không phải chờ cả trăm nghìn dòng.
+        for chunk in tqdm(reader, total=(num_items + chunk_size - 1) // chunk_size, unit="chunk", desc="[encode_captions]"):
+            video_ids = chunk["final_video_id"].to_numpy()
+            captions = chunk["caption"].fillna("").astype(str).tolist()
+            # multilingual-e5 yêu cầu prefix "passage: " cho document embedding (khác "query: ")
+            captions = [f"passage: {c}" for c in captions]
 
-        emb = model.encode(captions, batch_size=batch_size, show_progress_bar=False, convert_to_numpy=True)
-        embeddings_mm[video_ids] = emb.astype(np.float32)
+            if pool is not None:
+                emb = model.encode_multi_process(captions, pool, batch_size=batch_size)
+            else:
+                emb = model.encode(captions, batch_size=batch_size, show_progress_bar=False, convert_to_numpy=True)
+            embeddings_mm[video_ids] = emb.astype(np.float32)
 
-        nonempty = chunk["caption"].fillna("").astype(str).str.len() > 0
-        has_caption_mm[video_ids[nonempty.to_numpy()]] = True
-
-        progress.update(len(chunk))
-    progress.close()
+            nonempty = chunk["caption"].fillna("").astype(str).str.len() > 0
+            has_caption_mm[video_ids[nonempty.to_numpy()]] = True
+    finally:
+        if pool is not None:
+            model.stop_multi_process_pool(pool)
 
     embeddings_mm.flush()
     has_caption_mm.flush()
@@ -88,7 +101,8 @@ if __name__ == "__main__":
     parser.add_argument("--num-items", type=int, default=NUM_ITEMS)
     parser.add_argument("--model-name", type=str, default=MODEL_NAME)
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--chunk-size", type=int, default=200_000)
+    parser.add_argument("--chunk-size", type=int, default=20_000)
+    parser.add_argument("--single-gpu", action="store_true", help="Tắt multi-GPU pool, chỉ dùng 1 GPU/CPU")
     args = parser.parse_args()
 
     encode_all_captions(
@@ -97,5 +111,6 @@ if __name__ == "__main__":
         num_items=args.num_items,
         model_name=args.model_name,
         batch_size=args.batch_size,
+        multi_gpu=not args.single_gpu,
         chunk_size=args.chunk_size,
     )
