@@ -30,6 +30,15 @@ NUM_ITEMS = 32_038_725  # tổng số item KuaiRand-27K, đã xác nhận video_
 MODEL_NAME = "intfloat/multilingual-e5-base"
 
 
+# Model nào cần prefix "passage: "/"query: " trước mỗi câu (chuẩn E5-style asymmetric
+# embedding) — GTE/BGE/text2vec KHÔNG cần, tự thêm sai prefix sẽ làm giảm chất lượng.
+MODELS_REQUIRE_PASSAGE_PREFIX = {"intfloat/multilingual-e5-base", "intfloat/multilingual-e5-small", "intfloat/multilingual-e5-large"}
+# Model cần trust_remote_code=True để tải code custom (đã XÁC NHẬN qua test trực tiếp:
+# Alibaba-NLP/gte-multilingual-base tự tải thêm code từ Alibaba-NLP/new-impl trên HF Hub —
+# chấp nhận rủi ro supply-chain vì là model chính thức của Alibaba, đã CHỐT 2026-09-10).
+MODELS_REQUIRE_TRUST_REMOTE_CODE = {"Alibaba-NLP/gte-multilingual-base"}
+
+
 def encode_all_captions(
     input_csv: Path,
     output_dir: Path,
@@ -50,9 +59,12 @@ def encode_all_captions(
     num_gpus = torch.cuda.device_count()
     use_pool = multi_gpu and num_gpus > 1
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[encode_captions] device={device} num_gpus={num_gpus} multi_gpu_pool={use_pool}")
+    print(f"[encode_captions] device={device} num_gpus={num_gpus} multi_gpu_pool={use_pool} model={model_name}")
 
-    model = SentenceTransformer(model_name, device=device)
+    needs_prefix = model_name in MODELS_REQUIRE_PASSAGE_PREFIX
+    needs_remote_code = model_name in MODELS_REQUIRE_TRUST_REMOTE_CODE
+    model_kwargs = {"trust_remote_code": True} if needs_remote_code else {}
+    model = SentenceTransformer(model_name, device=device, **model_kwargs)
     embed_dim = model.get_sentence_embedding_dimension()
 
     # start_multi_process_pool: chia batch qua từng process/GPU riêng (API chính thức
@@ -95,8 +107,9 @@ def encode_all_captions(
             print(f"[encode_captions] chunk {chunk_idx + 1}/{remaining_chunks} ({rows_done} dòng đã xong)")
             video_ids = chunk["final_video_id"].to_numpy()
             captions = chunk["caption"].fillna("").astype(str).tolist()
-            # multilingual-e5 yêu cầu prefix "passage: " cho document embedding (khác "query: ")
-            captions = [f"passage: {c}" for c in captions]
+            if needs_prefix:
+                # chỉ E5-style: prefix "passage: " cho document embedding (khác "query: ")
+                captions = [f"passage: {c}" for c in captions]
 
             if pool is not None:
                 # sentence-transformers >=3.2 gộp multi-process vào encode(pool=...), bản cũ
