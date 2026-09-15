@@ -18,7 +18,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from confidence_attention import ConfidenceModulatedAttention
+from confidence_attention import ConfidenceModulatedAttention, compute_prod
 
 
 class DecoderBlock(nn.Module):
@@ -45,8 +45,9 @@ class DecoderBlock(nn.Module):
         key_padding_mask: torch.Tensor | None = None,  # (B, L) bool, True = padding
         log_u: torch.Tensor | None = None,  # (B, L) — log(u_i + ε), xem confidence_attention.py
         log_m: torch.Tensor | None = None,  # (B, L) — log(m_j + ε)
+        prod: torch.Tensor | None = None,  # (B,1,L,L) tính sẵn ở SequenceDecoder (tránh OOM)
     ) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x), key_padding_mask, log_u=log_u, log_m=log_m)
+        x = x + self.attn(self.norm1(x), key_padding_mask, log_u=log_u, log_m=log_m, prod=prod)
         x = x + self.ffn(self.norm2(x))
         return x
 
@@ -85,8 +86,19 @@ class SequenceDecoder(nn.Module):
     ) -> torch.Tensor:
         """log_u/log_m truyền cho MỌI layer (không chỉ layer đầu): chúng là thuộc tính của
         TOKEN, không phải của biểu diễn ở 1 tầng cụ thể — mỗi tầng attention đều cần biết
-        token j đáng tin đến đâu và user đang ở giai đoạn nào."""
+        token j đáng tin đến đâu và user đang ở giai đoạn nào.
+
+        [SỬA 2026-09-15] prod = log(u_i)·log(m_j) tính MỘT LẦN ở đây rồi dùng chung cho mọi
+        layer, thay vì để từng layer tự tính. prod chỉ phụ thuộc (log_u, log_m) — cả hai
+        KHÔNG đổi qua các layer — nên tính lại mỗi layer là tạo num_layers bản (B,1,L,L)
+        giống hệt nhau, autograd giữ hết cho backward: ở B=256, L=513, fp32 là 269 MB/bản,
+        4 layer = 1.05 GB thừa -> CUDA OOM thật trên T4 (nhánh ablation #4/#5 chết ở
+        loss.backward()). Cùng giá trị, cùng gradient — chỉ khác bộ nhớ."""
+        prod = None
+        if log_u is not None and log_m is not None and any(l.attn.use_gamma for l in self.layers):
+            prod = compute_prod(log_u, log_m)
+
         x = token_embeddings
         for layer in self.layers:
-            x = layer(x, key_padding_mask, log_u=log_u, log_m=log_m)
+            x = layer(x, key_padding_mask, log_u=log_u, log_m=log_m, prod=prod)
         return self.final_norm(x)  # (B, L, dim) — hidden state tại mọi vị trí (causal, vị trí t chỉ thấy <=t)

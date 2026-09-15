@@ -70,6 +70,20 @@ EPS = 1e-6  # chặn log(0) khi u_i hoặc m_j = 0 (item/user hoàn toàn mới)
 PROD_CLAMP = 10.0
 
 
+def compute_prod(log_u: torch.Tensor, log_m: torch.Tensor) -> torch.Tensor:
+    """log(u_i)·log(m_j) đã clamp — (B, L) × (B, L) -> (B, 1, L, L).
+
+    Tách ra hàm riêng để SequenceDecoder tính MỘT LẦN rồi truyền cho mọi layer: tensor này
+    chỉ phụ thuộc (log_u, log_m), vốn không đổi qua các layer, nên tính lại mỗi layer là
+    lãng phí 4× bộ nhớ và ĐÃ gây CUDA OOM thật ở B=256, L=513 (xem forward()).
+
+    Trục 1 để size 1 (không phải num_heads): bias giống nhau cho mọi head, hệ số γ_h riêng
+    theo head mới nhân vào sau — broadcast lo phần còn lại, không cần nhân bản theo head.
+    """
+    B, L = log_u.shape
+    return (log_u.view(B, 1, L, 1) * log_m.view(B, 1, 1, L)).clamp(-PROD_CLAMP, PROD_CLAMP)
+
+
 class ConfidenceModulatedAttention(nn.Module):
     """Causal self-attention + pairwise confidence bias (xem docstring module).
 
@@ -119,6 +133,7 @@ class ConfidenceModulatedAttention(nn.Module):
         key_padding_mask: torch.Tensor | None = None,  # (B, L) bool, True = padding (bỏ qua)
         log_u: torch.Tensor | None = None,  # (B, L) — log(user_weight tại vị trí i + ε)
         log_m: torch.Tensor | None = None,  # (B, L) — log(item_weight của token j + ε)
+        prod: torch.Tensor | None = None,  # (B, 1, L, L) — log(u_i)·log(m_j) ĐÃ clamp, xem dưới
     ) -> torch.Tensor:
         B, L, _ = x.shape
 
@@ -145,8 +160,19 @@ class ConfidenceModulatedAttention(nn.Module):
             # bệnh lý. Đuôi đó sinh từ log(EPS)=-13.8 khi u hoặc m = 0 TUYỆT ĐỐI — tức token
             # hoàn toàn mới, đúng chỗ tín hiệu KÉM tin cậy nhất lại đang có ảnh hưởng lớn
             # nhất. Kẹp ở đây là sửa đúng nghịch lý đó, không phải che triệu chứng.
+            #
+            # [SỬA 2026-09-15 — OOM] `prod` giờ TÍNH SẴN Ở SequenceDecoder và truyền xuống,
+            # không tính lại trong từng layer. Lý do: prod chỉ phụ thuộc (log_u, log_m) —
+            # hai tensor GIỐNG HỆT NHAU qua mọi layer — nên tính lại mỗi layer là tạo 4 bản
+            # (B,1,L,L) y hệt và autograd giữ cả 4 cho backward. Ở B=256, L=513, fp32 mỗi
+            # bản là 269 MB -> 1.05 GB thừa, đủ để CUDA OOM trên T4 15GB (đã xảy ra thật:
+            # nhánh #4/#5 chết ở loss.backward(), "Tried to allocate 1.01 GiB").
+            # Đây là tối ưu THUẦN BỘ NHỚ: cùng giá trị, cùng gradient, cùng kết quả — nên
+            # ablation vẫn so sánh được với #1/#2/#3 ở CÙNG batch=256.
+            # Fallback tự tính khi prod=None để module dùng độc lập được (test đơn vị).
             if self.use_gamma:
-                prod = (log_u.view(B, 1, L, 1) * log_m.view(B, 1, 1, L)).clamp(-PROD_CLAMP, PROD_CLAMP)
+                if prod is None:
+                    prod = compute_prod(log_u, log_m)
                 logit = logit + self.gamma.view(1, -1, 1, 1) * prod
 
         # δ_h · log(1 + i − j) — relative position bias, trục ngắn/dài hạn
