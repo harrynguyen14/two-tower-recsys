@@ -28,6 +28,7 @@ single-device trước, thêm khi có 2 GPU T4 thật để test.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -36,6 +37,27 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+
+# [SỬA 2026-09-15] Set GEN_RECSYS_OUT_DIR TRƯỚC khi import build_n_cumulative — module đó
+# đọc env var ở cấp module (biến OUT_DIR), nên set sau khi import là VÔ TÁC DỤNG.
+#
+# Vì sao phải làm ở đây, trước cả argparse: build_n_cumulative.OUT_DIR trước đây hard-code
+# thành thư mục cạnh file code, bỏ qua --output-dir hoàn toàn. Trên máy dev hai đường dẫn
+# trùng nhau nên không lộ; trên Kaggle (code /kaggle/working, dữ liệu /kaggle/input) thì
+# FileNotFoundError: item_N_ids.npy, cả 5 nhánh ablation cùng chết ở step 0.
+# Đọc --output-dir bằng tay từ sys.argv vì argparse chỉ chạy ở __main__, sau import.
+def _peek_output_dir() -> str | None:
+    for i, a in enumerate(sys.argv):
+        if a == "--output-dir" and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if a.startswith("--output-dir="):
+            return a.split("=", 1)[1]
+    return None
+
+
+_out = _peek_output_dir()
+if _out and not os.environ.get("GEN_RECSYS_OUT_DIR"):
+    os.environ["GEN_RECSYS_OUT_DIR"] = str(Path(_out).resolve())
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "preprocess_data"))
 from build_n_cumulative import build_n_cache, lookup_n_at_t_batch_cached  # noqa: E402

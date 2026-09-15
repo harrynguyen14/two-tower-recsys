@@ -96,7 +96,15 @@ def main() -> None:
         sys.exit(f"--output-dir không tồn tại: {args.output_dir}")
     # Kiểm tra SỚM: thiếu file dữ liệu thì mọi nhánh cùng chết ở step 0, mất hàng chục phút
     # mới biết. Thà báo ngay.
-    missing = [f for f in ("train.npy", "val.npy", "item_static.npy") if not (Path(args.output_dir) / f).is_file()]
+    required = (
+        "train.npy", "val.npy", "item_static.npy", "user_static.npy",
+        # Pass 1 (build_n_cumulative) — thiếu nhóm này là lỗi ĐÃ XẢY RA THẬT trên Kaggle:
+        # train.py chết ở build_n_cache("item_N") sau khi đã nạp xong dataset, nên mất ~10s
+        # mỗi nhánh × 5 nhánh mới biết. Kiểm ở đây thì biết trong 1 giây.
+        "item_N_ids.npy", "item_N_offsets.npy", "item_N_events.npy",
+        "category_N_ids.npy", "user_N_ids.npy",
+    )
+    missing = [f for f in required if not (Path(args.output_dir) / f).is_file()]
     if missing:
         sys.exit(f"--output-dir thiếu file: {', '.join(missing)} (trong {args.output_dir})")
 

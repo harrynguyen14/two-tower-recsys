@@ -21,6 +21,7 @@ Tra cứu N(id, t): 2 lần np.searchsorted liên tiếp (id trong ids, rồi t 
 timestamps[offsets[i]:offsets[i+1]]) — hoàn toàn vector hóa, KHÔNG vòng lặp Python.
 """
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -34,7 +35,20 @@ LOG_STANDARD_FILES = [
     LOG_DIR / "log_standard_4_22_to_5_08_pure.csv",
 ]
 VIDEO_BASIC_FILE = LOG_DIR / "video_features_basic_pure.csv"
-OUT_DIR = Path(__file__).parent / "output"
+# [SỬA 2026-09-15] Cho phép ghi đè qua biến môi trường GEN_RECSYS_OUT_DIR.
+#
+# Vì sao cần: trước đây OUT_DIR hard-code = thư mục cạnh FILE CODE. Lúc BUILD dữ liệu điều
+# đó đúng (code và output cùng chỗ), nhưng lúc TRAIN thì train.py nhận --output-dir riêng —
+# và module này bỏ qua nó hoàn toàn. Trên máy dev hai đường dẫn tình cờ trùng nên không ai
+# phát hiện; trên Kaggle/Colab (code ở /kaggle/working, dữ liệu ở /kaggle/input) thì chết
+# ngay với FileNotFoundError: item_N_ids.npy — 5/5 nhánh ablation cùng chết.
+#
+# Dùng env var thay vì thêm tham số hàm: build_n_cache()/lookup_n_at_t_batch() được gọi từ
+# 4 file khác nhau (train.py, build_interactions.py, build_dataset_kuairand.py,
+# test_pipeline_smoke.py); đổi chữ ký hàm sẽ phải sửa cả 4 và dễ sót. train.py set env này
+# ngay khi biết --output-dir, TRƯỚC khi import module — xem train.py.
+# Không set env -> giữ nguyên hành vi cũ, nên 4 caller hiện tại không bị ảnh hưởng.
+OUT_DIR = Path(os.environ.get("GEN_RECSYS_OUT_DIR") or (Path(__file__).parent / "output"))
 
 
 def _first_interaction_per_item() -> pl.DataFrame:
