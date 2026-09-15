@@ -43,9 +43,14 @@ ABLATIONS = [
      "e_profile prepend có đáng giá không"),
     (3, "beta", ["--no-gamma"],
      "beta*log(m_j): bias phía item một mình đủ chưa"),
-    (4, "gamma_full", [],
+    # Nhánh 4/5 BẮT BUỘC --checkpoint: bật γ thêm một tensor (B,H,L,L) = 1.00 GiB ở
+    # B=256/H=4/L=513/fp32 mà autograd phải giữ -> CUDA OOM trên T4 15GB (đã xảy ra thật,
+    # lỗi ghi đúng "Tried to allocate 1.01 GiB"). Checkpointing đổi ~30% thời gian lấy ~70%
+    # VRAM và KHÔNG đổi phép toán nào, nên vẫn so sánh được với nhánh 1-3 ở CÙNG batch=256
+    # — điều kiện bắt buộc để ablation có giá trị.
+    (4, "gamma_full", ["--checkpoint"],
      "gamma*log(u_i)*log(m_j): số hạng TÍCH có đóng góp RIÊNG không  <-- QUYẾT ĐỊNH"),
-    (5, "gamma_static_u", ["--static-user-weight"],
+    (5, "gamma_static_u", ["--static-user-weight", "--checkpoint"],
      "gamma nhưng u TĨNH per-user: per-position có phải mấu chốt không  <-- QUYẾT ĐỊNH"),
 ]
 

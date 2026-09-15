@@ -49,6 +49,7 @@ class SequenceModel(nn.Module):
         interleave: bool = True,  # True = xen kẽ [Φ_0,a_0,Φ_1,a_1,...] (HSTU); False = cộng gộp (ablation)
         use_beta: bool = True,   # ablation #3: tắt β·log m_j
         use_gamma: bool = True,  # ablation #4: tắt γ·log u_i·log m_j (số hạng TÍCH)
+        use_checkpoint: bool = False,  # gradient checkpointing (tiết kiệm VRAM, xem decoder.py)
     ):
         super().__init__()
         self.dim = dim
@@ -74,7 +75,7 @@ class SequenceModel(nn.Module):
 
         self.decoder = SequenceDecoder(
             dim, num_heads, num_layers, ffn_dim, dropout, max_seq_len=max_seq_len,
-            use_beta=use_beta, use_gamma=use_gamma,
+            use_beta=use_beta, use_gamma=use_gamma, use_checkpoint=use_checkpoint,
         )
 
     def forward(

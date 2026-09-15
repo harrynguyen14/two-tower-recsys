@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from confidence_attention import ConfidenceModulatedAttention, compute_prod
 
@@ -66,8 +67,10 @@ class SequenceDecoder(nn.Module):
         self, dim: int, num_heads: int, num_layers: int, ffn_dim: int,
         dropout: float = 0.0, max_seq_len: int = 513,
         use_beta: bool = True, use_gamma: bool = True,  # công tắc ablation #3/#4
+        use_checkpoint: bool = False,  # gradient checkpointing, xem forward()
     ):
         super().__init__()
+        self.use_checkpoint = use_checkpoint
         self.layers = nn.ModuleList([
             DecoderBlock(
                 dim, num_heads, ffn_dim, dropout, max_seq_len=max_seq_len,
@@ -100,5 +103,23 @@ class SequenceDecoder(nn.Module):
 
         x = token_embeddings
         for layer in self.layers:
-            x = layer(x, key_padding_mask, log_u=log_u, log_m=log_m, prod=prod)
+            if self.use_checkpoint and self.training:
+                # [THÊM 2026-09-15] Gradient checkpointing — KHÔNG lưu tensor trung gian của
+                # layer, tính lại khi backward. Đổi ~30% thời gian lấy ~70% bộ nhớ.
+                #
+                # Vì sao cần: mỗi phép `logit = logit + bias` trong attention tạo một tensor
+                # (B,H,L,L) MỚI mà autograd phải giữ. Ở B=256, H=4, L=513, fp32 = 1.00 GiB
+                # MỖI BẢN, và có 9 phép như vậy mỗi layer (qk, +β, +γ, +δ, 2×masked_fill,
+                # softmax, nan_to_num, dropout). Bật γ thêm đúng 1 bản -> vượt ngưỡng T4
+                # 15GB. Khớp chính xác lỗi thật: "Tried to allocate 1.01 GiB".
+                #
+                # use_reentrant=False: bản mới, bắt buộc để hoạt động đúng với tham số
+                # không nhận gradient ở một số nhánh ablation (β/γ bị tắt) — bản reentrant
+                # cũ sẽ báo lỗi hoặc bỏ qua gradient trong trường hợp đó.
+                # self.training: eval không cần checkpointing (torch.no_grad, không lưu gì).
+                x = checkpoint(
+                    layer, x, key_padding_mask, log_u, log_m, prod, use_reentrant=False
+                )
+            else:
+                x = layer(x, key_padding_mask, log_u=log_u, log_m=log_m, prod=prod)
         return self.final_norm(x)  # (B, L, dim) — hidden state tại mọi vị trí (causal, vị trí t chỉ thấy <=t)

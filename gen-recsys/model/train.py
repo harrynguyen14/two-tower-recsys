@@ -316,6 +316,7 @@ def train(
     static_user_weight: bool = False,  # ablation #5: u_i tĩnh per-user (xem run_batch_forward)
     use_beta: bool = True,   # ablation #3: tắt β·log m_j (xem confidence_attention.py)
     use_gamma: bool = True,  # ablation #4: tắt γ·log u_i·log m_j — số hạng TÍCH, đóng góp chính
+    use_checkpoint: bool = False,  # gradient checkpointing — BẮT BUỘC cho nhánh có γ ở batch lớn
     device_str: str = "cuda" if torch.cuda.is_available() else "cpu",
 ):
     output_dir = Path(output_dir)
@@ -344,7 +345,7 @@ def train(
         # +1 cho token profile prepend (xem sequence_model.py forward) — thiếu 1 slot ở đây
         # là IndexError trong position_embedding ngay step đầu.
         max_seq_len=(2 * MAX_SEQ_LEN if interleave else MAX_SEQ_LEN) + 1, interleave=interleave,
-        use_beta=use_beta, use_gamma=use_gamma,
+        use_beta=use_beta, use_gamma=use_gamma, use_checkpoint=use_checkpoint,
     ).to(device)
     profile_config = UserProfileConfig(
         onehot_num_categories=train_dataset.onehot_num_categories, dim=dim,
@@ -557,6 +558,7 @@ if __name__ == "__main__":
     parser.add_argument("--static-user-weight", action="store_true", help="ABLATION #5: u_i TĨNH per-user (N_u tại điểm dự đoán, broadcast ra K vị trí) thay vì per-position. Thí nghiệm tách bạch đóng góp 'cold-start là đại lượng per-position' — xem run_batch_forward()")
     parser.add_argument("--no-beta", action="store_true", help="ABLATION #3: tắt số hạng β·log m_j trong attention bias")
     parser.add_argument("--no-gamma", action="store_true", help="ABLATION #4: tắt số hạng TÍCH γ·log(u_i)·log(m_j) — đóng góp chính, ablation quan trọng nhất")
+    parser.add_argument("--checkpoint", action="store_true", help="Gradient checkpointing: chậm ~30%%, tiết kiệm ~70%% VRAM. BẮT BUỘC cho nhánh có γ ở batch=256 trên T4 15GB (nếu không sẽ CUDA OOM ở loss.backward)")
     args = parser.parse_args()
     train(
         output_dir=args.output_dir,
@@ -570,4 +572,5 @@ if __name__ == "__main__":
         static_user_weight=args.static_user_weight,
         use_beta=not args.no_beta,
         use_gamma=not args.no_gamma,
+        use_checkpoint=args.checkpoint,
     )
