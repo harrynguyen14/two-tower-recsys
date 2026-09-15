@@ -111,6 +111,20 @@ def main() -> None:
     log_dir = Path(args.log_dir).resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
 
+    # [THÊM 2026-09-15] Xoá log CŨ của đúng các nhánh sắp chạy. Không phải dọn cho gọn:
+    # parse_logs() cuối run dùng glob theo mẫu abl{id}_*.log, nên log của lần chạy TRƯỚC
+    # (hỏng, hoặc chạy với tham số khác) sẽ bị đọc lẫn và in ra số SAI mà không ai biết.
+    # Đã gây hiểu nhầm thật: 5 log của lần chạy lỗi rc=2 nằm lại trong thư mục, trông như
+    # cả 5 nhánh đang chạy song song.
+    # Chỉ xoá nhánh trong `todo` — `--only 4,5` KHÔNG được đụng log của nhánh 1,2,3.
+    stale = [p for aid, _, _, _ in todo for p in log_dir.glob(f"abl{aid}_*.log")]
+    if stale:
+        print(f"Xoá {len(stale)} log cũ của các nhánh sắp chạy:")
+        for p in stale:
+            print(f"  - {p.name}")
+            p.unlink()
+        print()
+
     # UTF-8 BẮT BUỘC: stdout Windows mặc định cp1252, gặp tiếng Việt trong log là
     # UnicodeEncodeError và cả run chết giữa chừng (đã xảy ra thật 2026-09-15).
     env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
