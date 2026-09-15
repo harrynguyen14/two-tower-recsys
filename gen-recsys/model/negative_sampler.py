@@ -37,9 +37,34 @@ class NegativeSampler:
         self.log_probs = np.log(self.probs)
         self.num_items = num_items
 
-    def sample(self, batch_size: int, num_negatives: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-        """Trả về (negative_video_ids, log_q) — shape (batch_size, num_negatives)."""
+    def sample(
+        self,
+        batch_size: int,
+        num_negatives: int,
+        device: torch.device,
+        exclude: torch.Tensor | None = None,  # (batch_size,) video_id positive cần loại
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Trả về (negative_video_ids, log_q) — shape (batch_size, num_negatives).
+
+        [SỬA 2026-09-14] Thêm `exclude` — loại FALSE NEGATIVE. Bug cũ: sample theo tần suất
+        KHÔNG loại positive, nên positive thường xuyên nằm trong tập negative của chính nó.
+        Cross-entropy khi đó phạt model vì xếp positive lên cao — hại trực tiếp metric. Rủi
+        ro cao trên Pure: chỉ 7,583 item với 100 negative/sample, sampling theo tần suất còn
+        dồn về item phổ biến.
+
+        Resample lặp (tối đa 10 vòng) thay vì 1 lần: lần resample vẫn có thể trúng lại
+        positive. 10 vòng đủ để xác suất còn sót không đáng kể với mọi phân phối thực tế."""
         neg_ids = np.random.choice(self.num_items, size=(batch_size, num_negatives), p=self.probs)
+
+        if exclude is not None:
+            pos = exclude.detach().cpu().numpy().reshape(-1, 1)  # (B, 1) broadcast theo cột
+            for _ in range(10):
+                collide = neg_ids == pos
+                n_collide = int(collide.sum())
+                if n_collide == 0:
+                    break
+                neg_ids[collide] = np.random.choice(self.num_items, size=n_collide, p=self.probs)
+
         log_q = self.log_probs[neg_ids]
         return (
             torch.from_numpy(neg_ids.astype(np.int64)).to(device),

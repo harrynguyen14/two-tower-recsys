@@ -1,29 +1,72 @@
-"""Item embedding module — biến 1 item thành 1 embedding E_i, dùng làm token trong chuỗi
-user hoặc làm candidate lúc decode (KHÔNG phải "item tower" — xem lưu ý thuật ngữ ở
+"""Item embedding module — biến 1 item thành 1 embedding e_i_final, dùng làm token trong
+chuỗi user hoặc làm candidate lúc decode (KHÔNG phải "item tower" — xem lưu ý thuật ngữ ở
 idea.md mục 4.5 đầu mục "Đề xuất thiết kế cụ thể").
 
+[SỬA 2026-09-13] Đổi tên biến cho tường minh (xem result.md "CHECKLIST CUỐI CÙNG"),
+KHÔNG đổi công thức:
+    mat_i             -> item_weight
+    conf_content      -> category_confidence
+    content_branch_shrunk -> category_content_shrunk
+    collaborative_branch  -> e_collab
+    content_branch        -> e_content
+    E_i                   -> e_i_final
+
 Công thức đã chốt (idea.md mục 4.5 điểm 2 + điểm 3):
-    conf_content(i)       = tanh(N_category(i) / τ_c)
-    content_branch_shrunk = content_branch(i) · conf_content(i)
-    g_i                   = σ(MLP([mat_i, collaborative_branch(i), content_branch(i)]))
-    E_i                   = g_i · collaborative_branch(i) + (1-g_i) · content_branch_shrunk
+    category_confidence(i)  = tanh(N_category(i) / τ_c)
+    category_content_shrunk = e_content(i) · category_confidence(i)
+    g_i                     = σ(MLP([item_weight, e_collab(i), e_content(i)]))
+    e_i_final               = g_i · e_collab(i) + (1-g_i) · category_content_shrunk
 
-collaborative_branch: nn.Embedding(num_items, dim) học từ đầu theo video_id — thuần ID
-embedding, KHÔNG dùng feature nào khác (đã chốt 2026-09-10). Do catalog 32,038,725 item
-(dim=64 -> ~8.2GB), cần chia model parallelism (item_id % 2 -> GPU0/GPU1, xem idea.md
-mục "TRẠNG THÁI DỰ ÁN" quyết định #1) — CHƯA làm ở module này (single-GPU trước, xem
-TODO ở EmbeddingConfig), thêm khi có 2 GPU thật để test.
+e_collab: học từ đầu theo video_id — thuần ID embedding, KHÔNG dùng feature nào khác (đã
+chốt 2026-09-10). Do catalog lớn, cần chia model parallelism (item_id % 2 -> GPU0/GPU1,
+xem idea.md mục "TRẠNG THÁI DỰ ÁN" quyết định #1) — CHƯA làm ở module này (single-GPU
+trước, xem TODO ở EmbeddingConfig), thêm khi có 2 GPU thật để test.
 
-content_branch: qua GMU (gmu.py) fuse các nhánh tĩnh của item — categorical (category
-1 cấp cũ + category 4 cấp mới + author + music + video_type + music_type) và numeric
-(8 feature thống kê đã chuẩn hóa). author_idx/music_idx CŨNG nằm trong content_branch
-(đã CHỐT 2026-09-10 — xem hỏi-đáp: "author/music là 1 nhánh trong content_branch qua
-GMU", KHÔNG tách riêng thành số hạng thứ 3 trong E_i, giữ đúng công thức 2 nhánh).
+[THÊM 2026-09-11] `use_cuckoo_embedding=True` (mặc định) thay nn.Embedding cố định bằng
+CuckooEmbedding (xem cuckoo_embedding.py, lấy cảm hứng ByteDance Monolith "Collisionless
+Embedding Table") cho 3 bảng ID lớn (collaborative/author/music) — giải quyết đúng gap đã
+tìm thấy khi review kiến trúc: nn.Embedding(num_items, dim) cố định kích thước lúc train
+KHÔNG có hàng nào cho item/author/music HOÀN TOÀN MỚI xuất hiện lúc serving (không
+hash-bucket/fallback). CuckooEmbedding dùng capacity NHỎ HƠN tổng ID tiềm năng (không cần
+biết trước, đúng tinh thần Monolith cho hệ thống serving thật đang chạy liên tục) — ID mới
+được cấp slot ngay (evict ID ít hoạt động nếu bảng đầy) thay vì crash/IndexError.
+`use_cuckoo_embedding=False` giữ nn.Embedding cũ để so sánh ablation.
+
+[CẢNH BÁO review.md] CuckooEmbedding (Python dict-based) đo được ~0.38s/step resolve trên
+19,264 ID/batch — đây là bottleneck thật (dù nhỏ hơn I/O memmap ~9-18s/step). Với dataset
+KuaiRand-Pure (7,583 item, không phải 32M), CÂN NHẮC `use_cuckoo_embedding=False` (dùng
+nn.Embedding cố định thường) — bảng nhỏ, không cần collisionless, tiết kiệm hẳn 0.38s/step
+này. Quyết định cụ thể để lại cho lúc build pipeline cho Pure, KHÔNG đổi mặc định ở đây.
+
+e_content: qua GMU (gmu.py) fuse các nhánh tĩnh của item — categorical (category 1 cấp +
+video_type + music_type) + author/music (ID embedding nhỏ). author_idx/music_idx CŨNG nằm
+trong e_content (đã CHỐT 2026-09-10 — "author/music là 1 nhánh trong content qua GMU",
+KHÔNG tách riêng thành số hạng thứ 3 trong e_i_final, giữ đúng công thức 2 nhánh).
+
+[SỬA 2026-09-13] Chuyển sang KuaiRand-Pure (xem schema.py, result.md "CHECKLIST CUỐI
+CÙNG"): BỎ 4 field category 4 cấp (cat_l1-l4_id — Pure không có file nguồn) và BỎ
+stat_features (review.md L9 — snapshot cuối kỳ leak thời gian, corr≈0.92 với N_i cuối kỳ
+qua mô phỏng) khỏi content_gmu. content_gmu giờ chỉ còn 5 modality: category_id,
+video_type_id, music_type_id, author, music (+ caption optional).
+
+[CHỐT 2026-09-11] Nhánh caption (text tiếng Trung, qua multilingual-e5-small, 384 chiều,
+encode offline — xem encode_captions_kaggle.py) là nhánh OPTIONAL thứ 8 trong content_gmu
+— đúng tinh thần "GMU tổng quát, text/image thêm sau chỉ cần thêm entry vào dict, không
+sửa module" đã thiết kế từ đầu (xem gmu.py). Item KHÔNG có caption thật
+(caption_has_caption.npy = False) truyền mask=0, GMU tự loại nhánh này khỏi softmax gate
+cho đúng item đó.
+
+[CẢNH BÁO review.md L9] `stat_features` (VIDEO_STATIC_STAT_FIELDS: play_cnt, like_cnt...)
+là SNAPSHOT CUỐI KỲ (tổng cộng dồn tới lúc thu thập dataset) — nếu build lại cho Pure,
+PHẢI kiểm tra/sửa để tránh leak thời gian tương tự đã phát hiện trên 27K (corr ước lượng
+~0.92 với N_i cuối kỳ). Đây là việc của build_item_static.py (preprocess), KHÔNG sửa ở
+module này — chỉ ghi chú lại để không quên khi build pipeline cho Pure.
 
 Input: item_static.npy (Pass 3, xem build_item_static.py) — mỗi field int32 đã factorize
 sẵn thành index liên tục [0, n), category_id/video_type_id/music_type_id/cat_l1-l4_id
 dùng nn.Embedding riêng từng field (KHÔNG concat one-hot — số category nhỏ nhưng tách
-riêng để mỗi field có không gian embedding riêng, không ép chung 1 bảng).
+riêng để mỗi field có không gian embedding riêng, không ép chung 1 bảng). caption_embedding
+đọc riêng từ caption_embeddings.npy/caption_has_caption.npy (Pass 3.5, merge_caption_shards.py).
 """
 
 from __future__ import annotations
@@ -31,14 +74,14 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from cuckoo_embedding import CuckooEmbedding
 from gmu import GMU
 
 # Field categorical trong item_static.npy dùng embedding riêng (tên field -> tên tham số
 # num_embeddings tương ứng khi khởi tạo ItemEmbeddingConfig) — KHÔNG gồm author_idx/
 # music_idx (embedding lớn, tách riêng dict `id_embeddings` vì kích thước rất khác biệt
 # so với category nhỏ, dù cùng "categorical" về bản chất).
-CATEGORICAL_FIELDS = ["category_id", "video_type_id", "music_type_id", "cat_l1_id", "cat_l2_id", "cat_l3_id", "cat_l4_id"]
-NUM_STAT_FEATURES = 8  # VIDEO_STATIC_STAT_FIELDS, xem schema.py
+CATEGORICAL_FIELDS = ["category_id", "video_type_id", "music_type_id"]
 
 
 class ItemEmbeddingConfig:
@@ -51,6 +94,12 @@ class ItemEmbeddingConfig:
         dim: int = 64,
         cat_embed_dim: int = 16,
         id_embed_dim: int = 16,
+        caption_dim: int = 384,  # multilingual-e5-small, xem encode_captions_kaggle.py
+        use_cuckoo_embedding: bool = True,  # xem cuckoo_embedding.py — thay nn.Embedding cố định
+        cuckoo_capacity_ratio: float = 0.25,  # capacity mỗi bảng con = ratio * num_ids — CỐ TÌNH
+        # nhỏ hơn tổng ID (2 bảng con * ratio = 0.5x tổng số ID có slot ĐỒNG THỜI, không phải
+        # 1x) để mô phỏng đúng vấn đề Monolith giải quyết: bảng KHÔNG đủ chỗ cho MỌI ID, cần cơ
+        # chế evict thật. ratio=1.0 sẽ gần như không bao giờ evict (mất ý nghĩa mô phỏng).
     ):
         self.num_items = num_items
         self.num_authors = num_authors
@@ -59,6 +108,9 @@ class ItemEmbeddingConfig:
         self.dim = dim
         self.cat_embed_dim = cat_embed_dim
         self.id_embed_dim = id_embed_dim
+        self.caption_dim = caption_dim
+        self.use_cuckoo_embedding = use_cuckoo_embedding
+        self.cuckoo_capacity_ratio = cuckoo_capacity_ratio
 
 
 class ItemEmbedding(nn.Module):
@@ -66,33 +118,34 @@ class ItemEmbedding(nn.Module):
         super().__init__()
         self.config = config
 
-        # collaborative_branch — thuần ID embedding, KHÔNG dùng feature nào khác (đã chốt).
-        # sparse=True: 32,038,725 item x dim -> dense Adam state (exp_avg+exp_avg_sq) sẽ cấp
-        # phát ~8.2GB CHO TOÀN BỘ bảng dù mỗi batch chỉ chạm vài trăm dòng (đã xác nhận qua
-        # RuntimeError thật khi test) — sparse gradient để optimizer chỉ giữ state cho các
-        # dòng THỰC SỰ có gradient khác 0. Yêu cầu optimizer riêng (SparseAdam, xem train.py).
-        # TODO: chia model parallelism (item_id % 2 -> GPU0/GPU1) khi có 2 GPU thật —
-        # single-device trước, xem idea.md "TRẠNG THÁI DỰ ÁN" quyết định #1.
-        self.collaborative_embedding = nn.Embedding(config.num_items, config.dim, sparse=True)
+        # e_collab — thuần ID embedding, KHÔNG dùng feature nào khác (đã chốt).
+        if config.use_cuckoo_embedding:
+            cap_items = max(1, int(config.num_items * config.cuckoo_capacity_ratio))
+            cap_authors = max(1, int(config.num_authors * config.cuckoo_capacity_ratio))
+            cap_music = max(1, int(config.num_music * config.cuckoo_capacity_ratio))
+            self.collab_embedding = CuckooEmbedding(cap_items, config.dim, seed=1)
+            self.author_embedding = CuckooEmbedding(cap_authors, config.id_embed_dim, seed=2)
+            self.music_embedding = CuckooEmbedding(cap_music, config.id_embed_dim, seed=3)
+        else:
+            self.collab_embedding = nn.Embedding(config.num_items, config.dim, sparse=True)
+            self.author_embedding = nn.Embedding(config.num_authors, config.id_embed_dim, sparse=True)
+            self.music_embedding = nn.Embedding(config.num_music, config.id_embed_dim, sparse=True)
 
-        # content_branch — categorical nhỏ (mỗi field 1 bảng embedding riêng, KHÔNG sparse vì
-        # số lượng category nhỏ, dense Adam state không đáng kể) + author/music (embedding lớn
-        # hơn nhiều — 8.8M/14.2M hàng, CŨNG cần sparse=True cùng lý do trên) + numeric (8 stat
-        # feature, đưa thẳng vào GMU dạng vector liên tục, không cần embedding).
+        # e_content — categorical nhỏ (mỗi field 1 bảng embedding riêng, KHÔNG sparse vì số
+        # lượng category nhỏ, dense Adam state không đáng kể) + numeric (8 stat feature, đưa
+        # thẳng vào GMU dạng vector liên tục, không cần embedding).
         self.category_embeddings = nn.ModuleDict({
             field: nn.Embedding(config.num_categories[field], config.cat_embed_dim) for field in CATEGORICAL_FIELDS
         })
-        self.author_embedding = nn.Embedding(config.num_authors, config.id_embed_dim, sparse=True)
-        self.music_embedding = nn.Embedding(config.num_music, config.id_embed_dim, sparse=True)
 
         gmu_in_dims = {field: config.cat_embed_dim for field in CATEGORICAL_FIELDS}
         gmu_in_dims["author"] = config.id_embed_dim
         gmu_in_dims["music"] = config.id_embed_dim
-        gmu_in_dims["stat_features"] = NUM_STAT_FEATURES
+        gmu_in_dims["caption"] = config.caption_dim  # nhánh OPTIONAL, xem docstring module
         self.content_gmu = GMU(gmu_in_dims, dim=config.dim)
 
-        # g_i = σ(MLP([mat_i, collaborative_branch, content_branch])) — mở rộng GMU-gate
-        # thêm 1 tầng gate trộn collaborative/content (xem idea.md mục 4.5 điểm 2).
+        # g_i = σ(MLP([item_weight, e_collab, e_content])) — mở rộng GMU-gate thêm 1 tầng
+        # gate trộn collab/content (xem idea.md mục 4.5 điểm 2).
         self.gate_mlp = nn.Sequential(
             nn.Linear(1 + config.dim + config.dim, config.dim),
             nn.ReLU(),
@@ -101,33 +154,34 @@ class ItemEmbedding(nn.Module):
 
     def forward(
         self,
-        video_idx: torch.Tensor,  # (B,) int64 — index vào collaborative_embedding (0..num_items-1)
+        video_idx: torch.Tensor,  # (B,) int64 — index vào collab_embedding (0..num_items-1)
         category_ids: dict[str, torch.Tensor],  # field -> (B,) int64
         author_idx: torch.Tensor,  # (B,) int64
         music_idx: torch.Tensor,  # (B,) int64
-        stat_features: torch.Tensor,  # (B, NUM_STAT_FEATURES) float32
-        mat_i: torch.Tensor,  # (B,) float32 — tanh(N_i / τ_i), đã tính sẵn ở Pass 5
-        conf_content: torch.Tensor,  # (B,) float32 — tanh(N_category(i) / τ_c), đã tính sẵn
+        item_weight: torch.Tensor,  # (B,) float32 — tanh(N_i / τ_i), đã tính sẵn ở caller
+        category_confidence: torch.Tensor,  # (B,) float32 — tanh(N_category(i) / τ_c), đã tính sẵn
+        caption_embedding: torch.Tensor,  # (B, caption_dim) float32 — 0 nếu không có caption thật
+        caption_mask: torch.Tensor,  # (B,) float32/bool — 1 nếu item CÓ caption thật, 0 nếu không
     ) -> torch.Tensor:
-        collaborative_branch = self.collaborative_embedding(video_idx)  # (B, dim)
+        e_collab = self.collab_embedding(video_idx)  # (B, dim)
 
         gmu_inputs = {field: self.category_embeddings[field](category_ids[field]) for field in CATEGORICAL_FIELDS}
         gmu_inputs["author"] = self.author_embedding(author_idx)
         gmu_inputs["music"] = self.music_embedding(music_idx)
-        gmu_inputs["stat_features"] = stat_features
-        content_branch = self.content_gmu(gmu_inputs)  # (B, dim)
+        gmu_inputs["caption"] = caption_embedding
+        e_content = self.content_gmu(gmu_inputs, masks={"caption": caption_mask})  # (B, dim)
 
-        content_branch_shrunk = content_branch * conf_content.unsqueeze(-1)  # (B, dim)
+        category_content_shrunk = e_content * category_confidence.unsqueeze(-1)  # (B, dim)
 
-        gate_input = torch.cat([mat_i.unsqueeze(-1), collaborative_branch, content_branch], dim=-1)
+        gate_input = torch.cat([item_weight.unsqueeze(-1), e_collab, e_content], dim=-1)
         g_i = torch.sigmoid(self.gate_mlp(gate_input))  # (B, 1)
 
-        return g_i * collaborative_branch + (1 - g_i) * content_branch_shrunk  # (B, dim) = E_i
+        return g_i * e_collab + (1 - g_i) * category_content_shrunk  # (B, dim) = e_i_final
 
     def sparse_parameters(self) -> list[nn.Parameter]:
         """3 bảng embedding lớn (sparse=True) — cần SparseAdam riêng, xem train.py."""
         return (
-            list(self.collaborative_embedding.parameters())
+            list(self.collab_embedding.parameters())
             + list(self.author_embedding.parameters())
             + list(self.music_embedding.parameters())
         )

@@ -1,7 +1,7 @@
 """Orchestrator — chạy toàn bộ 5 pass tiền xử lý KuaiRand-27K theo đúng thứ tự phụ thuộc.
 
 Thứ tự BẮT BUỘC (không đổi):
-  Pass 1 (build_n_cumulative)  — N_i/N_category lũy kế, KHÔNG phụ thuộc pass nào khác
+  Pass 1 (build_n_cumulative)  — N_i/N_u/N_category lũy kế, KHÔNG phụ thuộc pass nào khác
   Pass 2 (build_sequences)     — chuỗi user + label_timestamps, KHÔNG phụ thuộc Pass 1
   Pass 3 (build_item_static)   — item static features, độc lập
   Pass 4 (build_user_static)   — user static features, độc lập
@@ -14,14 +14,19 @@ D:\\ama-rs\\gen-recsys (plan file lexical-hopping-lobster.md) cho đặc tả đ
 
 from build_interactions import build_interactions
 from build_item_static import build_item_static
-from build_n_cumulative import build_category_n_cumulative, build_item_n_cumulative
+from build_n_cumulative import (
+    build_category_n_cumulative,
+    build_item_n_cumulative,
+    build_user_n_cumulative,
+)
 from build_sequences import build_sequences
 from build_user_static import build_user_static
 
 
 def main() -> None:
-    print("=== Pass 1: N_i / N_category lũy kế ===")
+    print("=== Pass 1: N_i / N_u / N_category lũy kế ===")
     build_item_n_cumulative()
+    build_user_n_cumulative()  # [THÊM 2026-09-14] u_i per-position, xem build_n_cumulative.py
     build_category_n_cumulative()
 
     print("=== Pass 2: chuỗi hành vi user ===")

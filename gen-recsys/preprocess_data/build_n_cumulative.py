@@ -28,14 +28,12 @@ import polars as pl
 
 from schema import LOG_SCHEMA, VIDEO_BASIC_CATEGORY_FIELD
 
-LOG_DIR = Path(r"D:\amazon-datasets\KuaiRand-27K-extracted\KuaiRand-27K\data")
+LOG_DIR = Path(r"D:\amazon-datasets\KuaiRand-Pure-extracted\KuaiRand-Pure\data")
 LOG_STANDARD_FILES = [
-    LOG_DIR / "log_standard_4_08_to_4_21_27k_part1.csv",
-    LOG_DIR / "log_standard_4_08_to_4_21_27k_part2.csv",
-    LOG_DIR / "log_standard_4_22_to_5_08_27k_part1.csv",
-    LOG_DIR / "log_standard_4_22_to_5_08_27k_part2.csv",
+    LOG_DIR / "log_standard_4_08_to_4_21_pure.csv",
+    LOG_DIR / "log_standard_4_22_to_5_08_pure.csv",
 ]
-VIDEO_BASIC_FILE = LOG_DIR / "video_features_basic_27k.csv"
+VIDEO_BASIC_FILE = LOG_DIR / "video_features_basic_pure.csv"
 OUT_DIR = Path(__file__).parent / "output"
 
 
@@ -94,6 +92,30 @@ def build_item_n_cumulative() -> None:
     _save_csr("item_N", df["video_id"], df["time_ms"], df["cum_count"])
 
 
+def build_user_n_cumulative() -> None:
+    """N_u(user, t) = số dòng log có user_id=user và time_ms < t, lũy kế theo thời gian.
+
+    [THÊM 2026-09-14] Đối xứng hoàn toàn với build_item_n_cumulative, nhưng dùng cho
+    user_weight THEO TỪNG VỊ TRÍ trong chuỗi (u_i), KHÔNG phải 1 scalar/chuỗi như trước.
+
+    Vì sao cần: `user_weight` cũ tra 1 lần tại thời điểm dự đoán -> hằng theo i. Khi đưa
+    vào attention dạng cặp (u_i, m_j), log(u_i) hằng theo hàng i sẽ GỘP THẲNG vào hệ số
+    β — tức thoái hóa về đúng cơ chế λ·log(mat_j) đã bỏ 2026-09-13 (gradient đo được
+    ~1e-17). u_i per-position mới tạo được biến thiên thật: mọi user đều cold ở token đầu
+    chuỗi của mình và warm dần về cuối — đây đồng thời là trục ngắn/dài hạn.
+    """
+    scans = [
+        pl.scan_csv(f, schema_overrides={"user_id": pl.Int64, "time_ms": pl.Int64})
+        for f in LOG_STANDARD_FILES
+    ]
+    lazy = pl.concat(scans).select(["user_id", "time_ms"]).sort(["user_id", "time_ms"])
+    df = lazy.collect(streaming=True)
+
+    df = df.with_columns(pl.int_range(1, pl.len() + 1).over("user_id").alias("cum_count"))
+
+    _save_csr("user_N", df["user_id"], df["time_ms"], df["cum_count"])
+
+
 def build_category_n_cumulative() -> None:
     """N_category(tag, t) = số video_id RIÊNG BIỆT cùng tag có first_seen_ms < t, lũy kế theo thời gian."""
     video_basic = pl.read_csv(VIDEO_BASIC_FILE, columns=["video_id", VIDEO_BASIC_CATEGORY_FIELD])
@@ -129,27 +151,25 @@ def lookup_n_at_t(name: str, entity_id: int, t: int) -> int:
 
     start, end = offsets[id_pos], offsets[id_pos + 1]
     seg = events[start:end]
-    idx = np.searchsorted(seg["t"], t, side="right") - 1
-    return int(seg["count"][idx]) if idx >= 0 else 0
+    # [SỬA 2026-09-11] side="left" — vị trí = số phần tử có t < query_t, tức N TRƯỚC thời
+    # điểm t, KHÔNG tính chính sự kiện tại t. Bug đã xác nhận: side="right" - 1 trỏ đúng vào
+    # chính sự kiện có event_t == query_t (khi trùng), đếm LUÔN sự kiện đó -> leak 1 đơn vị
+    # thông tin tương lai (biết trước label/candidate này sẽ xảy ra tại t). count[j] (0-indexed)
+    # = j+1 (cộng dồn từ đầu, xem build_item_n_cumulative) nên count TRƯỚC t = count tại vị
+    # trí (side="left" - 1).
+    idx = np.searchsorted(seg["t"], t, side="left")
+    return int(seg["count"][idx - 1]) if idx > 0 else 0
 
 
-def lookup_n_at_t_batch(name: str, entity_ids: np.ndarray, ts: np.ndarray, batch_size: int = 20_000_000) -> np.ndarray:
-    """Phiên bản vector hóa của lookup_n_at_t cho nhiều (entity_id, t) cùng lúc — dùng ở
-    Pass 5 để tránh vòng lặp Python trên hàng chục triệu sample.
+def build_n_cache(name: str) -> dict:
+    """Build 1 LẦN DUY NHẤT flat_struct (322M phần tử, cố định theo dữ liệu — KHÔNG phụ
+    thuộc entity_ids/ts của bất kỳ query nào) — dùng cho training loop gọi lookup lặp lại
+    hàng nghìn lần (mỗi step 2 lần: hist + candidate). KHÔNG gọi lại _build bên trong
+    lookup_n_at_t_batch cho mỗi lần tra — đã xác nhận OOM thật khi build lại mỗi lần gọi
+    trong vòng lặp training (ArrayMemoryError 2.40 GiB ở np.arange(322,278,385), do RAM
+    không kịp giải phóng giữa các lần gọi liên tiếp).
 
-    [SỬA 2026-09-09] Kỹ thuật namespace-offset ban đầu (nhân entity_index với 1 hằng số
-    lớn rồi cộng vào timestamp) bị TRÀN SỐ int64 thật (đã xác nhận qua test cụ thể: với
-    88,905 item test — chưa tới 32,038,725 item thật — entity_idx_max * NAMESPACE đã vượt
-    np.iinfo(np.int64).max, gây searchsorted trả về vị trí sai hoàn toàn). Đã CHỐT thay
-    bằng structured array (entity_id, timestamp) — searchsorted trên structured/void array
-    so sánh đúng thứ tự từ điển (trước theo id, sau theo t trong cùng id) mà KHÔNG cần
-    phép cộng/nhân số học nào, không có rủi ro tràn số.
-
-    [SỬA 2026-09-10 — OOM đã xác nhận: ArrayMemoryError 4.80 GiB khi build query_struct
-    cho toàn bộ 322,251,100 sample cùng lúc, trên máy 31.7GB RAM]: flat_struct (dựng từ
-    item_N/category_N, cố định theo dữ liệu — KHÔNG phụ thuộc entity_ids/ts của query) chỉ
-    build 1 LẦN; query_struct (phụ thuộc entity_ids/ts, có thể rất lớn — 322M+ sample) chia
-    thành từng batch nhỏ (batch_size phần tử/lần) để tránh giữ 2 mảng ~4.8GB cùng lúc.
+    Trả về dict {ids, offsets, flat_struct, counts} — truyền vào lookup_n_at_t_batch_cached.
     """
     ids = np.load(OUT_DIR / f"{name}_ids.npy")
     offsets = np.load(OUT_DIR / f"{name}_offsets.npy")
@@ -157,8 +177,6 @@ def lookup_n_at_t_batch(name: str, entity_ids: np.ndarray, ts: np.ndarray, batch
     timestamps = events["t"]
     counts = events["count"]
 
-    # entity_id thật (không phải index) tương ứng mỗi dòng trong mảng phẳng — CỐ ĐỊNH,
-    # build 1 lần duy nhất, không phụ thuộc entity_ids/ts của query.
     entity_idx_per_row = np.searchsorted(offsets, np.arange(len(timestamps)), side="right") - 1
     entity_id_per_row = ids[entity_idx_per_row]
 
@@ -167,7 +185,18 @@ def lookup_n_at_t_batch(name: str, entity_ids: np.ndarray, ts: np.ndarray, batch
     flat_struct["id"] = entity_id_per_row
     flat_struct["t"] = timestamps
     # flat_struct đã sort đúng theo (id, t) vì dữ liệu gốc được sort trước khi build CSR
-    del entity_idx_per_row, entity_id_per_row  # không cần nữa sau khi build xong flat_struct
+
+    return {"ids": ids, "offsets": offsets, "flat_struct": flat_struct, "counts": counts, "dtype": dtype}
+
+
+def lookup_n_at_t_batch_cached(
+    cache: dict, entity_ids: np.ndarray, ts: np.ndarray, batch_size: int = 20_000_000
+) -> np.ndarray:
+    """Tra N(entity_id, t) dùng cache đã build sẵn (xem build_n_cache) — KHÔNG đọc lại file
+    hay build lại flat_struct, chỉ làm phần searchsorted phụ thuộc query."""
+    ids, offsets, flat_struct, counts, dtype = (
+        cache["ids"], cache["offsets"], cache["flat_struct"], cache["counts"], cache["dtype"]
+    )
 
     result = np.zeros(len(entity_ids), dtype=np.int32)
     for start in range(0, len(entity_ids), batch_size):
@@ -183,7 +212,15 @@ def lookup_n_at_t_batch(name: str, entity_ids: np.ndarray, ts: np.ndarray, batch
         query_struct["id"] = batch_ids
         query_struct["t"] = batch_ts
 
-        seg_pos = np.searchsorted(flat_struct, query_struct, side="right") - 1
+        # [SỬA 2026-09-11] side="left" (KHÔNG trừ 1) — searchsorted trên structured array so
+        # sánh từ điển (id, t): vị trí trả về = số phần tử flat_struct có (id, t) < (query_id,
+        # query_t) theo thứ tự đó, tức đúng "N TRƯỚC thời điểm t" (không tính chính sự kiện có
+        # t == query_t nếu trùng). Bug đã xác nhận: side="right" - 1 trỏ đúng vào chính sự kiện
+        # trùng (id, t) với query (khi query_t == 1 event_t thật, ví dụ chính label/candidate
+        # đang tra) -> đếm LUÔN sự kiện đó -> leak 1 đơn vị thông tin tương lai. Trừ đi 1 SAU
+        # khi lấy seg_pos (không phải trừ trong searchsorted) để tra counts[] tại đúng dòng
+        # TRƯỚC nó.
+        seg_pos = np.searchsorted(flat_struct, query_struct, side="left") - 1
 
         starts = offsets[id_pos_clipped]
         ends = offsets[id_pos_clipped + 1]
@@ -195,6 +232,37 @@ def lookup_n_at_t_batch(name: str, entity_ids: np.ndarray, ts: np.ndarray, batch
     return result
 
 
+def lookup_n_at_t_batch(name: str, entity_ids: np.ndarray, ts: np.ndarray, batch_size: int = 20_000_000) -> np.ndarray:
+    """Phiên bản vector hóa của lookup_n_at_t cho nhiều (entity_id, t) cùng lúc — dùng ở
+    Pass 5 (build_interactions.py, gọi ĐÚNG 1 LẦN cho mỗi name) để tránh vòng lặp Python
+    trên hàng chục triệu sample.
+
+    [SỬA 2026-09-09] Kỹ thuật namespace-offset ban đầu (nhân entity_index với 1 hằng số
+    lớn rồi cộng vào timestamp) bị TRÀN SỐ int64 thật (đã xác nhận qua test cụ thể: với
+    88,905 item test — chưa tới 32,038,725 item thật — entity_idx_max * NAMESPACE đã vượt
+    np.iinfo(np.int64).max, gây searchsorted trả về vị trí sai hoàn toàn). Đã CHỐT thay
+    bằng structured array (entity_id, timestamp) — searchsorted trên structured/void array
+    so sánh đúng thứ tự từ điển (trước theo id, sau theo t trong cùng id) mà KHÔNG cần
+    phép cộng/nhân số học nào, không có rủi ro tràn số.
+
+    [SỬA 2026-09-10 — OOM đã xác nhận: ArrayMemoryError 4.80 GiB khi build query_struct
+    cho toàn bộ 322,251,100 sample cùng lúc, trên máy 31.7GB RAM]: flat_struct (dựng từ
+    item_N/category_N, cố định theo dữ liệu — KHÔNG phụ thuộc entity_ids/ts của query) chỉ
+    build 1 LẦN; query_struct (phụ thuộc entity_ids/ts, có thể rất lớn — 322M+ sample) chia
+    thành từng batch nhỏ (batch_size phần tử/lần) để tránh giữ 2 mảng ~4.8GB cùng lúc.
+
+    [SỬA 2026-09-11 — dùng trong TRAINING LOOP thì KHÔNG dùng hàm này]: hàm này build lại
+    flat_struct MỖI LẦN GỌI (phù hợp Pass 5 — chỉ gọi 1 lần/name) — nếu gọi lặp lại hàng
+    nghìn lần (training loop, mỗi step 2 lần) sẽ OOM vì build lại 322M-phần-tử liên tục,
+    không kịp giải phóng RAM giữa các lần gọi (đã xác nhận qua traceback thật). Training
+    loop PHẢI dùng build_n_cache() 1 lần lúc khởi tạo + lookup_n_at_t_batch_cached() mỗi
+    step, xem train.py.
+    """
+    cache = build_n_cache(name)
+    return lookup_n_at_t_batch_cached(cache, entity_ids, ts, batch_size)
+
+
 if __name__ == "__main__":
     build_item_n_cumulative()
+    build_user_n_cumulative()
     build_category_n_cumulative()

@@ -1,18 +1,24 @@
 """τ_u, τ_i, τ_c — ngưỡng độ trưởng thành trong tanh(N/τ), HỌC ĐƯỢC (nn.Parameter) nhưng
 KHỞI TẠO từ thống kê thật của dataset (xem idea.md "Việc CẦN LÀM TIẾP" #1).
 
-Khởi tạo:
-    τ_u = 48   — median N_u/user (đo ở idea.md mục 0, KuaiRand-27K)
-    τ_i = 10   — mean N_i/item (đo trực tiếp — median N_i=1 quá nhỏ, làm tanh(N_i/τ_i)
-                 bão hòa gần như ngay lập tức mất hết độ phân giải ở vùng N nhỏ quan trọng
-                 nhất, xem idea.md build_interactions.py TAU_I_INIT)
-    τ_c        — CHƯA đo trực tiếp trong idea.md, khởi tạo tạm = τ_i (cùng bản chất "đếm
-                 số thực thể đã warm", xem đo thực tế ở _measure_tau_c_init khi có dữ liệu)
+[SỬA 2026-09-13] Đổi tên phương thức cho tường minh (xem result.md "CHECKLIST CUỐI CÙNG"):
+    mat_u        -> user_weight
+    mat_i        -> item_weight
+    conf_content -> category_confidence
 
-CẢNH BÁO rủi ro "threshold-collapse" (xem idea.md): gradient descent có thể kéo τ về giá
-trị tối ưu loss TRUNG BÌNH (bị chi phối bởi nhóm warm, đông hơn), vô tình "bỏ rơi" nhóm
-cold ít ảnh hưởng loss tổng — BẮT BUỘC giám sát riêng: vẽ đường giá trị τ qua epoch + so
-Recall/NDCG tách riêng theo nhóm cold (xem get_tau_snapshot()).
+Khởi tạo (đo lại cho KuaiRand-Pure, xem result.md 2026-09-13 — GIÁ TRỊ CŨ đo trên
+KuaiRand-27K không áp dụng được cho Pure, N_u/N_i có phân phối khác hẳn):
+    τ_u = 35.0     — median N_u tại thời điểm sample (đúng phương pháp idea.md mục 0)
+    τ_i = 599.3    — mean N_i tại thời điểm sample (median N_i=238 vẫn dùng mean theo
+                     đúng lý do gốc: tránh tanh bão hòa sớm ở vùng N nhỏ quan trọng nhất)
+    τ_c = 53486.1  — mean N_category tại thời điểm sample, cùng phương pháp với τ_i
+
+CẢNH BÁO rủi ro "threshold-collapse" (xem idea.md/review.md): gradient descent có thể kéo
+τ về giá trị tối ưu loss TRUNG BÌNH (bị chi phối bởi nhóm warm, đông hơn), vô tình "bỏ rơi"
+nhóm cold ít ảnh hưởng loss tổng — BẮT BUỘC giám sát riêng: vẽ đường giá trị τ qua epoch +
+so Recall/NDCG tách riêng theo nhóm cold (xem get_tau_snapshot()). Cơ chế chủ động chống
+threshold-collapse (class-balanced loss, anchor loss) đã CÂN NHẮC nhưng HOÃN — chờ đo
+baseline này có thật sự cần không trước khi thêm (xem result.md).
 """
 
 from __future__ import annotations
@@ -20,14 +26,15 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-TAU_U_INIT = 48.0  # median N_u/user, đo ở idea.md mục 0
-TAU_I_INIT = 10.0  # mean N_i/item, đo trực tiếp 2026-09-09 (median N_i=1 quá nhỏ, không dùng)
-TAU_C_INIT = 10.0  # chưa đo riêng — tạm dùng cùng giá trị τ_i (cùng bản chất đếm lũy kế)
+TAU_U_INIT = 35.0      # median N_u tại thời điểm sample, đo trên KuaiRand-Pure 2026-09-13
+TAU_I_INIT = 599.3     # mean N_i tại thời điểm sample, đo trên KuaiRand-Pure 2026-09-13
+TAU_C_INIT = 53486.1   # mean N_category tại thời điểm sample, đo trên KuaiRand-Pure 2026-09-13
 
 
 class LearnableThresholds(nn.Module):
-    """Bọc τ_u/τ_i/τ_c thành nn.Parameter, cung cấp mat_u/mat_i/conf_content tiện dụng và
-    snapshot giá trị để giám sát threshold-collapse qua epoch."""
+    """Bọc τ_u/τ_i/τ_c thành nn.Parameter, cung cấp user_weight/item_weight/
+    category_confidence tiện dụng và snapshot giá trị để giám sát threshold-collapse qua
+    epoch."""
 
     def __init__(self, tau_u_init: float = TAU_U_INIT, tau_i_init: float = TAU_I_INIT, tau_c_init: float = TAU_C_INIT):
         super().__init__()
@@ -39,13 +46,13 @@ class LearnableThresholds(nn.Module):
         # τ có thể bị gradient kéo về <=0 (vô nghĩa, N/τ đổi dấu) — clamp mềm giữ dương.
         return tau.clamp(min=1e-3)
 
-    def mat_u(self, n_u: torch.Tensor) -> torch.Tensor:
+    def user_weight(self, n_u: torch.Tensor) -> torch.Tensor:
         return torch.tanh(n_u / self._safe_tau(self.tau_u))
 
-    def mat_i(self, n_i: torch.Tensor) -> torch.Tensor:
+    def item_weight(self, n_i: torch.Tensor) -> torch.Tensor:
         return torch.tanh(n_i / self._safe_tau(self.tau_i))
 
-    def conf_content(self, n_category: torch.Tensor) -> torch.Tensor:
+    def category_confidence(self, n_category: torch.Tensor) -> torch.Tensor:
         return torch.tanh(n_category / self._safe_tau(self.tau_c))
 
     def get_tau_snapshot(self) -> dict[str, float]:

@@ -36,15 +36,16 @@ import polars as pl
 
 from schema import ACTION_VECTOR_FIELDS, MAX_SEQ_LEN
 
-LOG_DIR = Path(r"D:\amazon-datasets\KuaiRand-27K-extracted\KuaiRand-27K\data")
+LOG_DIR = Path(r"D:\amazon-datasets\KuaiRand-Pure-extracted\KuaiRand-Pure\data")
 LOG_STANDARD_FILES = [
-    LOG_DIR / "log_standard_4_08_to_4_21_27k_part1.csv",
-    LOG_DIR / "log_standard_4_08_to_4_21_27k_part2.csv",
-    LOG_DIR / "log_standard_4_22_to_5_08_27k_part1.csv",
-    LOG_DIR / "log_standard_4_22_to_5_08_27k_part2.csv",
+    LOG_DIR / "log_standard_4_08_to_4_21_pure.csv",
+    LOG_DIR / "log_standard_4_22_to_5_08_pure.csv",
 ]
 OUT_DIR = Path(__file__).parent / "output"
-NUM_BUCKETS = 100  # số bucket user_id — tránh OOM khi sort (đã xác nhận sort toàn cục OOM thật)
+# [SỬA 2026-09-13] Pure chỉ ~1.4M dòng (so với 322M của 27K) — 100 bucket không cần thiết
+# nữa (mỗi bucket chỉ ~14K dòng, overhead chia bucket > lợi ích tránh OOM). Giảm xuống 10
+# để giảm số lần quét lại CSV (mỗi bucket phải scan lại toàn bộ LOG_STANDARD_FILES).
+NUM_BUCKETS = 10
 
 
 def _compute_global_log1p_max() -> tuple[float, float]:
