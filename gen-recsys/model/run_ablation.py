@@ -50,9 +50,15 @@ ABLATIONS = [
 ]
 
 
+# Thư mục chứa CHÍNH file này — train.py nằm cùng chỗ. Dùng đường dẫn TUYỆT ĐỐI vì
+# script hay được gọi từ cwd khác (Kaggle: `!python /kaggle/working/.../run_ablation.py`
+# chạy ở /kaggle/working, nơi không có train.py -> rc=2 cho MỌI nhánh).
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
 def build_cmd(flags: list[str], args: argparse.Namespace) -> list[str]:
     cmd = [
-        sys.executable, "train.py",
+        sys.executable, str(SCRIPT_DIR / "train.py"),
         "--output-dir", args.output_dir,
         "--batch-size", str(args.batch_size),
         "--num-epochs", "1",
@@ -82,8 +88,20 @@ def main() -> None:
     if not todo:
         sys.exit(f"--only={args.only} không khớp nhánh nào (hợp lệ: 1-5)")
 
-    log_dir = Path(args.log_dir)
-    log_dir.mkdir(exist_ok=True)
+    # train.py chạy với cwd=SCRIPT_DIR, nên output-dir TƯƠNG ĐỐI phải resolve theo cwd mà
+    # NGƯỜI DÙNG đang đứng, không phải theo SCRIPT_DIR — nếu không, đường dẫn sẽ trỏ sai
+    # chỗ một cách im lặng.
+    args.output_dir = str(Path(args.output_dir).resolve())
+    if not Path(args.output_dir).is_dir():
+        sys.exit(f"--output-dir không tồn tại: {args.output_dir}")
+    # Kiểm tra SỚM: thiếu file dữ liệu thì mọi nhánh cùng chết ở step 0, mất hàng chục phút
+    # mới biết. Thà báo ngay.
+    missing = [f for f in ("train.npy", "val.npy", "item_static.npy") if not (Path(args.output_dir) / f).is_file()]
+    if missing:
+        sys.exit(f"--output-dir thiếu file: {', '.join(missing)} (trong {args.output_dir})")
+
+    log_dir = Path(args.log_dir).resolve()
+    log_dir.mkdir(parents=True, exist_ok=True)
 
     # UTF-8 BẮT BUỘC: stdout Windows mặc định cp1252, gặp tiếng Việt trong log là
     # UnicodeEncodeError và cả run chết giữa chừng (đã xảy ra thật 2026-09-15).
@@ -110,10 +128,22 @@ def main() -> None:
         with open(log_path, "w", encoding="utf-8") as f:
             f.write(f"# ablation {aid}: {name}\n# {question}\n# cmd: {' '.join(cmd)}\n\n")
             f.flush()
-            rc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, env=env).returncode
+            # cwd=SCRIPT_DIR: train.py import module cùng thư mục (`from retrieval import
+            # ...`) nên PHẢI chạy ở đó, bất kể script được gọi từ đâu.
+            rc = subprocess.run(
+                cmd, stdout=f, stderr=subprocess.STDOUT, env=env, cwd=SCRIPT_DIR
+            ).returncode
         elapsed = time.perf_counter() - start
 
-        print(f"    {'OK' if rc == 0 else f'LỖI (rc={rc})'} — {elapsed / 60:.1f} phút\n")
+        print(f"    {'OK' if rc == 0 else f'LỖI (rc={rc})'} — {elapsed / 60:.1f} phút")
+        if rc != 0:
+            # In ngay 15 dòng cuối log — không bắt người dùng đi mở file để biết vì sao
+            # chết. Nhánh 1 chết thì 4 nhánh sau thường chết y hệt; thấy sớm là dừng sớm.
+            tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-15:]
+            print("    --- 15 dòng cuối log ---")
+            for line in tail:
+                print(f"    | {line}")
+        print()
         results.append((aid, name, rc, elapsed, log_path))
 
     print("\n=== TỔNG KẾT ===")
