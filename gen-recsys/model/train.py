@@ -225,6 +225,10 @@ def run_batch_forward(
         label_video_id_cpu, label_timestamp_cpu, dataset, item_embed, thresholds,
         item_n_cache, category_n_cache, device,
     )
+    # [CHẨN ĐOÁN 2026-09-16] Chụp NGAY SAU lần embed label — _last_stats bị ghi đè ở mỗi
+    # lần gọi embed_items (history/label/negative), nên phải lấy đúng ở đây mới là stats của
+    # candidate POSITIVE, thứ ta cần đối chiếu với thứ hạng của nó.
+    label_embed_stats = {k: v.clone() for k, v in item_embed._last_stats.items()}
 
     # --- 1 lần chạy decoder trên chuỗi XEN KẼ [Φ_0,a_0,...,Φ_{K-1},a_{K-1}] ---
     # KHÔNG nối label vào chuỗi nữa (bỏ thiết kế K+1 cũ): xen kẽ khiến hidden tại Φ_t đã
@@ -292,6 +296,7 @@ def run_batch_forward(
         "label_action": label_action,
         "is_user_cold": batch["is_user_cold"],
         "is_item_cold": batch["is_item_cold"],
+        "label_embed_stats": label_embed_stats,  # chẩn đoán gate, xem item_embedding.py
         "is_user_lowhistory": batch["is_user_lowhistory"],  # few-shot, xem eval.py print_eval_report
     }
 
@@ -623,6 +628,60 @@ def load_checkpoint(path: Path, *, modules: dict, sparse_optimizer=None,
             "global_step": blob.get("global_step", 0)}
 
 
+def _report_gate_diagnostic(
+    stats: dict,  # g_i, category_confidence, item_weight, norm_collab/content/content_shrunk
+    is_user_cold: torch.Tensor,
+    is_item_cold: torch.Tensor,
+) -> None:
+    """In thành phần nội bộ của ItemEmbedding theo nhóm — trả lời 2 câu TRƯỚC khi sửa gate.
+
+    Công thức hiện tại (item_embedding.py):
+        e_i = g_i·e_collab + (1−g_i)·e_content·c        với g_i = σ(MLP([m, e_collab, e_content]))
+
+    Nghi vấn 1 — GATE có làm đúng việc không? Item cold (m→0) LẼ RA phải đẩy g_i→0 để dựa
+    vào content. Nếu g_i vẫn ≈0.5 hoặc cao ở nhóm item-cold thì gate hỏng, và việc thêm c
+    vào gate không cứu được gì.
+
+    Nghi vấn 2 — c có THẬT SỰ biến thiên không? c = tanh(N_cat/τ_c) với τ_c=53486; N_category
+    gộp hàng nghìn item nên có thể bão hoà ≈1 ở MỌI mẫu. Bằng chứng gián tiếp: τ_c không
+    nhúc nhích sau 3000 step ở cả 6 lần chạy (53486.10 → 53486.10) — dấu hiệu tanh ở vùng
+    phẳng, không nhận gradient. Nếu std(c) ≈ 0 thì đưa c vào gate cũng như đưa một hằng số,
+    và vấn đề thật nằm ở τ_c chứ không ở công thức gate.
+
+    Nghi vấn 3 — nhánh content bị co bao nhiêu? So ‖e_content‖ với ‖e_content·c‖. Ở item
+    cold, nếu CẢ g_i·e_collab lẫn (1−g_i)·e_content·c đều nhỏ thì e_i chỉ còn phần e_collab
+    chưa được train — khớp với ‖e_pos‖ cold > warm đã đo ở bảng thứ hạng."""
+    groups = {
+        "warm_warm": (~is_user_cold) & (~is_item_cold),
+        "cold_user_warm_item": is_user_cold & (~is_item_cold),
+        "warm_user_cold_item": (~is_user_cold) & is_item_cold,
+        "cold_cold": is_user_cold & is_item_cold,
+    }
+    print(f"\n  --- CHẨN ĐOÁN gate ItemEmbedding (candidate positive) ---")
+    print("    g_i→1 = tin collab, g_i→0 = tin content; c = category_confidence")
+    for name, mask in groups.items():
+        n = int(mask.sum().item())
+        if n == 0:
+            print(f"    [{name}] n=0")
+            continue
+        g = stats["g_i"][mask]
+        c = stats["category_confidence"][mask]
+        m = stats["item_weight"][mask]
+        print(
+            f"    [{name}] n={n} "
+            f"g_i={g.mean():.4f}±{g.std():.4f} "
+            f"c={c.mean():.4f}±{c.std():.4f} "
+            f"m={m.mean():.4f}±{m.std():.4f} | "
+            f"‖collab‖={stats['norm_collab'][mask].mean():.4f} "
+            f"‖content‖={stats['norm_content'][mask].mean():.4f} "
+            f"->co={stats['norm_content_shrunk'][mask].mean():.4f}"
+        )
+    c_all = stats["category_confidence"]
+    print(f"    [toàn bộ] c: min={c_all.min():.4f} p50={c_all.median():.4f} "
+          f"max={c_all.max():.4f} std={c_all.std():.4f}"
+          f"  <- std≈0 nghĩa là c vô dụng trong gate, phải sửa τ_c")
+
+
 def _report_rank_diagnostic(
     rank: torch.Tensor,        # (N,) thứ hạng positive, 0 = đứng đầu
     norm_user: torch.Tensor,   # (N,) ‖e_user_eval‖
@@ -705,6 +764,7 @@ def evaluate(
     all_metrics: dict[str, list[torch.Tensor]] = {}
     all_user_cold, all_item_cold, all_user_lowhist = [], [], []
     all_rank, all_norm_user, all_norm_pos, all_n_cand = [], [], [], []  # chẩn đoán, xem dưới
+    all_embed_stats: dict[str, list[torch.Tensor]] = {}  # g_i, c, ‖e_collab‖... của candidate positive
 
     total = min(len(loader), max_batches) if max_batches else len(loader)
     for i, batch in enumerate(tqdm(loader, total=total, desc=f"eval[{split}]", unit="batch")):
@@ -735,6 +795,8 @@ def evaluate(
         all_norm_user.append(fwd["e_user_eval"].norm(dim=-1).cpu())
         all_norm_pos.append(fwd["cand_e_i"][:, 0].norm(dim=-1).cpu())
         all_n_cand.append(torch.full_like(rank.cpu(), eval_logit.shape[1]))
+        for k, v in fwd["label_embed_stats"].items():
+            all_embed_stats.setdefault(k, []).append(v.cpu())
         for k, v in batch_metrics.items():
             all_metrics.setdefault(k, []).append(v.cpu())
         all_user_cold.append(fwd["is_user_cold"])
@@ -751,6 +813,9 @@ def evaluate(
     _report_rank_diagnostic(
         torch.cat(all_rank), torch.cat(all_norm_user), torch.cat(all_norm_pos),
         torch.cat(all_n_cand), is_user_cold, is_item_cold,
+    )
+    _report_gate_diagnostic(
+        {k: torch.cat(v) for k, v in all_embed_stats.items()}, is_user_cold, is_item_cold,
     )
     result = aggregate_by_cold_group(per_sample_metrics, is_user_cold, is_item_cold)
     result_low = aggregate_by_cold_group(per_sample_metrics, is_user_lowhist, is_item_cold)

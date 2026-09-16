@@ -152,6 +152,9 @@ class ItemEmbedding(nn.Module):
             nn.Linear(config.dim, 1),
         )
 
+        # Ảnh chụp thành phần nội bộ của forward() gần nhất — chỉ để chẩn đoán, xem forward().
+        self._last_stats: dict[str, torch.Tensor] = {}
+
     def forward(
         self,
         video_idx: torch.Tensor,  # (B,) int64 — index vào collab_embedding (0..num_items-1)
@@ -175,6 +178,22 @@ class ItemEmbedding(nn.Module):
 
         gate_input = torch.cat([item_weight.unsqueeze(-1), e_collab, e_content], dim=-1)
         g_i = torch.sigmoid(self.gate_mlp(gate_input))  # (B, 1)
+
+        # [CHẨN ĐOÁN 2026-09-16] Ghi lại thành phần nội bộ để evaluate() đọc, KHÔNG đổi giá
+        # trị trả về. Cần trả lời 2 câu trước khi sửa công thức gate:
+        #   - g_i có tiến về 0 khi item cold không? (gate làm đúng việc hay không)
+        #   - category_confidence có THẬT SỰ biến thiên không, hay bão hoà ~1 ở mọi mẫu?
+        #     τ_c=53486 không nhúc nhích sau 3000 step ở cả 6 lần chạy -> nghi tanh đang ở
+        #     vùng phẳng. Nếu c ≈ hằng số thì đưa c vào gate cũng vô nghĩa, phải sửa τ_c.
+        # detach(): thuần quan sát, không để lọt vào đồ thị gradient.
+        self._last_stats = {
+            "g_i": g_i.detach().squeeze(-1),
+            "category_confidence": category_confidence.detach(),
+            "item_weight": item_weight.detach(),
+            "norm_collab": e_collab.detach().norm(dim=-1),
+            "norm_content": e_content.detach().norm(dim=-1),
+            "norm_content_shrunk": category_content_shrunk.detach().norm(dim=-1),
+        }
 
         return g_i * e_collab + (1 - g_i) * category_content_shrunk  # (B, dim) = e_i_final
 
