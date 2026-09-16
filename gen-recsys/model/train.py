@@ -642,11 +642,10 @@ def _report_gate_diagnostic(
     vào content. Nếu g_i vẫn ≈0.5 hoặc cao ở nhóm item-cold thì gate hỏng, và việc thêm c
     vào gate không cứu được gì.
 
-    Nghi vấn 2 — c có THẬT SỰ biến thiên không? c = tanh(N_cat/τ_c) với τ_c=53486; N_category
-    gộp hàng nghìn item nên có thể bão hoà ≈1 ở MỌI mẫu. Bằng chứng gián tiếp: τ_c không
-    nhúc nhích sau 3000 step ở cả 6 lần chạy (53486.10 → 53486.10) — dấu hiệu tanh ở vùng
-    phẳng, không nhận gradient. Nếu std(c) ≈ 0 thì đưa c vào gate cũng như đưa một hằng số,
-    và vấn đề thật nằm ở τ_c chứ không ở công thức gate.
+    Nghi vấn 2 — c có THẬT SỰ biến thiên không? [ĐÃ TRẢ LỜI 2026-09-16] KHÔNG: c kẹt ở
+    ~0.0006 vì τ_c=53486 sai thang đo — nó lớn hơn max(N_category)=805 tới 66 lần. Đã sửa
+    τ_c=34.0 (xem learnable_thresholds.py). Giữ cột c để XÁC NHẬN sau khi sửa: kỳ vọng
+    c p50≈0.26, std≈0.39 thay vì p50=0.0007, std=0.0016.
 
     Nghi vấn 3 — nhánh content bị co bao nhiêu? So ‖e_content‖ với ‖e_content·c‖. Ở item
     cold, nếu CẢ g_i·e_collab lẫn (1−g_i)·e_content·c đều nhỏ thì e_i chỉ còn phần e_collab
