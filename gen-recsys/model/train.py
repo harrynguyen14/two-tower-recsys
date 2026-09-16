@@ -317,13 +317,29 @@ def train(
     use_beta: bool = True,   # ablation #3: tắt β·log m_j (xem confidence_attention.py)
     use_gamma: bool = True,  # ablation #4: tắt γ·log u_i·log m_j — số hạng TÍCH, đóng góp chính
     use_checkpoint: bool = False,  # gradient checkpointing — BẮT BUỘC cho nhánh có γ ở batch lớn
+    save_every: int | None = None,   # lưu checkpoint mỗi N step (None = chỉ lưu cuối epoch)
+    save_path: str | None = None,    # nơi lưu; mặc định <output_dir>/ckpt.pt
+    resume: str | None = None,       # nạp checkpoint rồi train tiếp từ đúng step đã dừng
+    eval_only: bool = False,         # bỏ qua train, chỉ nạp checkpoint và chạy evaluate()
+    num_workers: int = 4,            # worker nạp dữ liệu — xem DataLoader dưới (nghẽn là CPU, không phải GPU)
     device_str: str = "cuda" if torch.cuda.is_available() else "cpu",
 ):
     output_dir = Path(output_dir)
     device = torch.device(device_str)
 
     train_dataset = GenRecsysDataset(output_dir, split="train")
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    # [SỬA 2026-09-16] num_workers=4 + pin_memory: step đo được 1.59 s nhưng compute GPU chỉ
+    # ~125 ms (bench_t4.py, batch=256) và peak VRAM 1.73/15.6 GB — nghẽn nằm ở CPU, trong
+    # compute_n_i_n_category() (tra N_i/N_category theo timestamp, .numpy()/from_numpy mỗi
+    # step). Với num_workers=0 phần đó chạy tuần tự, GPU ngồi chờ. Worker process làm nó
+    # chồng lấn với forward/backward.
+    # Dataset dùng memmap read-only (dataset.py) nên fork sang worker an toàn: mỗi worker tự
+    # map lại, không chia sẻ file handle.
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=(device.type == "cuda"),
+        persistent_workers=num_workers > 0,  # không dựng lại 4 process mỗi epoch
+    )
 
     num_items = len(train_dataset.item_static)
     num_authors = int(train_dataset.item_static["author_idx"].max()) + 1
@@ -379,14 +395,58 @@ def train(
 
     steps_per_epoch = min(len(train_loader), max_steps_per_epoch) if max_steps_per_epoch else len(train_loader)
 
+    # Gom module vào 1 dict cho save/load — tránh lặp 6 tên ở 3 chỗ gọi khác nhau.
+    ckpt_modules = {
+        "item_embed": item_embed, "seq_model": seq_model, "profile_embed": profile_embed,
+        "thresholds": thresholds, "retrieval_loss_fn": retrieval_loss_fn,
+        "ranking_loss_fn": ranking_loss_fn,
+    }
+    # Cờ ĐỔI CƠ CHẾ model — lưu kèm để resume/eval-only không âm thầm chạy nhánh ablation
+    # khác với lúc train. Không gồm lr/batch_size: đổi chúng vẫn là cùng model, hợp lệ.
+    ckpt_config = {
+        "dim": dim, "num_heads": num_heads, "num_layers": num_layers, "ffn_dim": ffn_dim,
+        "use_cuckoo_embedding": use_cuckoo_embedding, "use_profile_token": use_profile_token,
+        "interleave": interleave, "static_user_weight": static_user_weight,
+        "use_beta": use_beta, "use_gamma": use_gamma,
+    }
+    ckpt_path = Path(save_path) if save_path else output_dir / "ckpt.pt"
+
+    start_epoch, start_step = 0, 0
+    if resume or eval_only:
+        src = resume or save_path or str(ckpt_path)
+        state = load_checkpoint(
+            src, modules=ckpt_modules, config=ckpt_config,
+            sparse_optimizer=None if eval_only else sparse_optimizer,
+            dense_optimizer=None if eval_only else dense_optimizer,
+        )
+        start_epoch, start_step = state["epoch"], state["step"]
+        print(f"[resume] nạp {src} — epoch={start_epoch} step={start_step}")
+
+    if eval_only:
+        # Chỉ đo lại, không train: dùng khi cần chạy chẩn đoán nhiều lần trên CÙNG model
+        # (eval ~8 phút so với ~2 giờ train lại — và train lại còn ra model KHÁC vì seed
+        # dataloader khác, nên số đo sẽ không so sánh được với lần trước).
+        evaluate(
+            "val", output_dir, item_embed, seq_model, profile_embed, thresholds, neg_sampler,
+            retrieval_loss_fn, item_n_cache, category_n_cache, num_negatives, batch_size, device,
+            max_batches=max_steps_per_epoch, static_user_weight=static_user_weight,
+            num_workers=num_workers,
+        )
+        return
+
     forward_time_acc = 0.0
     step_time_acc = 0.0
 
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         progress = tqdm(enumerate(train_loader), total=steps_per_epoch, desc=f"epoch {epoch}", unit="step")
         for step, batch in progress:
             if max_steps_per_epoch is not None and step >= max_steps_per_epoch:
                 break
+            # Resume giữa epoch: bỏ qua các step ĐÃ train. Quay vòng dataloader vẫn tốn
+            # thời gian đọc nhưng không forward/backward — chấp nhận được, và giữ thứ tự
+            # batch nhất quán với lần chạy trước (shuffle dùng cùng seed torch mặc định).
+            if epoch == start_epoch and step < start_step:
+                continue
 
             step_start = time.perf_counter()
             B = batch["hist_video_ids"].shape[0]
@@ -437,6 +497,15 @@ def train(
 
             progress.set_postfix(loss=f"{loss.item():.4f}", retrieval=f"{r_loss.item():.4f}", ranking=f"{k_loss.item():.4f}")
 
+            if save_every and step > 0 and step % save_every == 0:
+                save_checkpoint(
+                    ckpt_path, epoch=epoch, step=step + 1,  # +1: step này ĐÃ xong
+                    global_step=epoch * steps_per_epoch + step + 1, modules=ckpt_modules,
+                    sparse_optimizer=sparse_optimizer, dense_optimizer=dense_optimizer,
+                    config=ckpt_config,
+                )
+                tqdm.write(f"[ckpt] đã lưu {ckpt_path} (epoch={epoch} step={step + 1})")
+
             if step % 50 == 0:
                 snap = thresholds.get_tau_snapshot()
                 cuckoo_msg = ""
@@ -466,11 +535,138 @@ def train(
                     f"{cuckoo_msg}"
                 )
 
+        # Lưu CUỐI epoch không phụ thuộc --save-every: đây là checkpoint ta thật sự muốn
+        # giữ (train xong đủ số step), và là thứ --eval-only sẽ nạp lại.
+        save_checkpoint(
+            ckpt_path, epoch=epoch + 1, step=0,
+            global_step=(epoch + 1) * steps_per_epoch, modules=ckpt_modules,
+            sparse_optimizer=sparse_optimizer, dense_optimizer=dense_optimizer,
+            config=ckpt_config,
+        )
+        print(f"[ckpt] đã lưu {ckpt_path} (hết epoch {epoch})")
+
         # --- eval trên val sau MỖI epoch — Recall/NDCG@K tách theo 4 nhóm cold-start ---
         evaluate(
             "val", output_dir, item_embed, seq_model, profile_embed, thresholds, neg_sampler, retrieval_loss_fn,
             item_n_cache, category_n_cache, num_negatives, batch_size, device,
             max_batches=max_steps_per_epoch, static_user_weight=static_user_weight,
+            num_workers=num_workers,
+        )
+
+
+# Mọi module có tham số học được + cả 2 optimizer. THIẾU bất kỳ cái nào là resume ra
+# model khác: τ (LearnableThresholds) quyết định item_weight/user_weight, retrieval/ranking
+# head có bảng riêng — bỏ sót chúng thì nạp lại xong metric lệch mà không báo lỗi gì.
+_CKPT_MODULES = ("item_embed", "seq_model", "profile_embed", "thresholds",
+                 "retrieval_loss_fn", "ranking_loss_fn")
+
+
+def save_checkpoint(path: Path, *, epoch: int, step: int, global_step: int,
+                    modules: dict, sparse_optimizer, dense_optimizer, config: dict) -> None:
+    """Lưu đủ để train tiếp ĐÚNG chỗ đã dừng, không chỉ để eval.
+
+    Lưu cả optimizer state: Adam mang exp_avg/exp_avg_sq: bỏ đi thì resume xong momentum
+    reset về 0 và loss nhảy vọt vài trăm step — nhìn như model hỏng, thực ra chỉ là mất
+    trạng thái optimizer.
+
+    `config` giữ các cờ ablation (use_gamma/use_beta/static_user_weight/...). Nạp lại mà
+    cấu hình lệch thì state_dict vẫn khớp shape nhưng model chạy CƠ CHẾ KHÁC — đúng loại
+    lỗi âm thầm đã tốn của ta nhiều lần chạy. load_checkpoint() so và báo.
+
+    Ghi ra .tmp rồi rename: Kaggle ngắt session giữa lúc ghi sẽ để lại file hỏng, và ta chỉ
+    phát hiện lúc nạp — sau khi đã mất phiên train."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    blob = {
+        "epoch": epoch, "step": step, "global_step": global_step, "config": config,
+        "sparse_optimizer": sparse_optimizer.state_dict(),
+        "dense_optimizer": dense_optimizer.state_dict(),
+    }
+    for name in _CKPT_MODULES:
+        blob[name] = modules[name].state_dict()
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(blob, tmp)
+    tmp.replace(path)
+
+
+def load_checkpoint(path: Path, *, modules: dict, sparse_optimizer=None,
+                    dense_optimizer=None, config: dict | None = None) -> dict:
+    """Nạp checkpoint; trả về {"epoch", "step", "global_step"} để train() chạy tiếp.
+
+    optimizer=None -> chỉ nạp trọng số (đủ cho --eval-only, không cần optimizer state."""
+    blob = torch.load(Path(path), map_location="cpu", weights_only=False)
+
+    if config is not None:
+        saved = blob.get("config", {})
+        lech = {k: (saved.get(k), v) for k, v in config.items() if saved.get(k) != v}
+        if lech:
+            raise SystemExit(
+                "[resume] CẤU HÌNH LỆCH so với checkpoint — train tiếp sẽ ra model lai, "
+                "không đọc được kết quả:\n"
+                + "\n".join(f"    {k}: checkpoint={a!r} nhưng lần chạy này={b!r}"
+                             for k, (a, b) in lech.items())
+            )
+
+    # Thiếu module trong checkpoint = nạp lại chỉ MỘT PHẦN model, phần còn lại giữ trọng
+    # số khởi tạo ngẫu nhiên. Im lặng bỏ qua thì metric sai mà không có dấu hiệu gì — báo
+    # thẳng còn hơn chẩn đoán ngược từ một con số vô lý.
+    thieu = [n for n in _CKPT_MODULES if n not in blob]
+    if thieu:
+        raise SystemExit(f"[resume] checkpoint THIẾU module: {thieu} — không nạp được")
+    for name in _CKPT_MODULES:
+        modules[name].load_state_dict(blob[name])
+    if sparse_optimizer is not None and "sparse_optimizer" in blob:
+        sparse_optimizer.load_state_dict(blob["sparse_optimizer"])
+    if dense_optimizer is not None and "dense_optimizer" in blob:
+        dense_optimizer.load_state_dict(blob["dense_optimizer"])
+    return {"epoch": blob.get("epoch", 0), "step": blob.get("step", 0),
+            "global_step": blob.get("global_step", 0)}
+
+
+def _report_rank_diagnostic(
+    rank: torch.Tensor,        # (N,) thứ hạng positive, 0 = đứng đầu
+    norm_user: torch.Tensor,   # (N,) ‖e_user_eval‖
+    norm_pos: torch.Tensor,    # (N,) ‖e_i của positive‖
+    n_cand: torch.Tensor,      # (N,) số candidate = 1 + num_negatives
+    is_user_cold: torch.Tensor,
+    is_item_cold: torch.Tensor,
+) -> None:
+    """In phân bố THỨ HẠNG positive theo nhóm — phân định nguyên nhân recall=0.
+
+    Recall@K chỉ là (rank < K), nó bằng 0 trong HAI tình huống hoàn toàn khác nhau và
+    không cho biết là tình huống nào:
+
+      (a) rank dồn về ĐÁY (median ≈ C−1): positive bị đẩy xuống hệ thống. Nguyên nhân
+          thường là embedding positive bị triệt tiêu (‖e_pos‖→0) hoặc logit NaN/-inf —
+          tức LỖI, không phải chất lượng model.
+      (b) rank RẢI ĐỀU (median ≈ C/2): model đoán mò, không biết gì về item cold. Đó là
+          giới hạn học được thật, không phải bug.
+
+    Cột random= là mốc đối chiếu: median của model ngẫu nhiên hoàn toàn. So median quan
+    sát với nó là đọc được ngay (a) hay (b). ‖e_pos‖ tách riêng để bắt trường hợp
+    embedding cold bị nhân về 0 (xem item_embedding.py: g_i·e_collab + (1−g_i)·e_content
+    ·category_confidence — cả hai nhánh đều co lại khi N nhỏ)."""
+    groups = {
+        "warm_warm": (~is_user_cold) & (~is_item_cold),
+        "cold_user_warm_item": is_user_cold & (~is_item_cold),
+        "warm_user_cold_item": (~is_user_cold) & is_item_cold,
+        "cold_cold": is_user_cold & is_item_cold,
+    }
+    C = int(n_cand[0].item()) if n_cand.numel() else 0
+    print(f"\n  --- CHẨN ĐOÁN thứ hạng positive (C={C} candidate; "
+          f"random -> median≈{C//2}, đáy={C-1}) ---")
+    for name, mask in groups.items():
+        n = int(mask.sum().item())
+        if n == 0:
+            print(f"    [{name}] n=0")
+            continue
+        r = rank[mask].float()
+        q = torch.quantile(r, torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0]))
+        at_bottom = (r >= C - 1).float().mean().item()
+        print(
+            f"    [{name}] n={n} rank min={q[0]:.0f} p25={q[1]:.0f} median={q[2]:.0f} "
+            f"p75={q[3]:.0f} max={q[4]:.0f} | ở đáy={at_bottom:.1%} "
+            f"| ‖e_user‖={norm_user[mask].mean():.3f} ‖e_pos‖={norm_pos[mask].mean():.4f}"
         )
 
 
@@ -491,12 +687,16 @@ def evaluate(
     device: torch.device,
     max_batches: int | None = None,
     static_user_weight: bool = False,  # PHẢI khớp cấu hình lúc train, nếu không train/eval lệch
+    num_workers: int = 4,
 ) -> None:
     """Đánh giá Recall/NDCG@K trên split (val/test), tách theo 4 nhóm cold-start — xem
     eval.py. Dùng đúng candidate-sampling như lúc train (positive + N negative theo tần
     suất) — KHÔNG rank full-catalog mỗi sample (không khả thi)."""
     dataset = GenRecsysDataset(output_dir, split=split)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    loader = DataLoader(
+        dataset, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=(device.type == "cuda"),
+    )
 
     item_embed.eval()
     seq_model.eval()
@@ -504,6 +704,7 @@ def evaluate(
 
     all_metrics: dict[str, list[torch.Tensor]] = {}
     all_user_cold, all_item_cold, all_user_lowhist = [], [], []
+    all_rank, all_norm_user, all_norm_pos, all_n_cand = [], [], [], []  # chẩn đoán, xem dưới
 
     total = min(len(loader), max_batches) if max_batches else len(loader)
     for i, batch in enumerate(tqdm(loader, total=total, desc=f"eval[{split}]", unit="batch")):
@@ -523,6 +724,17 @@ def evaluate(
         eval_logit = retrieval_loss_fn.eval_logit(fwd["e_user_eval"], fwd["cand_e_i"])
 
         batch_metrics = compute_recall_ndcg_at_k(eval_logit)
+        # [CHẨN ĐOÁN 2026-09-16] Vì sao ô item-cold ra recall=0.0000 TUYỆT ĐỐI? Recall chỉ
+        # nói "có lọt top-K không", không phân biệt HAI nguyên nhân rất khác nhau:
+        #   rank dồn ở đáy (~C-1) -> positive bị ĐẨY xuống hệ thống (embedding hỏng/triệt tiêu)
+        #   rank rải đều 0..C-1   -> model chỉ đơn giản KHÔNG BIẾT item cold (đoán mò)
+        # Giữ rank thô + norm embedding để phân định; in 1 lần ở cuối, không spam mỗi batch.
+        order = torch.argsort(eval_logit, dim=1, descending=True)
+        rank = (order == 0).float().argmax(dim=1)  # thứ hạng positive, 0 = đứng đầu
+        all_rank.append(rank.cpu())
+        all_norm_user.append(fwd["e_user_eval"].norm(dim=-1).cpu())
+        all_norm_pos.append(fwd["cand_e_i"][:, 0].norm(dim=-1).cpu())
+        all_n_cand.append(torch.full_like(rank.cpu(), eval_logit.shape[1]))
         for k, v in batch_metrics.items():
             all_metrics.setdefault(k, []).append(v.cpu())
         all_user_cold.append(fwd["is_user_cold"])
@@ -536,6 +748,10 @@ def evaluate(
     # [SỬA 2026-09-15] HAI bảng: strict holdout (zero-shot, n nhỏ) + few-shot (nơi γ thật
     # sự học được). Không gộp — hai định nghĩa trả lời hai câu hỏi khác nhau, xem eval.py.
     is_user_lowhist = torch.cat(all_user_lowhist)
+    _report_rank_diagnostic(
+        torch.cat(all_rank), torch.cat(all_norm_user), torch.cat(all_norm_pos),
+        torch.cat(all_n_cand), is_user_cold, is_item_cold,
+    )
     result = aggregate_by_cold_group(per_sample_metrics, is_user_cold, is_item_cold)
     result_low = aggregate_by_cold_group(per_sample_metrics, is_user_lowhist, is_item_cold)
     print_eval_report(result, thresholds.get_tau_snapshot(), result_lowhistory=result_low)
@@ -558,6 +774,11 @@ if __name__ == "__main__":
     parser.add_argument("--static-user-weight", action="store_true", help="ABLATION #5: u_i TĨNH per-user (N_u tại điểm dự đoán, broadcast ra K vị trí) thay vì per-position. Thí nghiệm tách bạch đóng góp 'cold-start là đại lượng per-position' — xem run_batch_forward()")
     parser.add_argument("--no-beta", action="store_true", help="ABLATION #3: tắt số hạng β·log m_j trong attention bias")
     parser.add_argument("--no-gamma", action="store_true", help="ABLATION #4: tắt số hạng TÍCH γ·log(u_i)·log(m_j) — đóng góp chính, ablation quan trọng nhất")
+    parser.add_argument("--save-every", type=int, default=None, help="Lưu checkpoint mỗi N step (ngoài lần lưu cuối mỗi epoch, vốn LUÔN chạy). Dùng khi session hay bị ngắt giữa chừng")
+    parser.add_argument("--save-path", default=None, help="Đường dẫn checkpoint; mặc định <output-dir>/ckpt.pt. Trên Kaggle nên trỏ vào /kaggle/working (output-dir có thể read-only)")
+    parser.add_argument("--resume", default=None, help="Nạp checkpoint và train TIẾP từ đúng step đã dừng (gồm cả optimizer state)")
+    parser.add_argument("--num-workers", type=int, default=4, help="Worker nạp dữ liệu (mặc định 4). Nghẽn là CPU chứ không phải GPU — đặt 0 để debug hoặc khi môi trường không cho fork")
+    parser.add_argument("--eval-only", action="store_true", help="Không train, chỉ nạp checkpoint (--resume/--save-path) và chạy evaluate() — dùng để chạy lại chẩn đoán trên CÙNG model, ~8 phút thay vì train lại ~2 giờ")
     parser.add_argument("--checkpoint", action="store_true", help="Gradient checkpointing: chậm ~30%%, tiết kiệm ~70%% VRAM. BẮT BUỘC cho nhánh có γ ở batch=256 trên T4 15GB (nếu không sẽ CUDA OOM ở loss.backward)")
     args = parser.parse_args()
     train(
@@ -573,4 +794,9 @@ if __name__ == "__main__":
         use_beta=not args.no_beta,
         use_gamma=not args.no_gamma,
         use_checkpoint=args.checkpoint,
+        save_every=args.save_every,
+        save_path=args.save_path,
+        resume=args.resume,
+        eval_only=args.eval_only,
+        num_workers=args.num_workers,
     )
