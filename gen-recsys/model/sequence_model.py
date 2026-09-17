@@ -22,6 +22,13 @@ e_A+proj(click) và e_B+proj(like) có thể va chạm — rủi ro thật với
 
 Ràng buộc compute đã được BÁC BỎ bằng đo thật trên T4 — xem comment trong __init__.
 
+[SỬA 2026-09-17] Profile KHÔNG còn là token của chuỗi. Trước đây e_profile được prepend
+làm token 0; đo thật cho thấy token đó hút 28-33% attention ở MỌI độ dài chuỗi (share gần
+như không đổi: 0.331 ở ~4 lượt -> 0.279 ở ~64 lượt) — dấu hiệu attention sink chứ không
+phải token được tra cứu khi cần, và nhánh có nó cho recall@5 KÉM hơn (0.0577 vs 0.0628).
+Profile giờ đi qua ConditionalFiLM (decoder.py), điều biến mọi layer và tự nhạt dần theo
+u_i. Chuỗi trở lại đúng 2K token.
+
 forward() nhận (B, K, ...) và trả (B, K, dim) tại VỊ TRÍ ITEM trong CẢ hai chế độ, nên
 caller không phải biết chuỗi nội bộ dài K hay 2K.
 """
@@ -33,9 +40,7 @@ import torch.nn as nn
 
 from confidence_attention import EPS
 from decoder import SequenceDecoder
-
-NUM_ACTION_DIMS = 11  # ACTION_VECTOR_FIELDS, xem schema.py
-
+from action_encoder import ActionEncoder, NUM_ACTION_DIMS
 
 class SequenceModel(nn.Module):
     def __init__(
@@ -44,12 +49,13 @@ class SequenceModel(nn.Module):
         num_heads: int,
         num_layers: int,
         ffn_dim: int,
-        max_seq_len: int = 513,  # xen kẽ 2K token (K=256) + 1 token profile prepend
+        max_seq_len: int = 513,  # xen kẽ 2K token (K=256); +1 slot dự phòng
         dropout: float = 0.0,
         interleave: bool = True,  # True = xen kẽ [Φ_0,a_0,Φ_1,a_1,...] (HSTU); False = cộng gộp (ablation)
         use_beta: bool = True,   # ablation #3: tắt β·log m_j
         use_gamma: bool = True,  # ablation #4: tắt γ·log u_i·log m_j (số hạng TÍCH)
         use_checkpoint: bool = False,  # gradient checkpointing (tiết kiệm VRAM, xem decoder.py)
+        use_flex: bool = False,  # [2026-09-17] THỬ NGHIỆM: FlexAttention, xem confidence_attention.py
     ):
         super().__init__()
         self.dim = dim
@@ -70,12 +76,20 @@ class SequenceModel(nn.Module):
         # xen kẽ L=512 = 125.3 ms/step (0.15 h/epoch = 9 phút), peak 1.73/15.6 GB.
         # Compute KHÔNG còn là ràng buộc -> chọn xen kẽ, đúng HSTU, giữ đủ 256 item lịch sử.
         # `interleave=False` giữ đường cộng gộp cũ để ablate.
-        self.action_proj = nn.Linear(NUM_ACTION_DIMS, dim)
+        # [THAY 2026-09-17] GMU 3 nhánh -> ActionEncoder (gated action-type embedding).
+        # GMU là cơ chế cho MODALITY (biểu diễn thay thế được của cùng 1 vật, có cái
+        # optional); reaction/intensity/rhythm không phải vậy — chúng cùng đúng ở cường
+        # độ đầy đủ, mà softmax gate thì tổng = 1 nên buộc chúng CẠNH TRANH. Lập luận
+        # đầy đủ + dẫn chứng HSTU/MBHT/DIF-SR: docstring action_encoder.py.
+        self.action_encoder = ActionEncoder(dim)
         self.position_embedding = nn.Embedding(max_seq_len, dim)
 
+        # [ADDED 2026-09-17] The profile conditions EVERY decoder layer via ConditionalFiLM
+        # (decoder.py); it is NOT a sequence token. Measured rationale in that class.
         self.decoder = SequenceDecoder(
             dim, num_heads, num_layers, ffn_dim, dropout, max_seq_len=max_seq_len,
             use_beta=use_beta, use_gamma=use_gamma, use_checkpoint=use_checkpoint,
+            profile_dim=dim, use_flex=use_flex,
         )
 
     def forward(
@@ -86,6 +100,7 @@ class SequenceModel(nn.Module):
         profile_embedding: torch.Tensor | None = None,  # (B, dim) — e_profile, prepend làm token 0
         user_weight: torch.Tensor | None = None,  # (B, K) — u_i TẠI TỪNG LƯỢT, xem dataset.py hist_n_u
         item_weight: torch.Tensor | None = None,  # (B, K) — m_j của item mỗi lượt
+        hist_timestamps: torch.Tensor | None = None,  # (B, K) int64 ms — cho nhánh nhipthoigian
     ) -> torch.Tensor:
         """Trả về hidden state TẠI VỊ TRÍ ITEM: (B, K, dim) trong MỌI chế độ — caller
         không cần biết chuỗi bên trong dài K, 2K hay 2K+1.
@@ -116,7 +131,7 @@ class SequenceModel(nn.Module):
              tinh thần HSTU: mọi tín hiệu thành token trong MỘT chuỗi thống nhất.
         Chi phí: 1 token (L: 512 -> 513, <0.2% so với 125.3 ms/step đo thật trên T4)."""
         B, K, _ = item_embeddings.shape
-        a = self.action_proj(action_vectors)  # (B, K, dim)
+        a = self.action_encoder(action_vectors, hist_timestamps)  # (B, K, dim)
 
         if self.interleave:
             # (B, K, 2, dim) -> (B, 2K, dim), thứ tự Φ_0, a_0, Φ_1, a_1, ...
@@ -127,13 +142,16 @@ class SequenceModel(nn.Module):
         else:
             token = item_embeddings + a  # (B, K, dim) — đường cộng gộp cũ (ablation)
 
-        if profile_embedding is not None:
-            token = torch.cat([profile_embedding.unsqueeze(1), token], dim=1)  # (B, L+1, dim)
-            if key_padding_mask is not None:
-                # Token profile LUÔN là token thật, kể cả user không có lượt nào — đúng nhóm
-                # cold user cần nó nhất. Mask nhầm chỗ này = mask mất chính token cứu họ.
-                pad_false = torch.zeros(B, 1, dtype=key_padding_mask.dtype, device=key_padding_mask.device)
-                key_padding_mask = torch.cat([pad_false, key_padding_mask], dim=1)
+        # FiLM is gated by log(u_i), so without user_weight the profile would silently drop
+        # out of the graph -- it would train, lose nothing visibly, and simply have no
+        # effect. That is the failure mode this project has hit three times (the 3-way user
+        # gate receiving no gradient, the dead ReLU item gate, tau_c off by 5000x), so it
+        # fails loudly instead.
+        if profile_embedding is not None and user_weight is None:
+            raise ValueError(
+                "a profile_embedding requires user_weight: ConditionalFiLM is gated by "
+                "log(u_i), so without it the profile silently drops out of the graph."
+            )
 
         L = token.shape[1]
         positions = torch.arange(L, device=token.device).unsqueeze(0).expand(B, L)
@@ -152,21 +170,25 @@ class SequenceModel(nn.Module):
             else:
                 log_u_tok, log_m_tok = user_weight, item_weight  # (B, K)
 
-            if profile_embedding is not None:
-                # Token profile: u = giá trị của lượt ĐẦU (nó đứng trước mọi lượt), m = 1
-                # -> log m = 0 -> token profile KHÔNG bị phạt bởi số hạng β/γ. Đúng ngữ
-                # nghĩa: "độ hiếm" là khái niệm của item, profile không có item nào.
-                log_u_tok = torch.cat([log_u_tok[:, :1], log_u_tok], dim=1)
-                ones = torch.ones(B, 1, device=token.device, dtype=log_m_tok.dtype)
-                log_m_tok = torch.cat([ones, log_m_tok], dim=1)
 
             log_u = torch.log(log_u_tok + EPS)
             log_m = torch.log(log_m_tok + EPS)
 
-        hidden = self.decoder(token, key_padding_mask, log_u=log_u, log_m=log_m)  # (B, L, dim)
+        # [THÊM 2026-09-17] Timestamps cũng phải mở rộng THEO TOKEN cho relative time bias,
+        # và phải khớp CHÍNH XÁC cùng phép xếp token như log_u/log_m ở trên — lệch một nhịp
+        # là bias gắn nhầm khoảng cách thời gian cho nhầm cặp token, một bug hoàn toàn im
+        # lặng. Lượt t -> 2 token (Φ_t, a_t) cùng xảy ra tại một thời điểm nên cùng τ_t.
+        token_timestamps = None
+        if hist_timestamps is not None:
+            token_timestamps = (hist_timestamps.repeat_interleave(2, dim=1) if self.interleave
+                                else hist_timestamps)  # (B, L)
 
-        # Vị trí item lệch 1 khi có profile token: [e_profile, Φ_0, a_0, Φ_1, ...] -> 1, 3, 5...
-        # Sai chỗ này là bug IM LẶNG (không crash, chỉ kém) — mọi hidden lệch nửa bước.
-        offset = 1 if profile_embedding is not None else 0
+        hidden = self.decoder(token, key_padding_mask, log_u=log_u, log_m=log_m,
+                              e_profile=profile_embedding,
+                              token_timestamps=token_timestamps)  # (B, L, dim)
+
+        # Sequence is [Φ_0, a_0, Φ_1, a_1, ...] with no prepended token, so item positions
+        # start at 0. Getting this wrong is a SILENT bug (no crash, just worse) -- every
+        # hidden state would be off by half a step.
         stride = 2 if self.interleave else 1
-        return hidden[:, offset::stride]  # (B, K, dim) — luôn tại vị trí item
+        return hidden[:, ::stride]  # (B, K, dim) -- always at item positions

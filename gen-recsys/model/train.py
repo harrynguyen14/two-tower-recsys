@@ -76,30 +76,6 @@ from user_embedding import UserProfileConfig, UserProfileEmbedding
 BINARY_ACTION_INDICES = [ACTION_VECTOR_FIELDS.index(f) for f in BINARY_ACTION_FIELDS]
 
 
-def reset_optimizer_state_for_evicted(item_embed: ItemEmbedding, sparse_optimizer: torch.optim.SparseAdam) -> None:
-    """Reset SparseAdam state (exp_avg/exp_avg_sq) tại các slot vừa bị force-evict (LRU)
-    trong step NÀY — xem cuckoo_embedding.py docstring: nếu không reset, ID mới chiếm slot
-    sẽ "thừa kế" nhầm momentum của ID cũ đã bị đá khỏi hệ thống hẳn, học sai hướng ngay từ
-    bước đầu. Gọi SAU sparse_optimizer.step() mỗi step.
-
-    PHẢI dùng drain_pending_evicted_slots() (đọc + xóa), KHÔNG đọc trực tiếp
-    .pending_evicted_slots — ItemEmbedding.forward gọi resolve() nhiều LẦN/step (hist +
-    label + negatives) trên CÙNG 1 CuckooEmbedding instance; resolve() TÍCH LŨY, chỉ hàm
-    này (gọi 1 LẦN/step, sau MỌI lần resolve) mới drain."""
-    from cuckoo_embedding import CuckooEmbedding
-
-    for table in (item_embed.collab_embedding, item_embed.author_embedding, item_embed.music_embedding):
-        if not isinstance(table, CuckooEmbedding):
-            continue
-        for evicted_table, evicted_slot in table.drain_pending_evicted_slots():
-            param = table.table_a if evicted_table == "a" else table.table_b
-            state = sparse_optimizer.state.get(param)
-            if state is None or "exp_avg" not in state:
-                continue  # optimizer chưa từng step trên param này (batch đầu tiên) -> không có state để reset
-            state["exp_avg"][evicted_slot].zero_()
-            state["exp_avg_sq"][evicted_slot].zero_()
-
-
 def build_category_counts(item_static_path: Path) -> dict[str, int]:
     item_static = np.load(item_static_path, mmap_mode="r")
     return {field: int(item_static[field].max()) + 1 for field in ITEM_CATEGORICAL_FIELDS}
@@ -107,11 +83,11 @@ def build_category_counts(item_static_path: Path) -> dict[str, int]:
 
 def item_features_to_device(features: dict, device: torch.device) -> dict:
     return {
-        "category_ids": {k: v.to(device) for k, v in features["category_ids"].items()},
-        "author_idx": features["author_idx"].to(device),
-        "music_idx": features["music_idx"].to(device),
-        "caption_embedding": features["caption_embedding"].to(device),
-        "caption_mask": features["caption_mask"].to(device),
+        "category_ids": {k: v.to(device, non_blocking=True) for k, v in features["category_ids"].items()},
+        "author_idx": features["author_idx"].to(device, non_blocking=True),
+        "music_idx": features["music_idx"].to(device, non_blocking=True),
+        "caption_embedding": features["caption_embedding"].to(device, non_blocking=True),
+        "caption_mask": features["caption_mask"].to(device, non_blocking=True),
     }
 
 
@@ -151,12 +127,12 @@ def embed_items(
     runtime (có gradient chảy về τ_i/τ_c), rồi chạy ItemEmbedding — dùng CHUNG cho token
     lịch sử, candidate label, và negative (giữ logic 1 chỗ, tránh trùng lặp)."""
     n_i, n_cat = compute_n_i_n_category(dataset, item_n_cache, category_n_cache, video_ids_cpu, timestamps_cpu)
-    item_weight = thresholds.item_weight(n_i.to(device))
-    category_confidence = thresholds.category_confidence(n_cat.to(device))
+    item_weight = thresholds.item_weight(n_i.to(device, non_blocking=True))
+    category_confidence = thresholds.category_confidence(n_cat.to(device, non_blocking=True))
 
     features = item_features_to_device(dataset.get_item_features(video_ids_cpu), device)
     e_i_final = item_embed(
-        video_ids_cpu.to(device), features["category_ids"], features["author_idx"], features["music_idx"],
+        video_ids_cpu.to(device, non_blocking=True), features["category_ids"], features["author_idx"], features["music_idx"],
         item_weight, category_confidence,
         features["caption_embedding"], features["caption_mask"],
     )
@@ -191,12 +167,12 @@ def run_batch_forward(
     chuỗi), e_user_eval/cand_e_i/log_q (eval), label_action, is_user_cold, is_item_cold."""
     hist_video_ids_cpu = batch["hist_video_ids"]
     hist_timestamps_cpu = batch["hist_timestamps"]
-    hist_action = batch["hist_action"].to(device)
-    key_padding_mask = batch["key_padding_mask"].to(device)
-    hist_valid_mask = batch["hist_valid_mask"].to(device)  # (B, K) True = token thật
+    hist_action = batch["hist_action"].to(device, non_blocking=True)
+    key_padding_mask = batch["key_padding_mask"].to(device, non_blocking=True)
+    hist_valid_mask = batch["hist_valid_mask"].to(device, non_blocking=True)  # (B, K) True = token thật
     label_video_id_cpu = batch["label_video_id"]
     label_timestamp_cpu = batch["label_timestamp"]
-    label_action = batch["label_action"].to(device)
+    label_action = batch["label_action"].to(device, non_blocking=True)
 
     B, K = hist_video_ids_cpu.shape
 
@@ -210,7 +186,7 @@ def run_batch_forward(
     # u_i TẠI TỪNG VỊ TRÍ (không phải 1 scalar/chuỗi như trước) — điều kiện CHẶN để số hạng
     # γ·log(u_i)·log(m_j) không thoái hóa về đúng cơ chế λ·log(mat_j) đã bỏ 2026-09-13.
     # Xem dataset.py hist_n_u + confidence_attention.py docstring.
-    hist_n_u = batch["hist_n_u"].to(device)  # (B, K) — N_u tại TỪNG vị trí
+    hist_n_u = batch["hist_n_u"].to(device, non_blocking=True)  # (B, K) — N_u tại TỪNG vị trí
     if static_user_weight:
         # [ABLATION #5, THÊM 2026-09-15] Thay u_i per-position bằng u TĨNH per-user: lấy
         # N_u tại điểm dự đoán (vị trí cuối) rồi broadcast ra cả K vị trí. Đây là thí
@@ -239,12 +215,15 @@ def run_batch_forward(
     # xem user_embedding.py docstring: gate cũ không nhận gradient từ loss toàn chuỗi).
     user_features = dataset.get_user_features(batch["user_id"])
     e_profile = profile_embed(
-        user_features["onehot"].to(device), user_features["register_days"].to(device)
+        user_features["onehot"].to(device, non_blocking=True), user_features["register_days"].to(device, non_blocking=True)
     )  # (B, dim), hoặc None nếu use_profile_token=False (ablation)
 
     hidden = seq_model(
         hist_e_i, hist_action, key_padding_mask, profile_embedding=e_profile,
         user_weight=hist_user_weight, item_weight=hist_item_weight,
+        # [ADDED 2026-09-17] raw timestamps feed ActionEncoder (hour-of-day, see action_encoder.py).
+        # Derived at runtime, so no preprocessing rebuild was needed.
+        hist_timestamps=hist_timestamps_cpu.to(device, non_blocking=True),
     )  # (B, K, dim) tại vị trí item
 
     # --- Retrieval: loss TỰ HỒI QUY toàn chuỗi (mọi vị trí dự đoán item kế tiếp) ---
@@ -263,7 +242,7 @@ def run_batch_forward(
         item_n_cache, category_n_cache, device,
     )
     neg_e_i = neg_e_i.view(B, num_negatives, -1)
-    target_log_q = neg_sampler.log_q_for(target_ids_cpu.reshape(-1).to(device)).view(B, K)
+    target_log_q = neg_sampler.log_q_for(target_ids_cpu.reshape(-1).to(device, non_blocking=True)).view(B, K)
 
     # --- Biểu diễn user tại vị trí dự đoán CUỐI (= label), dùng cho eval ---
     # [SỬA 2026-09-14] Là hidden THUẦN từ decoder, KHÔNG qua gate nào nữa: e_profile đã nằm
@@ -275,7 +254,7 @@ def run_batch_forward(
     # Candidate set cho EVAL (xếp hạng label giữa positive + negative) — giữ đúng cách đo
     # cũ để so sánh được với baseline.
     cand_e_i = torch.cat([label_e_i.unsqueeze(1), neg_e_i], dim=1)  # (B, 1+num_negatives, dim)
-    positive_log_q = neg_sampler.log_q_for(label_video_id_cpu.to(device)).unsqueeze(1)
+    positive_log_q = neg_sampler.log_q_for(label_video_id_cpu.to(device, non_blocking=True)).unsqueeze(1)
     log_q = torch.cat([positive_log_q, neg_log_q], dim=1)
 
     return {
@@ -314,8 +293,8 @@ def train(
     ranking_loss_weight: float = 0.5,
     num_epochs: int = 1,
     max_steps_per_epoch: int | None = None,
-    use_cuckoo_embedding: bool = True,
-    cuckoo_capacity_ratio: float = 0.25,
+    amp: bool = True,  # [2026-09-17] fp16 autocast + GradScaler (CUDA), xem vòng lặp train
+    use_flex: bool = False,  # [2026-09-17] THỬ NGHIỆM: FlexAttention (tự tắt nếu kernel lỗi)
     use_profile_token: bool = True,  # prepend e_profile làm token 0 (xem user_embedding.py)
     interleave: bool = True,  # True = chuỗi xen kẽ [Φ,a,Φ,a,...] (HSTU); False = cộng gộp (ablation)
     static_user_weight: bool = False,  # ablation #5: u_i tĩnh per-user (xem run_batch_forward)
@@ -344,7 +323,15 @@ def train(
         train_dataset, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, pin_memory=(device.type == "cuda"),
         persistent_workers=num_workers > 0,  # không dựng lại 4 process mỗi epoch
+        # [THÊM 2026-09-17] prefetch_factor mặc định là 2; nâng lên 6 vì GPU đang ĐỢI CPU
+        # (fwd% đo được thấp), nên xếp sẵn nhiều batch hơn là đổi RAM lấy thời gian GPU rảnh.
+        prefetch_factor=6 if num_workers > 0 else None,
     )
+    # [THÊM 2026-09-17] pin_memory=True vốn đã bật, nhưng MỌI `.to(device)` trước đây đều
+    # BLOCKING — tức trả tiền cho pinned memory mà không nhận lợi ích: copy H2D vẫn chặn CPU
+    # cho tới khi xong. Nay tất cả dùng non_blocking=True để copy chồng lấn với compute.
+    # An toàn vì mọi tensor nguồn đều do DataLoader cấp (đã pinned) và chỉ được đọc SAU khi
+    # kernel dùng chúng đã enqueue trên cùng stream.
 
     num_items = len(train_dataset.item_static)
     num_authors = int(train_dataset.item_static["author_idx"].max()) + 1
@@ -354,9 +341,8 @@ def train(
     item_config = ItemEmbeddingConfig(
         num_items=num_items, num_authors=num_authors, num_music=num_music,
         num_categories=num_categories, dim=dim,
-        use_cuckoo_embedding=use_cuckoo_embedding, cuckoo_capacity_ratio=cuckoo_capacity_ratio,
     )
-    item_embed = ItemEmbedding(item_config).to(device)
+    item_embed = ItemEmbedding(item_config).to(device, non_blocking=True)
     # [SỬA 2026-09-14] Xen kẽ: chuỗi nội bộ 2K token cho K=256 lượt -> max_seq_len=512.
     # Đo thật trên T4 (bench_t4.py, fp16, batch=256): 125.3 ms/step = 0.15 h/epoch, peak
     # 1.73/15.6 GB — compute KHÔNG phải ràng buộc. Bỏ thiết kế K+1 cũ (nối candidate vào
@@ -366,22 +352,23 @@ def train(
         # +1 cho token profile prepend (xem sequence_model.py forward) — thiếu 1 slot ở đây
         # là IndexError trong position_embedding ngay step đầu.
         max_seq_len=(2 * MAX_SEQ_LEN if interleave else MAX_SEQ_LEN) + 1, interleave=interleave,
-        use_beta=use_beta, use_gamma=use_gamma, use_checkpoint=use_checkpoint,
-    ).to(device)
+        use_beta=use_beta, use_gamma=use_gamma, use_checkpoint=use_checkpoint, use_flex=use_flex,
+    ).to(device, non_blocking=True)
     profile_config = UserProfileConfig(
         onehot_num_categories=train_dataset.onehot_num_categories, dim=dim,
         use_profile_token=use_profile_token,
     )
-    profile_embed = UserProfileEmbedding(profile_config).to(device)
-    thresholds = LearnableThresholds().to(device)
-    retrieval_loss_fn = RetrievalLoss(dim=dim, t_base=t_base).to(device)
-    ranking_loss_fn = RankingLoss(dim=dim).to(device)
+    profile_embed = UserProfileEmbedding(profile_config).to(device, non_blocking=True)
+    thresholds = LearnableThresholds().to(device, non_blocking=True)
+    retrieval_loss_fn = RetrievalLoss(dim=dim, t_base=t_base).to(device, non_blocking=True)
+    ranking_loss_fn = RankingLoss(dim=dim).to(device, non_blocking=True)
     neg_sampler = NegativeSampler(output_dir, num_items=num_items)
 
-    # 3 bảng embedding lớn (collaborative/author/music, sparse=True) cần SparseAdam riêng —
-    # Adam thường sẽ cấp phát optimizer state (exp_avg/exp_avg_sq) cho TOÀN BỘ bảng dù mỗi
-    # batch chỉ chạm vài trăm dòng. Phần còn lại (category nhỏ, decoder, loss heads, τ)
-    # dùng Adam thường.
+    # [SỬA 2026-09-17] MỌI tham số vào chung 1 optimizer. Lập luận cũ ("3 bảng ID lớn cần
+    # SparseAdam, Adam sẽ cấp state cho TOÀN BỘ bảng") đúng về nguyên tắc nhưng sai về quy mô
+    # ở đây: KuaiRand-Pure có 7,583 item, bảng 64 chiều = 1.85 MB, nên state Adam thêm ~3.7 MB
+    # — không đáng so với việc phải nuôi 2 optimizer, mất fused=True, và buộc GradScaler đi
+    # đường coalesce cho gradient thưa khi bật AMP.
     dense_params = (
         item_embed.dense_parameters()
         + list(seq_model.parameters())
@@ -390,8 +377,15 @@ def train(
         + list(retrieval_loss_fn.parameters())
         + list(ranking_loss_fn.parameters())
     )
-    sparse_optimizer = torch.optim.SparseAdam(item_embed.sparse_parameters(), lr=lr)
-    dense_optimizer = torch.optim.Adam(dense_params, lr=lr)
+    # [GỠ 2026-09-17] Trước đây 2 optimizer: SparseAdam cho 3 bảng ID (sparse=True) + Adam
+    # cho phần còn lại. Với 7,583 item (bảng 1.85 MB) việc chia đó chỉ tốn phức tạp: nó chặn
+    # fused=True và bắt GradScaler đi đường coalesce khi bật AMP. Nay tất cả là dense -> 1
+    # optimizer. fused chỉ có trên CUDA.
+    optimizer = torch.optim.Adam(dense_params, lr=lr, fused=(device.type == "cuda"))
+    # GradScaler chỉ có tác dụng với fp16 trên CUDA; enabled=False biến mọi lời gọi thành
+    # no-op nên vòng lặp không cần rẽ nhánh.
+    use_amp = (device.type == "cuda") and amp
+    scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
 
     # Build 1 LẦN DUY NHẤT trước vòng lặp — KHÔNG build lại mỗi step.
     print("[train] building N_i/N_category cache (1 lần, dùng xuyên suốt training)...")
@@ -410,7 +404,7 @@ def train(
     # khác với lúc train. Không gồm lr/batch_size: đổi chúng vẫn là cùng model, hợp lệ.
     ckpt_config = {
         "dim": dim, "num_heads": num_heads, "num_layers": num_layers, "ffn_dim": ffn_dim,
-        "use_cuckoo_embedding": use_cuckoo_embedding, "use_profile_token": use_profile_token,
+        "amp": amp, "use_flex": use_flex, "use_profile_token": use_profile_token,
         "interleave": interleave, "static_user_weight": static_user_weight,
         "use_beta": use_beta, "use_gamma": use_gamma,
     }
@@ -421,8 +415,7 @@ def train(
         src = resume or save_path or str(ckpt_path)
         state = load_checkpoint(
             src, modules=ckpt_modules, config=ckpt_config,
-            sparse_optimizer=None if eval_only else sparse_optimizer,
-            dense_optimizer=None if eval_only else dense_optimizer,
+            optimizer=None if eval_only else optimizer,
         )
         start_epoch, start_step = state["epoch"], state["step"]
         print(f"[resume] nạp {src} — epoch={start_epoch} step={start_step}")
@@ -455,30 +448,39 @@ def train(
 
             step_start = time.perf_counter()
             B = batch["hist_video_ids"].shape[0]
-            fwd = run_batch_forward(
-                batch, train_dataset, item_embed, seq_model, profile_embed, thresholds, neg_sampler,
-                item_n_cache, category_n_cache, num_negatives, device,
-                static_user_weight=static_user_weight,
-            )
-            forward_time_acc += time.perf_counter() - step_start
+            # [THÊM 2026-09-17] AMP. Trên T4 (Turing) fp16 có tensor core: 8.1 -> 65 TFLOPS
+            # đỉnh, và MỌI tensor (B,H,L,L) giảm nửa (1.00 -> 0.50 GB ở B=256, L=512) — đòn
+            # bẩy lớn nhất cho cả tốc độ lẫn bộ nhớ. bf16 KHÔNG có trên sm_75, phải fp16 +
+            # GradScaler. Softmax/loss vẫn tự động chạy fp32 (autocast giữ danh sách op nhạy
+            # cảm với độ chính xác), nên chỉ matmul/conv hạ xuống fp16.
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                fwd = run_batch_forward(
+                    batch, train_dataset, item_embed, seq_model, profile_embed, thresholds, neg_sampler,
+                    item_n_cache, category_n_cache, num_negatives, device,
+                    static_user_weight=static_user_weight,
+                )
+                forward_time_acc += time.perf_counter() - step_start
 
-            # --- retrieval TỰ HỒI QUY toàn chuỗi: dự đoán item t+1 tại MỌI vị trí ---
-            r_loss = retrieval_loss_fn.forward_sequence(
-                fwd["pred"], fwd["target_e_i"], fwd["neg_e_i"],
-                fwd["target_log_q"], fwd["neg_log_q"], fwd["pair_valid"],
-            )
+                # --- retrieval TỰ HỒI QUY toàn chuỗi: dự đoán item t+1 tại MỌI vị trí ---
+                r_loss = retrieval_loss_fn.forward_sequence(
+                    fwd["pred"], fwd["target_e_i"], fwd["neg_e_i"],
+                    fwd["target_log_q"], fwd["neg_log_q"], fwd["pair_valid"],
+                )
 
-            # --- ranking p(a_t | Φ_t) tại MỌI vị trí — không leak nhờ chuỗi xen kẽ ---
-            binary_labels = fwd["hist_action"][..., BINARY_ACTION_INDICES]  # (B, K, 8)
-            k_loss, _ = ranking_loss_fn.forward_sequence(
-                fwd["pred"], binary_labels, fwd["hist_valid_mask"],
-            )
+                # --- ranking p(a_t | Φ_t) tại MỌI vị trí — không leak nhờ chuỗi xen kẽ ---
+                binary_labels = fwd["hist_action"][..., BINARY_ACTION_INDICES]  # (B, K, 8)
+                k_loss, _ = ranking_loss_fn.forward_sequence(
+                    fwd["pred"], binary_labels, fwd["hist_valid_mask"],
+                )
 
-            loss = r_loss + ranking_loss_weight * k_loss
+                loss = r_loss + ranking_loss_weight * k_loss
 
-            sparse_optimizer.zero_grad()
-            dense_optimizer.zero_grad()
-            loss.backward()
+            optimizer.zero_grad(set_to_none=True)
+            # AMP: scaler nhân loss lên trước backward để gradient fp16 không underflow về 0,
+            # rồi unscale_ trả về thang thật TRƯỚC khi đo grad norm bên dưới — nếu không, mọi
+            # con số chẩn đoán sẽ bị nhân với scale factor (~65536) và vô nghĩa.
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
 
             # [THÊM 2026-09-15] Đo ‖∇β‖/‖∇γ‖/‖∇δ‖ NGAY SAU backward, TRƯỚC step() — sau
             # step() gradient vẫn còn nhưng đã bị optimizer dùng, và zero_grad() đầu vòng
@@ -487,7 +489,7 @@ def train(
             # hệt và phải dừng, không xây tiếp. Cộng ‖·‖ qua MỌI layer vì mỗi layer có β/γ/δ
             # riêng — nhìn 1 layer có thể bỏ sót layer khác đang học.
             grad_norms = {}
-            for pname in ("beta", "gamma", "delta"):
+            for pname in ("beta", "gamma", "delta", "ts_w"):
                 total = 0.0
                 for layer in seq_model.decoder.layers:
                     g = getattr(layer.attn, pname).grad
@@ -495,9 +497,8 @@ def train(
                         total += g.norm().item() ** 2
                 grad_norms[pname] = total ** 0.5
 
-            sparse_optimizer.step()
-            dense_optimizer.step()
-            reset_optimizer_state_for_evicted(item_embed, sparse_optimizer)
+            scaler.step(optimizer)
+            scaler.update()
             step_time_acc += time.perf_counter() - step_start
 
             progress.set_postfix(loss=f"{loss.item():.4f}", retrieval=f"{r_loss.item():.4f}", ranking=f"{k_loss.item():.4f}")
@@ -506,29 +507,23 @@ def train(
                 save_checkpoint(
                     ckpt_path, epoch=epoch, step=step + 1,  # +1: step này ĐÃ xong
                     global_step=epoch * steps_per_epoch + step + 1, modules=ckpt_modules,
-                    sparse_optimizer=sparse_optimizer, dense_optimizer=dense_optimizer,
+                    optimizer=optimizer, scaler=scaler,
                     config=ckpt_config,
                 )
                 tqdm.write(f"[ckpt] đã lưu {ckpt_path} (epoch={epoch} step={step + 1})")
 
             if step % 50 == 0:
                 snap = thresholds.get_tau_snapshot()
-                cuckoo_msg = ""
-                if item_config.use_cuckoo_embedding:
-                    forward_pct = 100.0 * forward_time_acc / step_time_acc if step_time_acc > 0 else 0.0
-                    cuckoo_msg = (
-                        f" | cuckoo[item] load={item_embed.collab_embedding.load_factor():.2f} "
-                        f"evict={item_embed.collab_embedding.num_evictions} "
-                        f"forward%={forward_pct:.0f}"
-                    )
-                    forward_time_acc = 0.0
-                    step_time_acc = 0.0
+                forward_pct = 100.0 * forward_time_acc / step_time_acc if step_time_acc > 0 else 0.0
+                fwd_msg = f" | fwd%={forward_pct:.0f}"
+                forward_time_acc = 0.0
+                step_time_acc = 0.0
                 # Giá trị |β|/|γ|/|δ| trung bình qua mọi head & layer — cặp với grad norm:
                 # grad cho biết "có tín hiệu học không", giá trị cho biết "đã học được gì
                 # chưa". γ→0 kèm ∇γ→0 = chết (như λ cũ); γ→0 kèm ∇γ lớn = chưa hội tụ.
                 with torch.no_grad():
                     vals = {}
-                    for pname in ("beta", "gamma", "delta"):
+                    for pname in ("beta", "gamma", "delta", "ts_w"):
                         ps = [getattr(l.attn, pname).abs().mean().item() for l in seq_model.decoder.layers]
                         vals[pname] = sum(ps) / len(ps)
                 tqdm.write(
@@ -536,8 +531,10 @@ def train(
                     f"retrieval={r_loss.item():.4f} ranking={k_loss.item():.4f} "
                     f"tau_u={snap['tau_u']:.2f} tau_i={snap['tau_i']:.2f} tau_c={snap['tau_c']:.2f}"
                     f" | |b|={vals['beta']:.2e} |g|={vals['gamma']:.2e} |d|={vals['delta']:.2e}"
+                    f" |ts|={vals['ts_w']:.2e}"
                     f" gb={grad_norms['beta']:.2e} gg={grad_norms['gamma']:.2e} gd={grad_norms['delta']:.2e}"
-                    f"{cuckoo_msg}"
+                    f" gts={grad_norms['ts_w']:.2e}"
+                    f"{fwd_msg}"
                 )
 
         # Lưu CUỐI epoch không phụ thuộc --save-every: đây là checkpoint ta thật sự muốn
@@ -545,7 +542,7 @@ def train(
         save_checkpoint(
             ckpt_path, epoch=epoch + 1, step=0,
             global_step=(epoch + 1) * steps_per_epoch, modules=ckpt_modules,
-            sparse_optimizer=sparse_optimizer, dense_optimizer=dense_optimizer,
+            optimizer=optimizer, scaler=scaler,
             config=ckpt_config,
         )
         print(f"[ckpt] đã lưu {ckpt_path} (hết epoch {epoch})")
@@ -567,7 +564,7 @@ _CKPT_MODULES = ("item_embed", "seq_model", "profile_embed", "thresholds",
 
 
 def save_checkpoint(path: Path, *, epoch: int, step: int, global_step: int,
-                    modules: dict, sparse_optimizer, dense_optimizer, config: dict) -> None:
+                    modules: dict, optimizer, scaler, config: dict) -> None:
     """Lưu đủ để train tiếp ĐÚNG chỗ đã dừng, không chỉ để eval.
 
     Lưu cả optimizer state: Adam mang exp_avg/exp_avg_sq: bỏ đi thì resume xong momentum
@@ -584,8 +581,8 @@ def save_checkpoint(path: Path, *, epoch: int, step: int, global_step: int,
     path.parent.mkdir(parents=True, exist_ok=True)
     blob = {
         "epoch": epoch, "step": step, "global_step": global_step, "config": config,
-        "sparse_optimizer": sparse_optimizer.state_dict(),
-        "dense_optimizer": dense_optimizer.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scaler": scaler.state_dict(),
     }
     for name in _CKPT_MODULES:
         blob[name] = modules[name].state_dict()
@@ -594,8 +591,8 @@ def save_checkpoint(path: Path, *, epoch: int, step: int, global_step: int,
     tmp.replace(path)
 
 
-def load_checkpoint(path: Path, *, modules: dict, sparse_optimizer=None,
-                    dense_optimizer=None, config: dict | None = None) -> dict:
+def load_checkpoint(path: Path, *, modules: dict, optimizer=None, scaler=None,
+                    config: dict | None = None) -> dict:
     """Nạp checkpoint; trả về {"epoch", "step", "global_step"} để train() chạy tiếp.
 
     optimizer=None -> chỉ nạp trọng số (đủ cho --eval-only, không cần optimizer state."""
@@ -620,10 +617,10 @@ def load_checkpoint(path: Path, *, modules: dict, sparse_optimizer=None,
         raise SystemExit(f"[resume] checkpoint THIẾU module: {thieu} — không nạp được")
     for name in _CKPT_MODULES:
         modules[name].load_state_dict(blob[name])
-    if sparse_optimizer is not None and "sparse_optimizer" in blob:
-        sparse_optimizer.load_state_dict(blob["sparse_optimizer"])
-    if dense_optimizer is not None and "dense_optimizer" in blob:
-        dense_optimizer.load_state_dict(blob["dense_optimizer"])
+    if optimizer is not None and "optimizer" in blob:
+        optimizer.load_state_dict(blob["optimizer"])
+    if scaler is not None and "scaler" in blob:
+        scaler.load_state_dict(blob["scaler"])
     return {"epoch": blob.get("epoch", 0), "step": blob.get("step", 0),
             "global_step": blob.get("global_step", 0)}
 
@@ -642,14 +639,16 @@ def _report_gate_diagnostic(
     vào content. Nếu g_i vẫn ≈0.5 hoặc cao ở nhóm item-cold thì gate hỏng, và việc thêm c
     vào gate không cứu được gì.
 
-    Nghi vấn 2 — c có THẬT SỰ biến thiên không? [ĐÃ TRẢ LỜI 2026-09-16] KHÔNG: c kẹt ở
-    ~0.0006 vì τ_c=53486 sai thang đo — nó lớn hơn max(N_category)=805 tới 66 lần. Đã sửa
-    τ_c=34.0 (xem learnable_thresholds.py). Giữ cột c để XÁC NHẬN sau khi sửa: kỳ vọng
-    c p50≈0.26, std≈0.39 thay vì p50=0.0007, std=0.0016.
+    Nghi vấn 2 — c có THẬT SỰ biến thiên không? [ĐÃ TRẢ LỜI + ĐÃ SỬA 2026-09-16] Ban đầu
+    KHÔNG: c kẹt ~0.0006 vì τ_c=53486 sai thang đo (lớn hơn max(N_category)=805 tới 66 lần).
+    Sau khi sửa τ_c=34.0: c p50=0.8165 std=0.4153 — c sống, và τ_c bắt đầu HỌC thật
+    (34.00 -> 34.90 sau 3000 step, trước đó đứng im 53486.10 -> 53486.10).
 
-    Nghi vấn 3 — nhánh content bị co bao nhiêu? So ‖e_content‖ với ‖e_content·c‖. Ở item
-    cold, nếu CẢ g_i·e_collab lẫn (1−g_i)·e_content·c đều nhỏ thì e_i chỉ còn phần e_collab
-    chưa được train — khớp với ‖e_pos‖ cold > warm đã đo ở bảng thứ hạng."""
+    Nghi vấn 3 — nhánh content bị co bao nhiêu? [ĐÃ SỬA 2026-09-16] Trước: ‖content‖=18.57
+    -> ‖content·c‖=0.0238, co 780 lần, nhánh content vô hiệu. Sau khi sửa τ_c + bỏ phép nhân
+    (c vào gate thay vì nhân thẳng): ‖content‖=9.01 -> 6.30, co 1.4 lần — đúng mức của một
+    trọng số trộn. Cột này giờ là HỒI QUY: nếu ->co lại nhỏ hơn ‖content‖ hàng trăm lần thì
+    phép nhân đã quay lại (test_item_gate.py::[2] cũng chặn)."""
     groups = {
         "warm_warm": (~is_user_cold) & (~is_item_cold),
         "cold_user_warm_item": is_user_cold & (~is_item_cold),
@@ -678,7 +677,8 @@ def _report_gate_diagnostic(
     c_all = stats["category_confidence"]
     print(f"    [toàn bộ] c: min={c_all.min():.4f} p50={c_all.median():.4f} "
           f"max={c_all.max():.4f} std={c_all.std():.4f}"
-          f"  <- std≈0 nghĩa là c vô dụng trong gate, phải sửa τ_c")
+          f"  <- std<0.05 = c vô dụng trong gate (τ_c sai thang đo); "
+          f"đo 2026-09-16 sau khi sửa τ_c=34: p50=0.82 std=0.42")
 
 
 def _report_rank_diagnostic(
@@ -831,8 +831,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-epochs", type=int, default=1)
     parser.add_argument("--max-steps-per-epoch", type=int, default=None)
-    parser.add_argument("--no-cuckoo-embedding", action="store_true", help="Tắt CuckooEmbedding, dùng nn.Embedding cố định (ablation, khuyến nghị cho catalog nhỏ như KuaiRand-Pure)")
-    parser.add_argument("--cuckoo-capacity-ratio", type=float, default=0.25, help="Capacity mỗi bảng con cuckoo = ratio * num_ids")
+    parser.add_argument("--flex-attention", action="store_true", help="THỬ NGHIỆM [2026-09-17]: dùng FlexAttention (kernel fused, không materialize (B,H,L,L)). Chưa kiểm chứng trên T4/Turing — TỰ ĐỘNG quay về đường thủ công nếu kernel lỗi, xem log [flex]")
+    parser.add_argument("--no-amp", action="store_true", help="Tắt fp16 autocast + GradScaler (mặc định BẬT trên CUDA). Dùng khi nghi ngờ vấn đề độ chính xác")
     parser.add_argument("--no-profile-token", action="store_true", help="Không prepend e_profile làm token 0 của chuỗi — ablation (xem user_embedding.py)")
     parser.add_argument("--no-interleave", action="store_true", help="Cộng gộp item+action vào 1 token (chuỗi K) thay vì xen kẽ [Φ,a,Φ,a,...] (chuỗi 2K, đúng HSTU) — ablation")
     parser.add_argument("--static-user-weight", action="store_true", help="ABLATION #5: u_i TĨNH per-user (N_u tại điểm dự đoán, broadcast ra K vị trí) thay vì per-position. Thí nghiệm tách bạch đóng góp 'cold-start là đại lượng per-position' — xem run_batch_forward()")
@@ -850,8 +850,8 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         num_epochs=args.num_epochs,
         max_steps_per_epoch=args.max_steps_per_epoch,
-        use_cuckoo_embedding=not args.no_cuckoo_embedding,
-        cuckoo_capacity_ratio=args.cuckoo_capacity_ratio,
+        amp=not args.no_amp,
+        use_flex=args.flex_attention,
         use_profile_token=not args.no_profile_token,
         interleave=not args.no_interleave,
         static_user_weight=args.static_user_weight,

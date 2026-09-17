@@ -69,8 +69,6 @@ def build_cmd(flags: list[str], args: argparse.Namespace) -> list[str]:
         "--num-epochs", "1",
         "--max-steps-per-epoch", str(args.steps),
     ]
-    if args.no_cuckoo:
-        cmd.append("--no-cuckoo-embedding")
     return cmd + flags
 
 
@@ -83,8 +81,6 @@ def main() -> None:
     p.add_argument("--batch-size", type=int, default=256, help="256 cho T4 16GB (đo thật: peak 1.73GB)")
     p.add_argument("--log-dir", default="logs")
     p.add_argument("--only", default="", help="chỉ chạy các nhánh này, vd '4,5'")
-    p.add_argument("--with-cuckoo", dest="no_cuckoo", action="store_false", default=True,
-                   help="bật CuckooEmbedding (mặc định TẮT — khuyến nghị cho catalog nhỏ như Pure)")
     p.add_argument("--dry-run", action="store_true", help="in lệnh rồi thoát, không chạy")
     args = p.parse_args()
 

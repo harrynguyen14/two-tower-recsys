@@ -23,7 +23,12 @@ LOG_SCHEMA = [
 ACTION_VECTOR_FIELDS = [
     "is_click", "is_like", "is_follow", "is_comment", "is_forward", "is_hate",
     "long_view",            # đã là 0/1 trong dataset gốc
-    "play_ratio",           # derived = play_time_ms / duration_ms, clip [0, 1]
+    "play_ratio",           # derived [SỬA 2026-09-17 — D2Q]: THỨ HẠNG PHẦN TRĂM của
+                            # play_time/duration TRONG NHÓM duration (decile), không
+                            # phải tỉ lệ thô. Thời lượng video là biến gây nhiễu — đo
+                            # được play_ratio thô giảm đơn điệu 4.55x từ decile ngắn
+                            # sang decile dài. Sau khi sửa còn 1.22x. Xem
+                            # build_sequences._compute_derived_action_fields.
     "profile_stay_time_norm",  # derived, chuẩn hóa (log1p + scale)
     "comment_stay_time_norm",  # derived, chuẩn hóa (log1p + scale)
     "is_profile_enter",

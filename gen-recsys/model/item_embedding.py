@@ -27,21 +27,17 @@ chốt 2026-09-10). Do catalog lớn, cần chia model parallelism (item_id % 2 
 xem idea.md mục "TRẠNG THÁI DỰ ÁN" quyết định #1) — CHƯA làm ở module này (single-GPU
 trước, xem TODO ở EmbeddingConfig), thêm khi có 2 GPU thật để test.
 
-[THÊM 2026-09-11] `use_cuckoo_embedding=True` (mặc định) thay nn.Embedding cố định bằng
-CuckooEmbedding (xem cuckoo_embedding.py, lấy cảm hứng ByteDance Monolith "Collisionless
-Embedding Table") cho 3 bảng ID lớn (collaborative/author/music) — giải quyết đúng gap đã
-tìm thấy khi review kiến trúc: nn.Embedding(num_items, dim) cố định kích thước lúc train
-KHÔNG có hàng nào cho item/author/music HOÀN TOÀN MỚI xuất hiện lúc serving (không
-hash-bucket/fallback). CuckooEmbedding dùng capacity NHỎ HƠN tổng ID tiềm năng (không cần
-biết trước, đúng tinh thần Monolith cho hệ thống serving thật đang chạy liên tục) — ID mới
-được cấp slot ngay (evict ID ít hoạt động nếu bảng đầy) thay vì crash/IndexError.
-`use_cuckoo_embedding=False` giữ nn.Embedding cũ để so sánh ablation.
+[GỠ 2026-09-17] CuckooEmbedding đã GỠ khỏi đường chạy. Nó nén bảng ID lớn (ByteDance
+Monolith, "Collisionless Embedding Table") — cần thiết khi catalog hàng chục triệu ID.
+KuaiRand-Pure chỉ có 7,583 item: toàn bộ bảng embedding 64 chiều là 1.85 MB. Nén 1.85 MB
+không giải quyết vấn đề gì, trong khi resolve() dựa trên dict Python đo được ~0.38 s/step —
+tức CHÍNH LÀ nút thắt CPU mà train.py than phiền. File `cuckoo_embedding.py` giữ nguyên,
+import lại được khi chuyển sang catalog lớn (KuaiRand-27K).
 
-[CẢNH BÁO review.md] CuckooEmbedding (Python dict-based) đo được ~0.38s/step resolve trên
-19,264 ID/batch — đây là bottleneck thật (dù nhỏ hơn I/O memmap ~9-18s/step). Với dataset
-KuaiRand-Pure (7,583 item, không phải 32M), CÂN NHẮC `use_cuckoo_embedding=False` (dùng
-nn.Embedding cố định thường) — bảng nhỏ, không cần collisionless, tiết kiệm hẳn 0.38s/step
-này. Quyết định cụ thể để lại cho lúc build pipeline cho Pure, KHÔNG đổi mặc định ở đây.
+[SỬA 2026-09-17] `sparse=False` (trước là True). Gradient thưa buộc phải dùng SparseAdam,
+mà SparseAdam không gộp được với optimizer dày đặc, không dùng được `fused=True`, và buộc
+GradScaler đi đường coalesce chậm khi bật AMP. Với 7,583 item thì Adam dày đặc chỉ tốn thêm
+~3.7 MB state — đổi lại được MỘT optimizer duy nhất cho toàn model.
 
 e_content: qua GMU (gmu.py) fuse các nhánh tĩnh của item — categorical (category 1 cấp +
 video_type + music_type) + author/music (ID embedding nhỏ). author_idx/music_idx CŨNG nằm
@@ -79,7 +75,6 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from cuckoo_embedding import CuckooEmbedding
 from gmu import GMU
 
 # Field categorical trong item_static.npy dùng embedding riêng (tên field -> tên tham số
@@ -100,11 +95,6 @@ class ItemEmbeddingConfig:
         cat_embed_dim: int = 16,
         id_embed_dim: int = 16,
         caption_dim: int = 384,  # multilingual-e5-small, xem encode_captions_kaggle.py
-        use_cuckoo_embedding: bool = True,  # xem cuckoo_embedding.py — thay nn.Embedding cố định
-        cuckoo_capacity_ratio: float = 0.25,  # capacity mỗi bảng con = ratio * num_ids — CỐ TÌNH
-        # nhỏ hơn tổng ID (2 bảng con * ratio = 0.5x tổng số ID có slot ĐỒNG THỜI, không phải
-        # 1x) để mô phỏng đúng vấn đề Monolith giải quyết: bảng KHÔNG đủ chỗ cho MỌI ID, cần cơ
-        # chế evict thật. ratio=1.0 sẽ gần như không bao giờ evict (mất ý nghĩa mô phỏng).
     ):
         self.num_items = num_items
         self.num_authors = num_authors
@@ -114,8 +104,6 @@ class ItemEmbeddingConfig:
         self.cat_embed_dim = cat_embed_dim
         self.id_embed_dim = id_embed_dim
         self.caption_dim = caption_dim
-        self.use_cuckoo_embedding = use_cuckoo_embedding
-        self.cuckoo_capacity_ratio = cuckoo_capacity_ratio
 
 
 class ItemEmbedding(nn.Module):
@@ -124,17 +112,12 @@ class ItemEmbedding(nn.Module):
         self.config = config
 
         # e_collab — thuần ID embedding, KHÔNG dùng feature nào khác (đã chốt).
-        if config.use_cuckoo_embedding:
-            cap_items = max(1, int(config.num_items * config.cuckoo_capacity_ratio))
-            cap_authors = max(1, int(config.num_authors * config.cuckoo_capacity_ratio))
-            cap_music = max(1, int(config.num_music * config.cuckoo_capacity_ratio))
-            self.collab_embedding = CuckooEmbedding(cap_items, config.dim, seed=1)
-            self.author_embedding = CuckooEmbedding(cap_authors, config.id_embed_dim, seed=2)
-            self.music_embedding = CuckooEmbedding(cap_music, config.id_embed_dim, seed=3)
-        else:
-            self.collab_embedding = nn.Embedding(config.num_items, config.dim, sparse=True)
-            self.author_embedding = nn.Embedding(config.num_authors, config.id_embed_dim, sparse=True)
-            self.music_embedding = nn.Embedding(config.num_music, config.id_embed_dim, sparse=True)
+        # sparse=False: xem docstring module. Bảng nhỏ (7,583 item = 1.85 MB) nên Adam dày
+        # đặc rẻ, và nó cho phép MỘT optimizer duy nhất + fused + AMP không phải đi đường
+        # coalesce của GradScaler.
+        self.collab_embedding = nn.Embedding(config.num_items, config.dim)
+        self.author_embedding = nn.Embedding(config.num_authors, config.id_embed_dim)
+        self.music_embedding = nn.Embedding(config.num_music, config.id_embed_dim)
 
         # e_content — categorical nhỏ (mỗi field 1 bảng embedding riêng, KHÔNG sparse vì số
         # lượng category nhỏ, dense Adam state không đáng kể) + numeric (8 stat feature, đưa
@@ -242,15 +225,11 @@ class ItemEmbedding(nn.Module):
 
         return w_collab * e_collab + w_content * e_content  # (B, dim) = e_i_final
 
-    def sparse_parameters(self) -> list[nn.Parameter]:
-        """3 bảng embedding lớn (sparse=True) — cần SparseAdam riêng, xem train.py."""
-        return (
-            list(self.collab_embedding.parameters())
-            + list(self.author_embedding.parameters())
-            + list(self.music_embedding.parameters())
-        )
-
     def dense_parameters(self) -> list[nn.Parameter]:
-        """Phần còn lại (category_embeddings nhỏ + GMU + gate_mlp) — Adam thường."""
-        sparse_ids = {id(p) for p in self.sparse_parameters()}
-        return [p for p in self.parameters() if id(p) not in sparse_ids]
+        """MỌI tham số — không còn chia sparse/dense.
+
+        [GỠ 2026-09-17] Trước đây 3 bảng ID lớn dùng sparse=True + SparseAdam riêng, phần còn
+        lại dùng Adam. Với 7,583 item (bảng 64 chiều = 1.85 MB) việc chia đó không đáng: nó
+        buộc phải nuôi 2 optimizer, chặn `fused=True`, và bắt GradScaler đi đường coalesce khi
+        bật AMP. Giữ tên `dense_parameters` để caller không phải đổi."""
+        return list(self.parameters())

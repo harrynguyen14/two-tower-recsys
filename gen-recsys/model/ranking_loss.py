@@ -14,7 +14,7 @@ concat([h_u, e_i]) HOÀN TOÀN TÁCH RỜI khỏi decoder):
     riêng, chỉ cần đặt đúng vị trí trong chuỗi causal có sẵn)
     h_candidate = output[:, -1, :]           -- vị trí K+1 = vị trí candidate
 
-    x_candidate = e_i_final(candidate) + action_proj(label_action) + position(K)
+    x_candidate = e_i_final(candidate) + action_encoder(label_action) + position(K)
     (label_action = action THẬT tại vị trí label, dùng làm INPUT — nhãn để tính BCE loss
     cũng CHÍNH LÀ label_action đó: multi-task dự đoán "action nào đã thực sự xảy ra")
 

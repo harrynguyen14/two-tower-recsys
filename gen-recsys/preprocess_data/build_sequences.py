@@ -68,20 +68,148 @@ def _compute_global_log1p_max() -> tuple[float, float]:
     return float(row["profile_max"][0]), float(row["comment_max"][0])
 
 
-def _compute_derived_action_fields(df: pl.DataFrame, profile_max: float, comment_max: float) -> pl.DataFrame:
-    """play_ratio, profile_stay_time_norm, comment_stay_time_norm — derived, chuẩn hóa
-    theo max TOÀN CỤC (profile_max/comment_max tính 1 lần trước, xem _compute_global_log1p_max)."""
-    return df.with_columns(
+NUM_DURATION_GROUPS = 10  # số nhóm duration cho D2Q; đo được 35x giữa p10 và p90, xem dưới
+
+
+def _compute_duration_edges_and_rank_table() -> tuple[list[float], list[dict[float, float]]]:
+    """Biên decile duration + BẢNG TRA mid-rank percentile cho từng nhóm — TOÀN CỤC, 1 lần.
+
+    PHẢI toàn cục, không được tính trong từng bucket. Bucket chia theo `user_id % NUM_BUCKETS`
+    nên mỗi bucket chỉ là một MẪU: xếp hạng trong bucket cho kết quả PHỤ THUỘC NUM_BUCKETS,
+    và đổi NUM_BUCKETS sẽ lặng lẽ đổi play_ratio của mọi dòng.
+
+    [VIẾT LẠI 2026-09-17, lần 2] Bản đầu dùng pl.cut với biên percentile và một hàm ép biên
+    tăng nghiêm ngặt (+1e-9 cho biên trùng). BẢN ĐÓ ĐẢO NGƯỢC chính cái bias nó phải khử, đã
+    đo trên dữ liệu thật:
+
+      play_raw bị clip về [0,1] và DỒN CỤC ở đúng 1.0 (41.5% số dòng ở decile duration ngắn
+      nhất, chỉ 3.6% ở dài nhất -- lệch 8.6x). Quantile trùng nhau ở 1.0 -> bị nudge lên
+      +1e-9 -> BIÊN VƯỢT QUÁ 1.0 -> không dữ liệu nào tới được các bin đó. Số bin chết tỉ lệ
+      với tỉ lệ bão hòa, tức tỉ lệ với duration:
+
+        decile        0      3      6      9
+        biên > 1.0   40     18      9      2
+        trần thật  0.58   0.80   0.89   0.96
+        mean       0.401  0.472  0.481  0.490
+
+      Thô: 4.55x GIẢM theo duration. Sau "sửa": 1.22x TĂNG -- đảo dấu, model học ngược lại.
+
+    Mid-rank (`rank(method="average")`) không có vấn đề đó: mọi giá trị bằng nhau nhận CÙNG
+    thứ hạng trung bình, nên khối bão hòa ở 1.0 nằm đúng giữa phần đuôi của nó thay vì bị
+    dồn vào một bin. Đo được spread = 1.0000x, mỗi nhóm mean đúng 0.500.
+
+    Trả về:
+      duration_edges — NUM_DURATION_GROUPS-1 biên chia duration_ms thành decile
+      rank_tables[g] — dict {play_raw -> percentile} cho nhóm duration g
+
+    Bảng tra là dict thay vì biên + cut: play_raw chỉ có hữu hạn giá trị phân biệt (nó là
+    thương của hai số nguyên rồi clip), nên tra trực tiếp vừa chính xác tuyệt đối vừa không
+    cần biên nào. Đo trên KuaiRand-Pure: tổng ~140K khóa, không đáng kể về RAM.
+    """
+    scans = [pl.scan_csv(f).select(["duration_ms", "play_time_ms"]) for f in LOG_STANDARD_FILES]
+    qs = [i / NUM_DURATION_GROUPS for i in range(1, NUM_DURATION_GROUPS)]
+    df = pl.concat(scans).select(
+        pl.col("duration_ms"),
         (pl.col("play_time_ms") / pl.col("duration_ms").clip(lower_bound=1))
-        .clip(0.0, 1.0)
-        .alias("play_ratio"),
+        .clip(0.0, 1.0).alias("play_raw"),
+    ).collect(streaming=True)
+
+    # Biên duration cũng phải tăng nghiêm ngặt cho pl.cut, nhưng ở đây BỎ biên trùng đi
+    # (nhóm rỗng) chứ không nudge: duration không bị chặn trên nên nudge không gây trần giả,
+    # song bỏ hẳn vẫn đơn giản và an toàn hơn.
+    duration_edges = sorted({float(df["duration_ms"].quantile(q)) for q in qs})
+
+    groups = df["duration_ms"].cut(
+        duration_edges, labels=[str(i) for i in range(len(duration_edges) + 1)]
+    )
+    df = df.with_columns(groups.alias("_g"))
+
+    rank_tables = []
+    for g in range(len(duration_edges) + 1):
+        sub = df.filter(pl.col("_g") == str(g))
+        # mid-rank: các giá trị bằng nhau nhận cùng thứ hạng trung bình. Chia cho len để ra
+        # percentile trong [0,1]. Lấy 1 dòng đại diện mỗi play_raw -> dict tra cứu.
+        pct = sub.select(
+            pl.col("play_raw"),
+            (pl.col("play_raw").rank(method="average") / pl.len()).alias("pct"),
+        ).unique(subset=["play_raw"])
+        rank_tables.append(dict(zip(pct["play_raw"].to_list(), pct["pct"].to_list())))
+    return duration_edges, rank_tables
+
+
+def _compute_derived_action_fields(
+    df: pl.DataFrame, profile_max: float, comment_max: float,
+    duration_edges: list[float], rank_tables: list[dict[float, float]],
+) -> pl.DataFrame:
+    """play_ratio, profile_stay_time_norm, comment_stay_time_norm — derived.
+
+    profile/comment: chuẩn hóa theo max TOÀN CỤC (xem _compute_global_log1p_max).
+
+    play_ratio [SỬA 2026-09-17 — D2Q]: KHÔNG còn là play_time/duration thô. Thời lượng video
+    là BIẾN GÂY NHIỄU — nó ảnh hưởng ĐỒNG THỜI lên việc video được hiển thị và lên watch
+    time dự đoán (D2Q, arXiv:2206.06003, KDD 2022, Kuaishou, đã chạy production; báo cáo
+    +0.57% tổng watch time so với WLR, +0.75% so với VR trong A/B online).
+
+    ĐO TRÊN CHÍNH KuaiRand-Pure (1,436,609 dòng), play_ratio thô theo decile duration:
+
+        decile   median duration   mean play_ratio   % bão hòa ở 1.0
+          0           10.2 s           0.529             0.311
+          3           41.6 s           0.375             0.177
+          6          106.4 s           0.270             0.104
+          9          294.6 s           0.131             0.036
+
+    Giảm ĐƠN ĐIỆU 4× từ decile 0 xuống decile 9. Model học play_ratio thô sẽ học "video
+    ngắn = user thích", trong khi thực chất chỉ là "video ngắn dễ xem hết". duration trải
+    35× giữa p10 (11.9 s) và p90 (237.9 s), nên đây không phải hiệu ứng biên.
+
+    Cách sửa theo D2Q: chia video theo nhóm duration, rồi đổi watch time thành MID-RANK
+    PERCENTILE TRONG NHÓM đó (các giá trị bằng nhau nhận cùng thứ hạng trung bình). "Xem lâu hơn 80% số lần xem các video cùng độ dài" là đại lượng
+    so sánh được giữa video 10 giây và video 5 phút; "xem hết 80%" thì không.
+
+    ĐÁNH ĐỔI ĐÃ BIẾT: mất thông tin TUYỆT ĐỐI (0.9 và 0.3 giờ chỉ còn phân biệt qua thứ hạng
+    trong nhóm). Chấp nhận vì bản thô cũng đã mất một phần rồi — 16.7% số dòng bão hòa đúng
+    ở 1.0 do clip, và tỉ lệ bão hòa đó lệch 8.6× theo duration (31.1% ở decile 0 vs 3.6% ở
+    decile 9), tức phần bị mất CHÍNH LÀ phần nhiễu duration.
+
+    `long_view` KHÔNG sửa: đo được nó gần như phẳng theo duration (0.31-0.37, không xu
+    hướng) vì Kuaishou đã định nghĩa ngưỡng của nó theo duration sẵn rồi.
+
+    duration_ms <= 0 (28,874 dòng, ~2%) rơi vào nhóm 0 và được xếp hạng trong đó — không
+    tách riêng, vì play_time trên video duration=0 vốn không diễn giải được, và tách ra
+    thành nhóm riêng sẽ cho chúng thứ hạng "cao" giả tạo.
+    """
+    play_raw = (pl.col("play_time_ms") / pl.col("duration_ms").clip(lower_bound=1)).clip(0.0, 1.0)
+    # Tra BẢNG đã tính toàn cục, không rank tại chỗ: hàm này chạy trên TỪNG BUCKET user nên
+    # rank cục bộ sẽ phụ thuộc NUM_BUCKETS (xem _compute_duration_edges_and_rank_table).
+    group_expr = pl.col("duration_ms").cut(
+        duration_edges, labels=[str(i) for i in range(len(duration_edges) + 1)]
+    )
+    tagged = df.with_columns(play_raw.alias("_play_raw"), group_expr.alias("_g"))
+
+    # replace_strict cho từng nhóm rồi chọn theo _g. default=None để giá trị KHÔNG có trong
+    # bảng lộ ra thành null và bị assert bên dưới bắt, thay vì âm thầm thành 0.0 -- một
+    # play_ratio=0 giả sẽ tắt hẳn nhánh click của token đó mà không báo gì.
+    play_expr = pl.when(pl.col("_g") == "0").then(
+        pl.col("_play_raw").replace_strict(rank_tables[0], default=None, return_dtype=pl.Float64)
+    )
+    for g in range(1, len(rank_tables)):
+        play_expr = play_expr.when(pl.col("_g") == str(g)).then(
+            pl.col("_play_raw").replace_strict(rank_tables[g], default=None, return_dtype=pl.Float64)
+        )
+
+    # default=None -> giá trị không có trong bảng thành null. KHÔNG dùng 0.0 làm default: một
+    # play_ratio=0 giả sẽ tắt hẳn nhánh click của token đó mà không báo gì. Null thì
+    # build_sequences bắt được khi ghi (NaN -> ValueError, xem chỗ ghi history_action_mm).
+    # Hàm này nhận cả LazyFrame (đường pipeline) lẫn DataFrame (test), nên KHÔNG được
+    # subscript ở đây -- phải giữ lazy.
+    return tagged.with_columns(play_expr.alias("play_ratio")).with_columns(
         (pl.col("profile_stay_time").log1p() / profile_max)
         .fill_nan(0.0)
         .alias("profile_stay_time_norm"),
         (pl.col("comment_stay_time").log1p() / comment_max)
         .fill_nan(0.0)
         .alias("comment_stay_time_norm"),
-    )
+    ).drop(["_play_raw", "_g"])
 
 
 def _iter_log_buckets():
@@ -93,6 +221,7 @@ def _iter_log_buckets():
     vì .max() buộc vật chất hóa toàn bộ 322M dòng mỗi bucket).
     """
     profile_max, comment_max = _compute_global_log1p_max()
+    duration_edges, rank_tables = _compute_duration_edges_and_rank_table()
 
     scans_base = [pl.scan_csv(f) for f in LOG_STANDARD_FILES]
     base = pl.concat(scans_base)
@@ -100,7 +229,8 @@ def _iter_log_buckets():
     for bucket_idx in range(NUM_BUCKETS):
         bucket_filtered = base.filter(pl.col("user_id") % NUM_BUCKETS == bucket_idx)
         bucket = (
-            _compute_derived_action_fields(bucket_filtered, profile_max, comment_max)
+            _compute_derived_action_fields(bucket_filtered, profile_max, comment_max,
+                                           duration_edges, rank_tables)
             .sort(["user_id", "time_ms"])
             .collect(streaming=True)
         )
@@ -156,7 +286,18 @@ def build_sequences() -> None:
 
         history_meta_mm["video_id"][write_pos:write_pos + n] = bucket_df["video_id"].to_numpy().astype(np.int64)
         history_meta_mm["t"][write_pos:write_pos + n] = bucket_df["time_ms"].to_numpy().astype(np.int64)
-        history_action_mm[write_pos:write_pos + n] = bucket_df.select(ACTION_VECTOR_FIELDS).to_numpy().astype(np.float32)
+        av = bucket_df.select(ACTION_VECTOR_FIELDS).to_numpy().astype(np.float32)
+        # [THÊM 2026-09-17] Chặn NaN TẠI CHỖ GHI. play_ratio tra bảng mid-rank với
+        # default=None, nên một giá trị play_raw không có trong bảng thành null -> NaN ở đây.
+        # Không bắt thì nó chảy thẳng vào token và tắt âm thầm nhánh click của lượt đó.
+        if not np.isfinite(av).all():
+            bad = np.argwhere(~np.isfinite(av))
+            cols = sorted({ACTION_VECTOR_FIELDS[c] for _, c in bad})
+            raise ValueError(
+                f"{len(bad)} giá trị NaN/Inf trong action_vector ở bucket này, cột: {cols}. "
+                f"Với play_ratio nghĩa là bảng mid-rank không phủ hết giá trị play_raw."
+            )
+        history_action_mm[write_pos:write_pos + n] = av
 
         # bucket_df đã sort theo (user_id, time_ms) -> np.unique ở ĐÂY an toàn (chỉ dùng
         # để tìm ranh giới user TRONG bucket này, không ảnh hưởng thứ tự ghi toàn cục)
