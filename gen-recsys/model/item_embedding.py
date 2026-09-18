@@ -13,14 +13,14 @@ KHÔNG đổi công thức:
 
 Công thức [SỬA 2026-09-16 — xem lý do đầy đủ ở __init__/forward]:
     category_confidence(i) = tanh(N_category(i) / τ_c)
-    w                      = softmax(MLP([item_weight, category_confidence, e_collab, e_content]))
+    w                      = sigmoid(MLP([item_weight, category_confidence, e_collab, e_content]))
     e_i_final              = w_collab · e_collab(i) + w_content · e_content(i)
 
 Khác công thức cũ ở hai chỗ, cả hai đều từ chẩn đoán ĐO ĐƯỢC:
   - BỎ `category_content_shrunk = e_content · category_confidence`. Phép nhân vô điều kiện
     này đã vô hiệu hoá nhánh content: ‖e_content‖=18.57 -> ‖e_content·c‖=0.0238 (co ~780
     lần), vì c kẹt ~0.0006 do τ_c sai thang đo. c giờ vào GATE, không nhân thẳng vào vector.
-  - g_i (1 kênh + sigmoid) -> w (2 kênh + softmax), và ReLU -> SiLU trong MLP ẩn.
+  - g_i (1 kênh + sigmoid) -> w (2 kênh + sigmoid ĐỘC LẬP), và ReLU -> SiLU trong MLP ẩn.
 
 e_collab: học từ đầu theo video_id — thuần ID embedding, KHÔNG dùng feature nào khác (đã
 chốt 2026-09-10). Do catalog lớn, cần chia model parallelism (item_id % 2 -> GPU0/GPU1,
@@ -154,14 +154,37 @@ class ItemEmbedding(nn.Module):
         #    vùng âm, nơi ReLU cho gradient ĐÚNG BẰNG 0. SiLU vẫn dẫn gradient ở đó. Cũng
         #    nhất quán với HSTU (dùng SiLU).
         #
-        # 3. Đầu ra 2 kênh + softmax thay cho 1 kênh + sigmoid. Tương đương về mặt toán
-        #    (softmax 2 chiều = sigmoid của hiệu 2 score) nhưng nhất quán với `content_gmu`
-        #    ngay trên — cùng một cơ chế trộn, viết cùng một kiểu — và mở rộng được nếu sau
-        #    này tách thêm nguồn thứ ba. GIỮ dạng chuẩn hoá về [0,1] tổng 1: công thức trộn
-        #    `w_collab·e_collab + w_content·e_content` chỉ đúng khi trọng số là tổ hợp lồi.
-        #    Không dùng SiLU/GELU ở đây (không chặn miền -> trọng số âm hoặc >1 -> trừ
-        #    e_content thay vì trộn), cũng không dùng hardsigmoid (gradient 0 cứng ngoài
-        #    [-3,3], đúng bệnh vừa chẩn ra ở τ_c).
+        # 3. Đầu ra 2 kênh. [SỬA 2026-09-18] softmax -> SIGMOID ĐỘC LẬP cho mỗi kênh.
+        #
+        #    Lập luận cũ ("giữ tổ hợp lồi vì công thức trộn chỉ đúng khi trọng số tổng 1")
+        #    đã BỊ BÁC BỎ bằng đo thật sau 3000 step:
+        #        warm_warm:           w_collab=0.276  ‖collab‖=7.94  ‖content‖=10.22
+        #        warm_user_cold_item: w_collab=0.414  ‖collab‖=7.89  ‖content‖=11.81
+        #    ‖collab‖ KHÔNG ĐỔI giữa item warm và item cold. Item có hàng trăm tương tác
+        #    đáng lẽ phải cho biểu diễn ID sắc nét hơn hẳn item mới — ở đây nó phẳng. Và
+        #    ngay ở warm_warm (96% dữ liệu) gate chỉ đặt 27.6% trọng số vào collab, tức
+        #    model KHÔNG TIN nhánh ID của chính nó.
+        #
+        #    Nguyên nhân là ràng buộc tổng = 1: collab và content CẠNH TRANH. Nhưng một item
+        #    vừa LÀ CHÍNH NÓ (ID) vừa THUỘC thể loại/tác giả nào đó (content) — cả hai cùng
+        #    đúng, cùng đầy đủ, KHÔNG loại trừ nhau. Softmax buộc phải chọn, nên gradient về
+        #    collab luôn bị nhân 0.276, học chậm ~3.6× so với content. Hệ quả đo được:
+        #    warm_warm recall@20 = 0.2246 THẤP HƠN cold_user_warm_item = 0.3190, tức cơ chế
+        #    cold-start đang che lấp một nền biểu diễn yếu chứ không phải nền đó tốt.
+        #
+        #    Đây ĐÚNG lỗi đã sửa ở action vector ngày 2026-09-17 (xem action_encoder.py):
+        #    softmax gate trên các nguồn KHÔNG thay thế được cho nhau. Cùng dẫn chứng:
+        #    arXiv:2405.13997 (NeurIPS 2024) — softmax gating gây "unnecessary competition
+        #    among experts, potentially causing representation collapse".
+        #
+        #    Sigmoid giữ nguyên miền [0,1] (không có trọng số âm hay >1, không "trừ"
+        #    e_content), chỉ BỎ ràng buộc tổng = 1 -> hai nhánh lên xuống độc lập. Vẫn KHÔNG
+        #    dùng SiLU/GELU (không chặn miền) hay hardsigmoid (gradient 0 cứng ngoài [-3,3],
+        #    đúng bệnh đã chẩn ở τ_c).
+        #
+        #    ĐÁNH ĐỔI: ‖e_i_final‖ giờ có thể tới 2× thay vì bị chuẩn hoá về 1× — theo dõi
+        #    ‖e_user‖ vs ‖e_pos‖ trong chẩn đoán (trước khi sửa: 10.20 vs 7.66). Nếu loss nổ
+        #    ở vài trăm step đầu, đây là chỗ nhìn trước tiên.
         self.gate_mlp = nn.Sequential(
             nn.Linear(2 + config.dim + config.dim, config.dim),
             nn.SiLU(),
@@ -204,7 +227,7 @@ class ItemEmbedding(nn.Module):
             [item_weight.unsqueeze(-1), category_confidence.unsqueeze(-1), e_collab, e_content],
             dim=-1,
         )
-        w = torch.softmax(self.gate_mlp(gate_input), dim=-1)  # (B, 2), tổng = 1
+        w = torch.sigmoid(self.gate_mlp(gate_input))  # (B, 2), mỗi kênh [0,1] ĐỘC LẬP
         w_collab, w_content = w[:, 0:1], w[:, 1:2]  # mỗi cái (B, 1)
 
         # [CHẨN ĐOÁN 2026-09-16] Ghi lại thành phần nội bộ để evaluate() đọc, KHÔNG đổi giá
