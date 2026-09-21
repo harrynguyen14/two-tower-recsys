@@ -31,6 +31,7 @@ import argparse
 import os
 import sys
 import time
+import os
 from pathlib import Path
 
 import numpy as np
@@ -139,6 +140,31 @@ def embed_items(
     return e_i_final, item_weight
 
 
+def setup_ddp() -> tuple[bool, int, int, int]:
+    """Khởi tạo DDP từ biến môi trường của torchrun. Trả về (bật, rank, local_rank, world_size).
+
+    Chạy: torchrun --nproc_per_node=2 train.py ...
+    Không qua torchrun thì không có RANK trong env -> trả về (False, 0, 0, 1) và mọi thứ
+    chạy y như cũ, không rẽ nhánh nào khác.
+
+    [LƯU Ý 2026-09-21] DDP all-reduce lấy TRUNG BÌNH gradient qua các rank. Với
+    collab_embedding gradient THƯA (mỗi rank chỉ chạm ~2,000/7,583 hàng, và là các hàng
+    KHÁC nhau), gradient của một hàng bị chia cho world_size dù chỉ 1 rank thật sự có nó.
+    Đó đúng là căn bệnh vừa chữa bằng --collab-warmup-steps, nên train() bù lại bằng một
+    param group riêng có lr × world_size cho bảng collab. Xem chỗ tạo optimizer."""
+    if "RANK" not in os.environ:
+        return False, 0, 0, 1
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    if world_size <= 1:
+        return False, 0, 0, 1
+    torch.distributed.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    return True, rank, local_rank, world_size
+
+
 def run_batch_forward(
     batch: dict,
     dataset: GenRecsysDataset,
@@ -152,6 +178,7 @@ def run_batch_forward(
     num_negatives: int,
     device: torch.device,
     static_user_weight: bool = False,  # ablation #5: u_i tĩnh per-user thay vì per-position
+    uniform_negatives: bool = False,  # ponytail: chỉ eval chẩn đoán, train luôn False
 ) -> dict[str, torch.Tensor]:
     """1 forward pass đầy đủ cho 1 batch — dùng CHUNG bởi train() và evaluate().
 
@@ -204,7 +231,10 @@ def run_batch_forward(
     # [CHẨN ĐOÁN 2026-09-16] Chụp NGAY SAU lần embed label — _last_stats bị ghi đè ở mỗi
     # lần gọi embed_items (history/label/negative), nên phải lấy đúng ở đây mới là stats của
     # candidate POSITIVE, thứ ta cần đối chiếu với thứ hạng của nó.
-    label_embed_stats = {k: v.clone() for k, v in item_embed._last_stats.items()}
+    # [DDP 2026-09-21] .module khi item_embed là DistributedDataParallel — wrapper không
+    # chuyển tiếp thuộc tính thường, chỉ chuyển tiếp forward.
+    _ie = getattr(item_embed, "module", item_embed)
+    label_embed_stats = {k: v.clone() for k, v in _ie._last_stats.items()}
 
     # --- 1 lần chạy decoder trên chuỗi XEN KẼ [Φ_0,a_0,...,Φ_{K-1},a_{K-1}] ---
     # KHÔNG nối label vào chuỗi nữa (bỏ thiết kế K+1 cũ): xen kẽ khiến hidden tại Φ_t đã
@@ -235,7 +265,9 @@ def run_batch_forward(
     pair_valid = hist_valid_mask.clone()
     pair_valid[:, :-1] &= hist_valid_mask[:, 1:]
 
-    neg_ids, neg_log_q = neg_sampler.sample(B, num_negatives, device, exclude=label_video_id_cpu)
+    neg_ids, neg_log_q = neg_sampler.sample(
+        B, num_negatives, device, exclude=label_video_id_cpu, uniform=uniform_negatives,
+    )
     neg_ts_cpu = label_timestamp_cpu.unsqueeze(1).expand(-1, num_negatives).reshape(-1)
     neg_e_i, _ = embed_items(
         neg_ids.cpu().reshape(-1), neg_ts_cpu, dataset, item_embed, thresholds,
@@ -305,11 +337,23 @@ def train(
     save_path: str | None = None,    # nơi lưu; mặc định <output_dir>/ckpt.pt
     resume: str | None = None,       # nạp checkpoint rồi train tiếp từ đúng step đã dừng
     eval_only: bool = False,         # bỏ qua train, chỉ nạp checkpoint và chạy evaluate()
+    uniform_negatives: bool = False, # eval với candidate uniform — chẩn đoán, xem --uniform-negatives
+    collab_warmup_steps: int = 0,    # N step đầu train RIÊNG collab (gate bỏ qua) — xem item_embedding.py
     num_workers: int = 4,            # worker nạp dữ liệu — xem DataLoader dưới (nghẽn là CPU, không phải GPU)
     device_str: str = "cuda" if torch.cuda.is_available() else "cpu",
 ):
     output_dir = Path(output_dir)
-    device = torch.device(device_str)
+
+    # [THÊM 2026-09-21] DDP (2xT4 trên Kaggle). Không qua torchrun thì ddp=False và mọi
+    # thứ dưới đây chạy y như single-GPU — không rẽ nhánh nào khác. Xem setup_ddp().
+    ddp, rank, local_rank, world_size = setup_ddp()
+    is_main = rank == 0
+    device = torch.device(f"cuda:{local_rank}") if ddp else torch.device(device_str)
+
+    def log(*a, **kw):
+        """In CHỈ ở rank 0 — nếu không, mọi dòng log bị nhân world_size lần."""
+        if is_main:
+            print(*a, **kw)
 
     train_dataset = GenRecsysDataset(output_dir, split="train")
     # [SỬA 2026-09-16] num_workers=4 + pin_memory: step đo được 1.59 s nhưng compute GPU chỉ
@@ -319,8 +363,17 @@ def train(
     # chồng lấn với forward/backward.
     # Dataset dùng memmap read-only (dataset.py) nên fork sang worker an toàn: mỗi worker tự
     # map lại, không chia sẻ file handle.
+    # DDP: mỗi rank thấy một PHẦN RIÊNG của dataset (sampler lo việc chia), nên shuffle
+    # phải do sampler làm — truyền shuffle=True kèm sampler sẽ lỗi.
+    train_sampler = (
+        torch.utils.data.distributed.DistributedSampler(
+            train_dataset, num_replicas=world_size, rank=rank, shuffle=True,
+        )
+        if ddp else None
+    )
     train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True,
+        train_dataset, batch_size=batch_size, shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=num_workers, pin_memory=(device.type == "cuda"),
         persistent_workers=num_workers > 0,  # không dựng lại 4 process mỗi epoch
         # [THÊM 2026-09-17] prefetch_factor mặc định là 2; nâng lên 6 vì GPU đang ĐỢI CPU
@@ -381,14 +434,57 @@ def train(
     # cho phần còn lại. Với 7,583 item (bảng 1.85 MB) việc chia đó chỉ tốn phức tạp: nó chặn
     # fused=True và bắt GradScaler đi đường coalesce khi bật AMP. Nay tất cả là dense -> 1
     # optimizer. fused chỉ có trên CUDA.
-    optimizer = torch.optim.Adam(dense_params, lr=lr, fused=(device.type == "cuda"))
+    # [THÊM 2026-09-21] DDP + gradient thưa: param group RIÊNG cho collab_embedding với
+    # lr × world_size. DDP all-reduce lấy TRUNG BÌNH gradient qua các rank; với bảng collab
+    # mỗi rank chỉ chạm ~2,000/7,583 hàng và là các hàng KHÁC nhau, nên gradient một hàng bị
+    # chia cho world_size dù chỉ 1 rank thật sự có nó. Không bù thì DDP làm nặng thêm đúng
+    # căn bệnh mà --collab-warmup-steps đang chữa (xem item_embedding.py).
+    #
+    # Adam CHIA cho √exp_avg_sq nên nhân lr không đơn thuần là "đi nhanh gấp đôi" — nhưng
+    # nó khôi phục đúng TỈ LỆ giữa bảng collab và phần còn lại của model, vốn là thứ DDP
+    # phá vỡ. Single-GPU (world_size=1) thì hệ số = 1, không đổi gì so với trước.
+    collab_w = item_embed.collab_embedding.weight
+    collab_ids = {id(collab_w)}
+    optimizer = torch.optim.Adam(
+        [
+            {"params": [p_ for p_ in dense_params if id(p_) not in collab_ids], "lr": lr},
+            {"params": [collab_w], "lr": lr * world_size},
+        ],
+        lr=lr,
+        fused=(device.type == "cuda"),
+    )
+    if ddp:
+        log(f"[ddp] world_size={world_size} | lr collab_embedding = {lr * world_size:.2e} "
+            f"(= lr × world_size, bù all-reduce chia trung bình trên gradient thưa)")
     # GradScaler chỉ có tác dụng với fp16 trên CUDA; enabled=False biến mọi lời gọi thành
     # no-op nên vòng lặp không cần rẽ nhánh.
     use_amp = (device.type == "cuda") and amp
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
 
+    # [THÊM 2026-09-21] Wrap DDP. Chỉ seq_model (decoder HSTU) là phần nặng cần
+    # all-reduce qua nhiều lớp; item_embed/profile_embed cũng phải wrap để gradient của
+    # chúng được đồng bộ.
+    #
+    # find_unused_parameters=True là BẮT BUỘC ở đây, không phải tuỳ chọn: trong giai đoạn
+    # --collab-warmup-steps, forward() của ItemEmbedding trả về sớm (return e_collab) nên
+    # content_gmu + gate_mlp KHÔNG tham gia đồ thị. DDP mặc định coi mọi tham số đều phải
+    # có gradient và sẽ treo ở all-reduce khi không thấy. Cờ này đánh đổi ~5% tốc độ lấy
+    # việc chạy được — chấp nhận, vì nếu không thì warm-up và DDP loại trừ nhau.
+    #
+    # GIỮ tham chiếu tới module GỐC (item_embed/seq_model/...): vòng lặp và hàm chẩn đoán
+    # gọi thẳng .collab_warmup, .decoder.layers, .dense_parameters() — những thứ DDP wrapper
+    # không chuyển tiếp. Chỉ lời gọi forward đi qua wrapper để all-reduce được kích hoạt.
+    if ddp:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+
+        item_embed_ddp = DDP(item_embed, device_ids=[local_rank], find_unused_parameters=True)
+        seq_model_ddp = DDP(seq_model, device_ids=[local_rank], find_unused_parameters=True)
+        profile_embed_ddp = DDP(profile_embed, device_ids=[local_rank], find_unused_parameters=True)
+    else:
+        item_embed_ddp, seq_model_ddp, profile_embed_ddp = item_embed, seq_model, profile_embed
+
     # Build 1 LẦN DUY NHẤT trước vòng lặp — KHÔNG build lại mỗi step.
-    print("[train] building N_i/N_category cache (1 lần, dùng xuyên suốt training)...")
+    log("[train] building N_i/N_category cache (1 lần, dùng xuyên suốt training)...")
     item_n_cache = build_n_cache("item_N")
     category_n_cache = build_n_cache("category_N")
 
@@ -418,7 +514,7 @@ def train(
             optimizer=None if eval_only else optimizer,
         )
         start_epoch, start_step = state["epoch"], state["step"]
-        print(f"[resume] nạp {src} — epoch={start_epoch} step={start_step}")
+        log(f"[resume] nạp {src} — epoch={start_epoch} step={start_step}")
 
     if eval_only:
         # Chỉ đo lại, không train: dùng khi cần chạy chẩn đoán nhiều lần trên CÙNG model
@@ -428,7 +524,7 @@ def train(
             "val", output_dir, item_embed, seq_model, profile_embed, thresholds, neg_sampler,
             retrieval_loss_fn, item_n_cache, category_n_cache, num_negatives, batch_size, device,
             max_batches=max_steps_per_epoch, static_user_weight=static_user_weight,
-            num_workers=num_workers,
+            num_workers=num_workers, uniform_negatives=uniform_negatives,
         )
         return
 
@@ -436,7 +532,14 @@ def train(
     step_time_acc = 0.0
 
     for epoch in range(start_epoch, num_epochs):
-        progress = tqdm(enumerate(train_loader), total=steps_per_epoch, desc=f"epoch {epoch}", unit="step")
+        # DDP: bắt buộc, nếu không mỗi epoch mọi rank thấy CÙNG một thứ tự -> mất tác dụng
+        # shuffle và các rank lặp lại nhau.
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        progress = tqdm(
+            enumerate(train_loader), total=steps_per_epoch, desc=f"epoch {epoch}", unit="step",
+            disable=not is_main,  # tránh world_size thanh tiến trình chồng nhau
+        )
         for step, batch in progress:
             if max_steps_per_epoch is not None and step >= max_steps_per_epoch:
                 break
@@ -445,6 +548,20 @@ def train(
             # batch nhất quán với lần chạy trước (shuffle dùng cùng seed torch mặc định).
             if epoch == start_epoch and step < start_step:
                 continue
+
+            # [THÊM 2026-09-21] Giai đoạn warm-up collab: gate bị bỏ qua, content tắt.
+            # Lý do đầy đủ ở item_embedding.py::__init__ (self.collab_warmup) — tóm tắt:
+            # gate đóng nhánh collab xuống 0.003 trong 50 step đầu vì content học nhanh hơn
+            # hẳn (MLP dùng chung, gradient mỗi step) so với bảng collab (mỗi hàng vài lần
+            # mỗi epoch), khiến collab_embedding vĩnh viễn kẹt ở nhiễu khởi tạo.
+            global_step_now = epoch * steps_per_epoch + step
+            warmup_active = global_step_now < collab_warmup_steps
+            if item_embed.collab_warmup != warmup_active:
+                item_embed.collab_warmup = warmup_active
+                tqdm.write(
+                    f"[collab-warmup] {'BẬT' if warmup_active else 'TẮT'} tại global_step={global_step_now}"
+                    + ("" if warmup_active else " — gate trở lại bình thường, content bật lại")
+                )
 
             step_start = time.perf_counter()
             B = batch["hist_video_ids"].shape[0]
@@ -455,7 +572,8 @@ def train(
             # cảm với độ chính xác), nên chỉ matmul/conv hạ xuống fp16.
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
                 fwd = run_batch_forward(
-                    batch, train_dataset, item_embed, seq_model, profile_embed, thresholds, neg_sampler,
+                    batch, train_dataset, item_embed_ddp, seq_model_ddp, profile_embed_ddp,
+                    thresholds, neg_sampler,
                     item_n_cache, category_n_cache, num_negatives, device,
                     static_user_weight=static_user_weight,
                 )
@@ -503,7 +621,7 @@ def train(
 
             progress.set_postfix(loss=f"{loss.item():.4f}", retrieval=f"{r_loss.item():.4f}", ranking=f"{k_loss.item():.4f}")
 
-            if save_every and step > 0 and step % save_every == 0:
+            if is_main and save_every and step > 0 and step % save_every == 0:
                 save_checkpoint(
                     ckpt_path, epoch=epoch, step=step + 1,  # +1: step này ĐÃ xong
                     global_step=epoch * steps_per_epoch + step + 1, modules=ckpt_modules,
@@ -536,18 +654,45 @@ def train(
                     f" gts={grad_norms['ts_w']:.2e}"
                     f"{fwd_msg}"
                 )
+                # [THÊM 2026-09-21] cos.std của collab_embedding — chỉ số DUY NHẤT nói được
+                # bảng collab có học gì không. Với vector ngẫu nhiên độc lập ở dim=d, cosine
+                # giữa 2 hàng bất kỳ có std = 1/√d (dim=64 -> 0.1250). Đo trên 6 checkpoint
+                # cũ: 0.1247-0.1255, tức bảng chưa bao giờ rời khỏi nhiễu khởi tạo. Con số
+                # này RỜI KHỎI 0.125 = collab bắt đầu mang thông tin thật.
+                with torch.no_grad():
+                    W = item_embed.collab_embedding.weight
+                    Wn = torch.nn.functional.normalize(W, dim=-1)
+                    g = torch.Generator(device="cpu").manual_seed(0)  # cùng cặp mỗi lần -> so sánh được
+                    ii = torch.randint(0, W.shape[0], (20000,), generator=g).to(W.device)
+                    jj = torch.randint(0, W.shape[0], (20000,), generator=g).to(W.device)
+                    msk = ii != jj
+                    cos_std = (Wn[ii[msk]] * Wn[jj[msk]]).sum(-1).std().item()
+                    tqdm.write(
+                        f"  [collab] cos.std={cos_std:.4f} (nhiễu thuần={1 / W.shape[1] ** 0.5:.4f}) "
+                        f"‖W‖={W.norm(dim=-1).mean():.4f} W.std={W.std():.4f}"
+                        f"{' | WARM-UP đang BẬT' if item_embed.collab_warmup else ''}"
+                    )
 
         # Lưu CUỐI epoch không phụ thuộc --save-every: đây là checkpoint ta thật sự muốn
         # giữ (train xong đủ số step), và là thứ --eval-only sẽ nạp lại.
-        save_checkpoint(
-            ckpt_path, epoch=epoch + 1, step=0,
-            global_step=(epoch + 1) * steps_per_epoch, modules=ckpt_modules,
-            optimizer=optimizer, scaler=scaler,
-            config=ckpt_config,
-        )
-        print(f"[ckpt] đã lưu {ckpt_path} (hết epoch {epoch})")
+        # DDP: chỉ rank 0 ghi (mọi rank có tham số GIỐNG hệt nhau sau all-reduce), các rank
+        # khác chờ ở barrier để không chạy tiếp khi file đang được viết dở.
+        if is_main:
+            save_checkpoint(
+                ckpt_path, epoch=epoch + 1, step=0,
+                global_step=(epoch + 1) * steps_per_epoch, modules=ckpt_modules,
+                optimizer=optimizer, scaler=scaler,
+                config=ckpt_config,
+            )
+            print(f"[ckpt] đã lưu {ckpt_path} (hết epoch {epoch})")
+        if ddp:
+            torch.distributed.barrier()
 
         # --- eval trên val sau MỖI epoch — Recall/NDCG@K tách theo 4 nhóm cold-start ---
+        # DDP: chỉ rank 0 chạy eval. Chia eval cho nhiều rank rồi gộp lại phức tạp hơn giá
+        # trị nó mang lại (~8 phút/epoch), và bản báo cáo phải đến từ MỘT nguồn để đọc được.
+        if not is_main:
+            continue
         evaluate(
             "val", output_dir, item_embed, seq_model, profile_embed, thresholds, neg_sampler, retrieval_loss_fn,
             item_n_cache, category_n_cache, num_negatives, batch_size, device,
@@ -555,12 +700,20 @@ def train(
             num_workers=num_workers,
         )
 
+    cleanup_ddp(ddp)
+
 
 # Mọi module có tham số học được + cả 2 optimizer. THIẾU bất kỳ cái nào là resume ra
 # model khác: τ (LearnableThresholds) quyết định item_weight/user_weight, retrieval/ranking
 # head có bảng riêng — bỏ sót chúng thì nạp lại xong metric lệch mà không báo lỗi gì.
 _CKPT_MODULES = ("item_embed", "seq_model", "profile_embed", "thresholds",
                  "retrieval_loss_fn", "ranking_loss_fn")
+
+
+def cleanup_ddp(ddp: bool) -> None:
+    """Đóng process group. Bỏ qua thì tiến trình có thể treo lúc thoát."""
+    if ddp and torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
 
 
 def save_checkpoint(path: Path, *, epoch: int, step: int, global_step: int,
@@ -746,6 +899,7 @@ def evaluate(
     max_batches: int | None = None,
     static_user_weight: bool = False,  # PHẢI khớp cấu hình lúc train, nếu không train/eval lệch
     num_workers: int = 4,
+    uniform_negatives: bool = False,  # ponytail: candidate uniform thay vì theo tần suất
 ) -> None:
     """Đánh giá Recall/NDCG@K trên split (val/test), tách theo 4 nhóm cold-start — xem
     eval.py. Dùng đúng candidate-sampling như lúc train (positive + N negative theo tần
@@ -773,7 +927,7 @@ def evaluate(
         fwd = run_batch_forward(
             batch, dataset, item_embed, seq_model, profile_embed, thresholds, neg_sampler,
             item_n_cache, category_n_cache, num_negatives, device,
-            static_user_weight=static_user_weight,
+            static_user_weight=static_user_weight, uniform_negatives=uniform_negatives,
         )
         # [SỬA 2026-09-15] eval_logit = dot-product THUẦN, KHÔNG trừ log_q. Trước đây dùng
         # scaled_logit() (có log_q) -> recall@5 = 1.0000 ở ô item-cold, vì log_q cộng ~3.90
@@ -843,6 +997,8 @@ if __name__ == "__main__":
     parser.add_argument("--resume", default=None, help="Nạp checkpoint và train TIẾP từ đúng step đã dừng (gồm cả optimizer state)")
     parser.add_argument("--num-workers", type=int, default=4, help="Worker nạp dữ liệu (mặc định 4). Nghẽn là CPU chứ không phải GPU — đặt 0 để debug hoặc khi môi trường không cho fork")
     parser.add_argument("--eval-only", action="store_true", help="Không train, chỉ nạp checkpoint (--resume/--save-path) và chạy evaluate() — dùng để chạy lại chẩn đoán trên CÙNG model, ~8 phút thay vì train lại ~2 giờ")
+    parser.add_argument("--collab-warmup-steps", type=int, default=0, help="SỬA GỐC [2026-09-21]: N global-step ĐẦU train RIÊNG collab_embedding (gate bỏ qua, w_collab=1, content TẮT). Không có nó, gate đóng collab xuống 0.003 trong 50 step đầu và bảng collab kẹt ở nhiễu khởi tạo VĨNH VIỄN (đo: cos.std=0.1254 vs 0.1250 của vector ngẫu nhiên). Thử 300-500. Theo dõi log [collab] cos.std — rời khỏi 0.125 là có tác dụng")
+    parser.add_argument("--uniform-negatives", action="store_true", help="CHẨN ĐOÁN [2026-09-21]: eval với candidate rút UNIFORM thay vì theo tần suất. Trả lời: item cold recall=0 vì embedding rác, hay vì luôn phải đấu 100 item warm? Chỉ dùng với --eval-only")
     parser.add_argument("--checkpoint", action="store_true", help="Gradient checkpointing: chậm ~30%%, tiết kiệm ~70%% VRAM. BẮT BUỘC cho nhánh có γ ở batch=256 trên T4 15GB (nếu không sẽ CUDA OOM ở loss.backward)")
     args = parser.parse_args()
     train(
@@ -862,5 +1018,7 @@ if __name__ == "__main__":
         save_path=args.save_path,
         resume=args.resume,
         eval_only=args.eval_only,
+        uniform_negatives=args.uniform_negatives,
+        collab_warmup_steps=args.collab_warmup_steps,
         num_workers=args.num_workers,
     )

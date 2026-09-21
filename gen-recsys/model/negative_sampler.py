@@ -43,6 +43,7 @@ class NegativeSampler:
         num_negatives: int,
         device: torch.device,
         exclude: torch.Tensor | None = None,  # (batch_size,) video_id positive cần loại
+        uniform: bool = False,  # ponytail: chỉ dùng cho eval chẩn đoán, train luôn False
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Trả về (negative_video_ids, log_q) — shape (batch_size, num_negatives).
 
@@ -54,7 +55,12 @@ class NegativeSampler:
 
         Resample lặp (tối đa 10 vòng) thay vì 1 lần: lần resample vẫn có thể trúng lại
         positive. 10 vòng đủ để xác suất còn sót không đáng kể với mọi phân phối thực tế."""
-        neg_ids = np.random.choice(self.num_items, size=(batch_size, num_negatives), p=self.probs)
+        # uniform=True: candidate set KHÔNG lệch về item phổ biến. Dùng để trả lời câu hỏi
+        # "item cold recall=0 vì embedding của nó là rác, hay vì nó luôn phải đấu với 100
+        # item warm được train kỹ?". KHÔNG dùng lúc train — ở đó log_q correction đòi hỏi
+        # negative phải đến từ phân phối tần suất (xem retrieval.py eval_logit docstring).
+        probs = None if uniform else self.probs
+        neg_ids = np.random.choice(self.num_items, size=(batch_size, num_negatives), p=probs)
 
         if exclude is not None:
             pos = exclude.detach().cpu().numpy().reshape(-1, 1)  # (B, 1) broadcast theo cột
@@ -63,7 +69,7 @@ class NegativeSampler:
                 n_collide = int(collide.sum())
                 if n_collide == 0:
                     break
-                neg_ids[collide] = np.random.choice(self.num_items, size=n_collide, p=self.probs)
+                neg_ids[collide] = np.random.choice(self.num_items, size=n_collide, p=probs)
 
         log_q = self.log_probs[neg_ids]
         return (

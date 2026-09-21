@@ -194,6 +194,41 @@ class ItemEmbedding(nn.Module):
         # Ảnh chụp thành phần nội bộ của forward() gần nhất — chỉ để chẩn đoán, xem forward().
         self._last_stats: dict[str, torch.Tensor] = {}
 
+        # [THÊM 2026-09-21] COLLAB WARM-UP. Bật cờ này thì gate bị BỎ QUA: w_collab=1,
+        # w_content=0 cứng, nhánh content không chạy. Dùng cho vài trăm step đầu để
+        # collab_embedding học trong môi trường KHÔNG có đối thủ.
+        #
+        # VÌ SAO CẦN. Đo 2026-09-21: collab_embedding chưa bao giờ học được gì qua CẢ 6
+        # cấu hình đã thử — cosine-std của bảng = 0.1254 trong khi vector ngẫu nhiên độc
+        # lập ở dim=64 cho 0.1250, tức bảng vẫn nguyên nhiễu khởi tạo. Nguyên nhân là cuộc
+        # đua không cân sức giữa hai nhánh:
+        #
+        #   nhánh      tham số                    nhận gradient    norm init -> sau 1 epoch
+        #   collab     bảng 7583x64, hàng riêng   vài lần/epoch    7.83 -> 8.03 (đứng yên)
+        #   content    MLP DÙNG CHUNG mọi item    MỖI step         0.89 -> 8.58 (học được)
+        #
+        # Content học nhanh gấp bội vì trọng số dùng chung. Gate — vốn làm ĐÚNG việc của nó
+        # — thấy collab vô dụng nên hạ w_collab từ 0.498 xuống 0.052 chỉ trong 25 step, đáy
+        # 0.0030 ở step 50. Từ đó gradient tới e_collab bị nhân ~0.01, collab mất cơ hội
+        # vĩnh viễn, và 2,975 step còn lại của epoch chạy không tải: sau 200 step
+        # cos(W, W_0) = 0.9998, bảng gần như không xoay.
+        #
+        # ĐÃ LOẠI TRỪ bằng đo đạc (không phải phỏng đoán): SparseAdam->Adam (mô phỏng cho
+        # thấy dense dịch chuyển NHIỀU hơn, 4.02 vs 2.95); gate bias lệch (±0.05 ở cả 6
+        # ckpt); item_weight nhân vào output (không có, nó chỉ là input của gate); thiếu dữ
+        # liệu (item N>200 nhận 10,480 lượt chạm/epoch — thừa cho 64 chiều); gradient triệt
+        # tiêu (tỉ lệ kéo/đẩy 20:1, lành mạnh); gradient bị chặn (2,120 hàng có grad != 0).
+        #
+        # VÌ SAO KHÔNG DÙNG WARM-UP GATE (ép w_collab >= 0.5 rồi thả). Cách đó bắt model
+        # dùng NHIỄU trong giai đoạn warm-up, làm hỏng luôn nhánh content đang học tốt.
+        # Ở đây content bị TẮT hẳn nên nó không bị kéo theo, và khi gate mở ra thì collab
+        # đã có nội dung thật — gate không còn lý do đóng nó xuống 0.003.
+        #
+        # Giai đoạn 1 nên NGẮN (vài trăm step): chỉ cần collab thoát nhiễu, không cần hội
+        # tụ. Theo dõi bằng cos.std của bảng — rời khỏi 0.125 là có tác dụng. Kéo dài sẽ
+        # khiến e_user (từ decoder) bị kéo về chỗ chỉ hợp với collab rồi phải học lại.
+        self.collab_warmup = False
+
     def forward(
         self,
         video_idx: torch.Tensor,  # (B,) int64 — index vào collab_embedding (0..num_items-1)
@@ -206,6 +241,20 @@ class ItemEmbedding(nn.Module):
         caption_mask: torch.Tensor,  # (B,) float32/bool — 1 nếu item CÓ caption thật, 0 nếu không
     ) -> torch.Tensor:
         e_collab = self.collab_embedding(video_idx)  # (B, dim)
+
+        # [THÊM 2026-09-21] Giai đoạn warm-up: collab là tín hiệu DUY NHẤT. Bỏ qua gate và
+        # bỏ luôn việc chạy content_gmu (nhánh nặng nhất: GMU 6 modality + caption MLP
+        # 384->64), nên giai đoạn này còn RẺ HƠN train thường. Xem __init__ self.collab_warmup.
+        if self.collab_warmup:
+            self._last_stats = {
+                "g_i": torch.ones_like(item_weight),
+                "category_confidence": category_confidence.detach(),
+                "item_weight": item_weight.detach(),
+                "norm_collab": e_collab.detach().norm(dim=-1),
+                "norm_content": torch.zeros_like(item_weight),
+                "norm_content_shrunk": torch.zeros_like(item_weight),
+            }
+            return e_collab
 
         gmu_inputs = {field: self.category_embeddings[field](category_ids[field]) for field in CATEGORICAL_FIELDS}
         gmu_inputs["author"] = self.author_embedding(author_idx)
