@@ -99,6 +99,7 @@ class SequenceModel(nn.Module):
         key_padding_mask: torch.Tensor | None = None,  # (B, K) bool, True = padding (theo LƯỢT, không phải token)
         profile_embedding: torch.Tensor | None = None,  # (B, dim) — e_profile, prepend làm token 0
         user_weight: torch.Tensor | None = None,  # (B, K) — u_i TẠI TỪNG LƯỢT, xem dataset.py hist_n_u
+        log_user_maturity: torch.Tensor | None = None,  # (B, K) — thay log(u_i), xem learnable_thresholds.py
         item_weight: torch.Tensor | None = None,  # (B, K) — m_j của item mỗi lượt
         hist_timestamps: torch.Tensor | None = None,  # (B, K) int64 ms — cho nhánh nhipthoigian
     ) -> torch.Tensor:
@@ -171,7 +172,20 @@ class SequenceModel(nn.Module):
                 log_u_tok, log_m_tok = user_weight, item_weight  # (B, K)
 
 
-            log_u = torch.log(log_u_tok + EPS)
+            # [SỬA 2026-09-22] log(u_i) = log(tanh(N_u/τ_u)) BÃO HOÀ VỀ 0 với user nhiều lịch
+            # sử, làm số hạng γ·log(u_i)·log(m_j) tắt hẳn — đo được: |prod| yếu đi 1,000 lần
+            # từ N_u 0-20 (1.50) xuống N_u 301+ (0.0015), và median rank xấu đi đơn điệu
+            # 36 -> 48 theo đúng nhịp đó. Cùng lúc FiLM (gate profile) cũng dùng log_u nên
+            # nó chịu chung số phận. Xem learnable_thresholds.py::log_user_maturity().
+            #
+            # Truyền log_user_maturity từ caller thì dùng nó; không thì giữ đường cũ (ablation
+            # so sánh + không phá test đang có).
+            if log_user_maturity is not None:
+                lum = (log_user_maturity.repeat_interleave(2, dim=1)
+                       if self.interleave else log_user_maturity)
+                log_u = lum
+            else:
+                log_u = torch.log(log_u_tok + EPS)
             log_m = torch.log(log_m_tok + EPS)
 
         # [THÊM 2026-09-17] Timestamps cũng phải mở rộng THEO TOKEN cho relative time bias,

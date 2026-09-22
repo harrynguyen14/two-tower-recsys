@@ -179,6 +179,7 @@ def run_batch_forward(
     device: torch.device,
     static_user_weight: bool = False,  # ablation #5: u_i tĩnh per-user thay vì per-position
     uniform_negatives: bool = False,  # ponytail: chỉ eval chẩn đoán, train luôn False
+    log_user_maturity: bool = False,  # [2026-09-22] log1p thay log(tanh) cho log_u — xem thresholds
 ) -> dict[str, torch.Tensor]:
     """1 forward pass đầy đủ cho 1 batch — dùng CHUNG bởi train() và evaluate().
 
@@ -222,7 +223,10 @@ def run_batch_forward(
         # biến thiên hay hằng. Nếu nhánh tĩnh ngang nhánh per-position -> luận điểm
         # per-position KHÔNG có cơ sở thực nghiệm và phải rút khỏi paper.
         hist_n_u = hist_n_u[:, -1:].expand_as(hist_n_u)
-    hist_user_weight = thresholds.user_weight(hist_n_u)  # (B, K)
+    hist_user_weight = thresholds.user_weight(hist_n_u)  # (B, K) — vẫn dùng cho các chỗ khác
+    # [SỬA 2026-09-22] log(u_i) cho attention bias + FiLM: dùng log1p(N_u)-log1p(τ_u) thay
+    # log(tanh(N_u/τ_u)) đang bão hoà về 0 ở user warm. Xem learnable_thresholds.py.
+    hist_log_u = thresholds.log_user_maturity(hist_n_u) if log_user_maturity else None
 
     label_e_i, _ = embed_items(
         label_video_id_cpu, label_timestamp_cpu, dataset, item_embed, thresholds,
@@ -251,6 +255,7 @@ def run_batch_forward(
     hidden = seq_model(
         hist_e_i, hist_action, key_padding_mask, profile_embedding=e_profile,
         user_weight=hist_user_weight, item_weight=hist_item_weight,
+        log_user_maturity=hist_log_u,
         # [ADDED 2026-09-17] raw timestamps feed ActionEncoder (hour-of-day, see action_encoder.py).
         # Derived at runtime, so no preprocessing rebuild was needed.
         hist_timestamps=hist_timestamps_cpu.to(device, non_blocking=True),
@@ -309,6 +314,16 @@ def run_batch_forward(
         "is_item_cold": batch["is_item_cold"],
         "label_embed_stats": label_embed_stats,  # chẩn đoán gate, xem item_embedding.py
         "is_user_lowhistory": batch["is_user_lowhistory"],  # few-shot, xem eval.py print_eval_report
+        # [THÊM 2026-09-22] N_u tại vị trí DỰ ĐOÁN (cuối chuỗi) — để phân tầng thứ hạng theo
+        # độ dài lịch sử. Xem _report_history_diagnostic().
+        "n_u_at_pred": hist_n_u[:, -1].detach().cpu(),
+        # [THÊM 2026-09-22] tỉ lệ token lịch sử có m_j > 0.95 (vùng bão hoà của tanh, nơi
+        # log(m_j) -> 0 và số hạng β/γ mất tín hiệu). Đo được: 31.5% token của user điển
+        # hình nằm trong vùng này. Câu hỏi phép đo này trả lời: chuỗi nhiều token bão hoà
+        # có bị rank xấu hơn không? Nếu KHÔNG thì bão hoà m_j vô hại, đừng sửa.
+        "m_saturated_frac": (
+            (hist_item_weight > 0.95).float() * hist_valid_mask.float()
+        ).sum(1).div(hist_valid_mask.float().sum(1).clamp(min=1)).detach().cpu(),
     }
 
 
@@ -339,6 +354,7 @@ def train(
     eval_only: bool = False,         # bỏ qua train, chỉ nạp checkpoint và chạy evaluate()
     uniform_negatives: bool = False, # eval với candidate uniform — chẩn đoán, xem --uniform-negatives
     collab_warmup_steps: int = 0,    # N step đầu train RIÊNG collab (gate bỏ qua) — xem item_embedding.py
+    log_user_maturity: bool = False, # [2026-09-22] log1p(N_u)-log1p(τ_u) thay log(tanh) — xem thresholds
     num_workers: int = 4,            # worker nạp dữ liệu — xem DataLoader dưới (nghẽn là CPU, không phải GPU)
     device_str: str = "cuda" if torch.cuda.is_available() else "cpu",
 ):
@@ -502,6 +518,7 @@ def train(
         "dim": dim, "num_heads": num_heads, "num_layers": num_layers, "ffn_dim": ffn_dim,
         "amp": amp, "use_flex": use_flex, "use_profile_token": use_profile_token,
         "interleave": interleave, "static_user_weight": static_user_weight,
+        "log_user_maturity": log_user_maturity,
         "use_beta": use_beta, "use_gamma": use_gamma,
     }
     ckpt_path = Path(save_path) if save_path else output_dir / "ckpt.pt"
@@ -576,6 +593,7 @@ def train(
                     thresholds, neg_sampler,
                     item_n_cache, category_n_cache, num_negatives, device,
                     static_user_weight=static_user_weight,
+                    log_user_maturity=log_user_maturity,
                 )
                 forward_time_acc += time.perf_counter() - step_start
 
@@ -697,7 +715,7 @@ def train(
             "val", output_dir, item_embed, seq_model, profile_embed, thresholds, neg_sampler, retrieval_loss_fn,
             item_n_cache, category_n_cache, num_negatives, batch_size, device,
             max_batches=max_steps_per_epoch, static_user_weight=static_user_weight,
-            num_workers=num_workers,
+            num_workers=num_workers, log_user_maturity=log_user_maturity,
         )
 
     cleanup_ddp(ddp)
@@ -753,7 +771,14 @@ def load_checkpoint(path: Path, *, modules: dict, optimizer=None, scaler=None,
 
     if config is not None:
         saved = blob.get("config", {})
-        lech = {k: (saved.get(k), v) for k, v in config.items() if saved.get(k) != v}
+        # [SỬA 2026-09-22] Khoá VẮNG MẶT trong checkpoint cũ không phải lệch cấu hình: cờ
+        # mới thêm sau khi ckpt được lưu (log_user_maturity...) mặc định False, đúng bằng
+        # hành vi của ckpt đó. So sánh None != False sẽ chặn nhầm mọi checkpoint cũ.
+        lech = {
+            k: (saved.get(k), v)
+            for k, v in config.items()
+            if k in saved and saved[k] != v
+        }
         if lech:
             raise SystemExit(
                 "[resume] CẤU HÌNH LỆCH so với checkpoint — train tiếp sẽ ra model lai, "
@@ -776,6 +801,81 @@ def load_checkpoint(path: Path, *, modules: dict, optimizer=None, scaler=None,
         scaler.load_state_dict(blob["scaler"])
     return {"epoch": blob.get("epoch", 0), "step": blob.get("step", 0),
             "global_step": blob.get("global_step", 0)}
+
+
+def _report_history_diagnostic(
+    rank: torch.Tensor,     # (N,) thứ hạng positive, 0 = đứng đầu
+    n_u: torch.Tensor,      # (N,) N_u tại vị trí dự đoán
+    n_cand: torch.Tensor,   # (N,) số candidate
+) -> None:
+    """LỊCH SỬ DÀI có giúp hay hại? — câu hỏi gốc của chất lượng, không liên quan cold-start.
+
+    Bất thường đo được 2026-09-22: warm_warm (user NHIỀU lịch sử) có median rank 53/100,
+    TỆ HƠN đoán mò (50), trong khi cold_user (ít lịch sử) được 45. Tức càng biết nhiều về
+    user, model dự đoán càng tệ. warm_warm chiếm 138k/141k mẫu nên đây là thứ quyết định
+    gần như toàn bộ metric — quan trọng hơn hẳn ô cold-start.
+
+    Nếu rank xấu đi ĐƠN ĐIỆU theo N_u thì decoder đang xử lý lịch sử dài kém (attention
+    loãng, hoặc u_i/γ phạt user warm). Nếu rank phẳng thì bất thường đến từ chỗ khác."""
+    print("\n--- CHẨN ĐOÁN: lịch sử DÀI giúp hay hại? (rank thấp = tốt) ---")
+    C = int(n_cand.float().median().item())
+    print(f"    ngẫu nhiên -> median≈{C // 2}; N_u = số tương tác của user TẠI vị trí dự đoán")
+    bins = [(0, 5), (6, 20), (21, 50), (51, 100), (101, 300), (301, 10 ** 9)]
+    print(f"    {'N_u':<14}{'n':>8}{'median rank':>13}{'p25':>7}{'p75':>7}{'top-10%':>10}")
+    for lo, hi in bins:
+        m = (n_u >= lo) & (n_u <= hi)
+        n = int(m.sum())
+        if n == 0:
+            continue
+        r = rank[m].float()
+        top = (r < C * 0.1).float().mean().item()
+        name = f"{lo}-{hi}" if hi < 10 ** 9 else f"{lo}+"
+        print(f"    {name:<14}{n:>8}{r.median():>13.0f}{r.quantile(0.25):>7.0f}"
+              f"{r.quantile(0.75):>7.0f}{top:>10.3f}")
+    # tương quan Spearman thô: N_u tăng thì rank tăng (xấu đi) hay giảm?
+    ru = torch.argsort(torch.argsort(n_u.float())).float()
+    rr = torch.argsort(torch.argsort(rank.float())).float()
+    rho = torch.corrcoef(torch.stack([ru, rr]))[0, 1].item()
+    print(f"    tương quan hạng N_u <-> rank: rho={rho:+.4f}  "
+          f"(<0 = lịch sử dài GIÚP; >0 = lịch sử dài HẠI)")
+
+
+def _report_msat_diagnostic(
+    rank: torch.Tensor,   # (N,) thứ hạng positive
+    m_sat: torch.Tensor,  # (N,) tỉ lệ token lịch sử có m_j > 0.95
+    n_cand: torch.Tensor,
+) -> None:
+    """m_j BÃO HOÀ có hại không? — phép thử trước khi quyết định có sửa hay không.
+
+    Đo 2026-09-22: m_j = tanh(N_i/τ_i) bão hoà nặng — 110 item (1.5%) có m > 0.99 nhưng
+    chúng chiếm 21.6% TỔNG LƯỢT XEM, và lịch sử của user điển hình có 31.5% token nằm ở
+    vùng m > 0.95. |log_m| sụp 5.21 (N_i 1-10) -> 0.0218 (N_i 1000+), 239 lần.
+
+    NHƯNG bão hoà tự nó KHÔNG phải bằng chứng — bài học từ 3 giả thuyết sai trước
+    (SparseAdam, cos.std, collab warm-up). Với log_u thì có tương quan rõ (|prod| 1.50 ->
+    0.0015 kèm rank 36 -> 48, đơn điệu). Với m_j thì tương quan N_u <-> tỉ lệ bão hoà là
+    -0.21, tức NGƯỢC dấu: user nhiều lịch sử xem item ÍT phổ biến hơn. Nên m_j không cộng
+    dồn với log_u và không giải thích được nghịch lý theo N_u.
+
+    Bảng này trả lời câu còn lại: nó có phải tổn thất NỀN (đều trên mọi user) không.
+    Rank xấu đi theo tỉ lệ bão hoà -> đáng sửa. Phẳng -> để yên."""
+    print("\n  --- CHẨN ĐOÁN: m_j bão hoà có hại không? ---")
+    C = int(n_cand.float().median().item())
+    print(f"    m_j > 0.95 = vùng log(m_j) -> 0, β/γ mất tín hiệu; ngẫu nhiên -> median≈{C // 2}")
+    print(f"    {'% token bão hoà':<20}{'n':>8}{'median rank':>13}{'top-10%':>10}")
+    for lo, hi, ten in [(0.0, 0.15, "0-15%"), (0.15, 0.30, "15-30%"),
+                        (0.30, 0.45, "30-45%"), (0.45, 1.01, "45%+")]:
+        k = (m_sat >= lo) & (m_sat < hi)
+        n = int(k.sum())
+        if n == 0:
+            continue
+        r = rank[k].float()
+        print(f"    {ten:<20}{n:>8}{r.median():>13.0f}{(r < C * 0.1).float().mean():>10.3f}")
+    ra = torch.argsort(torch.argsort(m_sat.float())).float()
+    rr = torch.argsort(torch.argsort(rank.float())).float()
+    rho = torch.corrcoef(torch.stack([ra, rr]))[0, 1].item()
+    print(f"    tương quan hạng (% bão hoà) <-> rank: rho={rho:+.4f}  "
+          f"(>0 = bão hoà m_j HẠI; ≈0 = vô hại, ĐỪNG sửa)")
 
 
 def _report_gate_diagnostic(
@@ -900,6 +1000,7 @@ def evaluate(
     static_user_weight: bool = False,  # PHẢI khớp cấu hình lúc train, nếu không train/eval lệch
     num_workers: int = 4,
     uniform_negatives: bool = False,  # ponytail: candidate uniform thay vì theo tần suất
+    log_user_maturity: bool = False,  # PHẢI khớp lúc train, nếu không train/eval lệch
 ) -> None:
     """Đánh giá Recall/NDCG@K trên split (val/test), tách theo 4 nhóm cold-start — xem
     eval.py. Dùng đúng candidate-sampling như lúc train (positive + N negative theo tần
@@ -916,6 +1017,8 @@ def evaluate(
 
     all_metrics: dict[str, list[torch.Tensor]] = {}
     all_user_cold, all_item_cold, all_user_lowhist = [], [], []
+    all_n_u = []  # [2026-09-22] N_u tại vị trí dự đoán — xem _report_history_diagnostic
+    all_m_sat = []  # [2026-09-22] tỉ lệ token có m_j bão hoà — xem _report_msat_diagnostic
     all_rank, all_norm_user, all_norm_pos, all_n_cand = [], [], [], []  # chẩn đoán, xem dưới
     all_embed_stats: dict[str, list[torch.Tensor]] = {}  # g_i, c, ‖e_collab‖... của candidate positive
 
@@ -928,6 +1031,7 @@ def evaluate(
             batch, dataset, item_embed, seq_model, profile_embed, thresholds, neg_sampler,
             item_n_cache, category_n_cache, num_negatives, device,
             static_user_weight=static_user_weight, uniform_negatives=uniform_negatives,
+            log_user_maturity=log_user_maturity,
         )
         # [SỬA 2026-09-15] eval_logit = dot-product THUẦN, KHÔNG trừ log_q. Trước đây dùng
         # scaled_logit() (có log_q) -> recall@5 = 1.0000 ở ô item-cold, vì log_q cộng ~3.90
@@ -955,6 +1059,8 @@ def evaluate(
         all_user_cold.append(fwd["is_user_cold"])
         all_item_cold.append(fwd["is_item_cold"])
         all_user_lowhist.append(fwd["is_user_lowhistory"])
+        all_n_u.append(fwd["n_u_at_pred"])
+        all_m_sat.append(fwd["m_saturated_frac"])
 
     per_sample_metrics = {k: torch.cat(v) for k, v in all_metrics.items()}
     is_user_cold = torch.cat(all_user_cold)
@@ -967,6 +1073,8 @@ def evaluate(
         torch.cat(all_rank), torch.cat(all_norm_user), torch.cat(all_norm_pos),
         torch.cat(all_n_cand), is_user_cold, is_item_cold,
     )
+    _report_history_diagnostic(torch.cat(all_rank), torch.cat(all_n_u), torch.cat(all_n_cand))
+    _report_msat_diagnostic(torch.cat(all_rank), torch.cat(all_m_sat), torch.cat(all_n_cand))
     _report_gate_diagnostic(
         {k: torch.cat(v) for k, v in all_embed_stats.items()}, is_user_cold, is_item_cold,
     )
@@ -997,6 +1105,7 @@ if __name__ == "__main__":
     parser.add_argument("--resume", default=None, help="Nạp checkpoint và train TIẾP từ đúng step đã dừng (gồm cả optimizer state)")
     parser.add_argument("--num-workers", type=int, default=4, help="Worker nạp dữ liệu (mặc định 4). Nghẽn là CPU chứ không phải GPU — đặt 0 để debug hoặc khi môi trường không cho fork")
     parser.add_argument("--eval-only", action="store_true", help="Không train, chỉ nạp checkpoint (--resume/--save-path) và chạy evaluate() — dùng để chạy lại chẩn đoán trên CÙNG model, ~8 phút thay vì train lại ~2 giờ")
+    parser.add_argument("--log-user-maturity", action="store_true", help="SỬA GỐC [2026-09-22]: dùng log1p(N_u)-log1p(τ_u) thay log(tanh(N_u/τ_u)) cho log_u trong attention bias + FiLM. Cái cũ BÃO HOÀ VỀ 0 với user nhiều lịch sử: |prod| yếu đi 1,000 lần từ N_u 0-20 xuống N_u 301+, và median rank xấu đi đơn điệu 36->48. Nhắm nhóm warm_warm = 138k/141k mẫu")
     parser.add_argument("--collab-warmup-steps", type=int, default=0, help="SỬA GỐC [2026-09-21]: N global-step ĐẦU train RIÊNG collab_embedding (gate bỏ qua, w_collab=1, content TẮT). Không có nó, gate đóng collab xuống 0.003 trong 50 step đầu và bảng collab kẹt ở nhiễu khởi tạo VĨNH VIỄN (đo: cos.std=0.1254 vs 0.1250 của vector ngẫu nhiên). Thử 300-500. Theo dõi log [collab] cos.std — rời khỏi 0.125 là có tác dụng")
     parser.add_argument("--uniform-negatives", action="store_true", help="CHẨN ĐOÁN [2026-09-21]: eval với candidate rút UNIFORM thay vì theo tần suất. Trả lời: item cold recall=0 vì embedding rác, hay vì luôn phải đấu 100 item warm? Chỉ dùng với --eval-only")
     parser.add_argument("--checkpoint", action="store_true", help="Gradient checkpointing: chậm ~30%%, tiết kiệm ~70%% VRAM. BẮT BUỘC cho nhánh có γ ở batch=256 trên T4 15GB (nếu không sẽ CUDA OOM ở loss.backward)")
@@ -1020,5 +1129,6 @@ if __name__ == "__main__":
         eval_only=args.eval_only,
         uniform_negatives=args.uniform_negatives,
         collab_warmup_steps=args.collab_warmup_steps,
+        log_user_maturity=args.log_user_maturity,
         num_workers=args.num_workers,
     )

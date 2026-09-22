@@ -70,6 +70,45 @@ class LearnableThresholds(nn.Module):
     def user_weight(self, n_u: torch.Tensor) -> torch.Tensor:
         return torch.tanh(n_u / self._safe_tau(self.tau_u))
 
+    def log_user_maturity(self, n_u: torch.Tensor) -> torch.Tensor:
+        """log1p(N_u) - log1p(tau_u) — thay cho log(user_weight) trong attention bias.
+
+        [SUA 2026-09-22] VI SAO KHONG DUNG log(tanh(N_u/tau_u)). tanh bao hoa ve 1 theo cap
+        so nhan, va log(1) = 0 — nen so hang gamma*log(u_i)*log(m_j) TAT HAN voi user nhieu
+        lich su. Do that tren du lieu val (2,490 chuoi, tau_u=35.3):
+
+            N_u       |prod|    |log_u|    median rank (C=101)
+            0-20      1.5009     3.7876     36
+            21-50     0.7427     1.5592     40
+            51-100    0.4121     0.8290     44
+            101-300   0.2383     0.4186     45
+            301+      0.0015     0.0015     48   <- gan nhu doan mo
+
+        So hang gamma yeu di 1,000 LAN tu nhom it lich su den nhom nhieu, va thu hang xau di
+        DON DIEU theo dung nhip do. |log_m| thi KHONG giam (0.57 -> 1.09), nen su sup do den
+        hoan toan tu phia log_u. Nhom warm_warm (138k/141k mau) nam gan nhu tron trong vung
+        chet — day la thu quyet dinh gan het metric, khong phai o cold-start.
+
+        Tang tau_u KHONG sua duoc: tanh luon co tiem can ngang tai 1 nen moi tau chi DOI tran
+        chu khong bo duoc no. Phai doi DANG HAM.
+
+        log1p(N_u) - log1p(tau_u) = log((1+N_u)/(1+tau_u)): giu nguyen y nghia "N_u so voi
+        nguong tau_u", khong bao hoa, va tau_u van hoc duoc (kha vi). Them mot cai loi: gia
+        tri gio co CA HAI DAU (am khi N_u < tau_u, duong khi lon hon), trong khi
+        log(tanh(.)) luon am — model phan biet duoc "duoi nguong" va "tren nguong" thay vi
+        chi "gan hay xa nguong".
+
+            N_u     cu: log(tanh(N/35.3))    moi: log1p(N)-log1p(35.3)
+            1              -3.56                    -2.89
+            35             -0.28                    -0.02
+            100            -0.0069                  +1.03
+            300            -0.0000                  +2.13
+            1000            0.0000                  +3.33
+
+        Vung N_u < 35 gan nhu khong doi (nhom cold_user, dang cho ket qua tot nhat, it bi
+        anh huong); vung N_u > 100 tu cho CHET thanh co tin hieu that va tang don dieu."""
+        return torch.log1p(n_u) - torch.log1p(self._safe_tau(self.tau_u))
+
     def item_weight(self, n_i: torch.Tensor) -> torch.Tensor:
         return torch.tanh(n_i / self._safe_tau(self.tau_i))
 
