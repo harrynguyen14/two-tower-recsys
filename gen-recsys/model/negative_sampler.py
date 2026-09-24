@@ -1,17 +1,4 @@
-"""Negative sampler cho sampled-softmax retrieval loss — sample theo TẦN SUẤT xuất hiện
-thật trong log (chuẩn word2vec/HSTU negative sampling), KHÔNG uniform (đã CHỐT 2026-09-10
-— item phổ biến làm negative "khó" hơn, đúng tinh thần item cold không bị lấn át bởi việc
-so sánh không công bằng với item phổ biến).
-
-Tần suất lấy từ item_N_ids/item_N_offsets (Pass 1, build_n_cumulative.py) — số lượt tương
-tác TOÀN CỤC mỗi item đã nhận (không phải theo thời điểm, chỉ dùng cho sampling, KHÔNG
-dùng để tính mat_i — mat_i vẫn phải tính theo timestamp để tránh leak tương lai, xem
-build_n_cumulative.py lookup_n_at_t_batch). 32 item hoàn toàn chưa từng xuất hiện trong
-log (N_i=0 tuyệt đối) KHÔNG có trong item_N_ids — gán tần suất tối thiểu (1) để vẫn có
-cơ hội được sample làm negative, không bị loại trừ hoàn toàn.
-
-log_Q(i) = log(freq(i) / sum(freq)) — sampled-softmax correction chuẩn (xem retrieval.py).
-"""
+"""Negative sampler cho sampled-softmax retrieval loss — sample theo TẦN SUẤT xuất hiện"""
 
 from __future__ import annotations
 
@@ -28,8 +15,6 @@ class NegativeSampler:
         item_offsets = np.load(output_dir / "item_N_offsets.npy")
         freq_observed = np.diff(item_offsets).astype(np.float64)
 
-        # Full-length tần suất theo đúng index video_id (0..num_items-1) — item không xuất
-        # hiện trong item_N_ids (chưa từng có tương tác) được gán tần suất tối thiểu = 1.
         freq = np.ones(num_items, dtype=np.float64)
         freq[item_ids] = freq_observed
 
@@ -42,28 +27,15 @@ class NegativeSampler:
         batch_size: int,
         num_negatives: int,
         device: torch.device,
-        exclude: torch.Tensor | None = None,  # (batch_size,) video_id positive cần loại
-        uniform: bool = False,  # ponytail: chỉ dùng cho eval chẩn đoán, train luôn False
+        exclude: torch.Tensor | None = None,
+        uniform: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Trả về (negative_video_ids, log_q) — shape (batch_size, num_negatives).
-
-        [SỬA 2026-09-14] Thêm `exclude` — loại FALSE NEGATIVE. Bug cũ: sample theo tần suất
-        KHÔNG loại positive, nên positive thường xuyên nằm trong tập negative của chính nó.
-        Cross-entropy khi đó phạt model vì xếp positive lên cao — hại trực tiếp metric. Rủi
-        ro cao trên Pure: chỉ 7,583 item với 100 negative/sample, sampling theo tần suất còn
-        dồn về item phổ biến.
-
-        Resample lặp (tối đa 10 vòng) thay vì 1 lần: lần resample vẫn có thể trúng lại
-        positive. 10 vòng đủ để xác suất còn sót không đáng kể với mọi phân phối thực tế."""
-        # uniform=True: candidate set KHÔNG lệch về item phổ biến. Dùng để trả lời câu hỏi
-        # "item cold recall=0 vì embedding của nó là rác, hay vì nó luôn phải đấu với 100
-        # item warm được train kỹ?". KHÔNG dùng lúc train — ở đó log_q correction đòi hỏi
-        # negative phải đến từ phân phối tần suất (xem retrieval.py eval_logit docstring).
+        """Trả về (negative_video_ids, log_q) — shape (batch_size, num_negatives)."""
         probs = None if uniform else self.probs
         neg_ids = np.random.choice(self.num_items, size=(batch_size, num_negatives), p=probs)
 
         if exclude is not None:
-            pos = exclude.detach().cpu().numpy().reshape(-1, 1)  # (B, 1) broadcast theo cột
+            pos = exclude.detach().cpu().numpy().reshape(-1, 1)
             for _ in range(10):
                 collide = neg_ids == pos
                 n_collide = int(collide.sum())

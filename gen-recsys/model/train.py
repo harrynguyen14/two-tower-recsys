@@ -1,29 +1,4 @@
-"""Training loop — nối toàn bộ module: Dataset -> ItemEmbedding -> SequenceModel ->
-RetrievalLoss (+ RankingLoss phụ) -> optimizer step. LearnableThresholds tính
-user_weight/item_weight/category_confidence RUNTIME từ N_i/N_category THẬT (tra qua
-lookup_n_at_t_batch, Pass 1, ĐÚNG THEO TIMESTAMP của từng token/candidate — KHÔNG leak
-tương lai, xem build_n_cumulative.py).
-
-[SỬA 2026-09-13] Thiết kế lại toàn bộ theo result.md "CHECKLIST CUỐI CÙNG":
-- Bỏ T(u,i) biến thiên (retrieval.py), bỏ λ·log(mat_j) (confidence_attention.py) — không
-  còn truyền mat_u/mat_i/mat_j vào các module đó.
-- [SỬA 2026-09-14] Gate user 3 thành phần đã BỎ HẲN: e_profile giờ là TOKEN 0 prepend vào
-  chuỗi (xem user_embedding.py + sequence_model.py). Gate cũ không nhận gradient từ loss
-  tự hồi quy toàn chuỗi — bug thật, không phải tối ưu hình thức.
-- RankingLoss thiết kế lại theo target-aware cross-attention: candidate NỐI vào cuối
-  chuỗi lịch sử (K -> K+1), decoder chạy 1 LẦN cho chuỗi K+1 — dùng CHUNG cho cả retrieval
-  (đọc vị trí K-1, 0-indexed — không bị ảnh hưởng bởi token K+1 phía sau nhờ causal mask)
-  và ranking (đọc vị trí K, chính là vị trí candidate) — TIẾT KIỆM 1 lần chạy decoder so
-  với chạy riêng 2 lần.
-
-Retrieval loss: 1 batch = (chuỗi lịch sử user, label, N sample negative theo tần suất
-thật trong log — xem negative_sampler.py).
-Ranking loss: dùng label làm candidate positive, action_vector THẬT tại vị trí label
-(dataset.py trả riêng field label_action, KHÁC hist_action là hành vi TRƯỚC label).
-
-CHƯA CHIA model parallelism (item_id % 2 -> GPU0/GPU1, xem idea.md quyết định #1) — chạy
-single-device trước, thêm khi có 2 GPU T4 thật để test.
-"""
+"""Training loop — nối toàn bộ module: Dataset -> ItemEmbedding -> SequenceModel ->"""
 
 from __future__ import annotations
 
@@ -39,14 +14,6 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# [SỬA 2026-09-15] Set GEN_RECSYS_OUT_DIR TRƯỚC khi import build_n_cumulative — module đó
-# đọc env var ở cấp module (biến OUT_DIR), nên set sau khi import là VÔ TÁC DỤNG.
-#
-# Vì sao phải làm ở đây, trước cả argparse: build_n_cumulative.OUT_DIR trước đây hard-code
-# thành thư mục cạnh file code, bỏ qua --output-dir hoàn toàn. Trên máy dev hai đường dẫn
-# trùng nhau nên không lộ; trên Kaggle (code /kaggle/working, dữ liệu /kaggle/input) thì
-# FileNotFoundError: item_N_ids.npy, cả 5 nhánh ablation cùng chết ở step 0.
-# Đọc --output-dir bằng tay từ sys.argv vì argparse chỉ chạy ở __main__, sau import.
 def _peek_output_dir() -> str | None:
     for i, a in enumerate(sys.argv):
         if a == "--output-dir" and i + 1 < len(sys.argv):
@@ -61,10 +28,11 @@ if _out and not os.environ.get("GEN_RECSYS_OUT_DIR"):
     os.environ["GEN_RECSYS_OUT_DIR"] = str(Path(_out).resolve())
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "preprocess_data"))
-from build_n_cumulative import build_n_cache, lookup_n_at_t_batch_cached  # noqa: E402
+from build_n_cumulative import build_n_cache, lookup_n_at_t_batch_cached
 
 from dataset import ACTION_VECTOR_FIELDS, GenRecsysDataset, ITEM_CATEGORICAL_FIELDS, MAX_SEQ_LEN
-from eval import aggregate_by_cold_group, compute_recall_ndcg_at_k, print_eval_report
+from eval import (aggregate_by_group, classify_signal_position, compute_metrics_at_k,
+                  print_eval_report)
 from item_embedding import ItemEmbedding, ItemEmbeddingConfig
 from learnable_thresholds import LearnableThresholds
 from negative_sampler import NegativeSampler
@@ -73,7 +41,6 @@ from retrieval import RetrievalLoss
 from sequence_model import SequenceModel
 from user_embedding import UserProfileConfig, UserProfileEmbedding
 
-# Index của mỗi field nhị phân trong ACTION_VECTOR_FIELDS — dùng để cắt nhãn cho RankingLoss
 BINARY_ACTION_INDICES = [ACTION_VECTOR_FIELDS.index(f) for f in BINARY_ACTION_FIELDS]
 
 
@@ -85,6 +52,7 @@ def build_category_counts(item_static_path: Path) -> dict[str, int]:
 def item_features_to_device(features: dict, device: torch.device) -> dict:
     return {
         "category_ids": {k: v.to(device, non_blocking=True) for k, v in features["category_ids"].items()},
+        "tag_ids": features["tag_ids"].to(device, non_blocking=True),
         "author_idx": features["author_idx"].to(device, non_blocking=True),
         "music_idx": features["music_idx"].to(device, non_blocking=True),
         "caption_embedding": features["caption_embedding"].to(device, non_blocking=True),
@@ -96,14 +64,10 @@ def compute_n_i_n_category(
     dataset: GenRecsysDataset,
     item_n_cache: dict,
     category_n_cache: dict,
-    video_ids_cpu: torch.Tensor,  # (N,) int64, CPU
-    timestamps_cpu: torch.Tensor,  # (N,) int64, CPU
+    video_ids_cpu: torch.Tensor,
+    timestamps_cpu: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """N_i(video_id, t) qua item_N, N_category(category_id, t) qua category_N — CẢ HAI
-    tính ĐÚNG THEO TIMESTAMP truyền vào (không leak tương lai). Dùng cache đã build 1 lần
-    (build_n_cache, xem build_n_cumulative.py) — KHÔNG gọi lookup_n_at_t_batch() thẳng vì
-    hàm đó build lại flat_struct MỖI LẦN GỌI, đã xác nhận OOM thật khi gọi lặp lại nhiều
-    lần/step trong training loop."""
+    """N_i(video_id, t) qua item_N, N_category(category_id, t) qua category_N — CẢ HAI"""
     video_ids_np = video_ids_cpu.numpy()
     ts_np = timestamps_cpu.numpy()
     n_i = lookup_n_at_t_batch_cached(item_n_cache, video_ids_np, ts_np)
@@ -115,8 +79,8 @@ def compute_n_i_n_category(
 
 
 def embed_items(
-    video_ids_cpu: torch.Tensor,  # (N,) CPU, flatten
-    timestamps_cpu: torch.Tensor,  # (N,) CPU, flatten
+    video_ids_cpu: torch.Tensor,
+    timestamps_cpu: torch.Tensor,
     dataset: GenRecsysDataset,
     item_embed: ItemEmbedding,
     thresholds: LearnableThresholds,
@@ -124,34 +88,20 @@ def embed_items(
     category_n_cache: dict,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Tra N_i/N_category theo đúng timestamp, tính item_weight/category_confidence
-    runtime (có gradient chảy về τ_i/τ_c), rồi chạy ItemEmbedding — dùng CHUNG cho token
-    lịch sử, candidate label, và negative (giữ logic 1 chỗ, tránh trùng lặp)."""
-    n_i, n_cat = compute_n_i_n_category(dataset, item_n_cache, category_n_cache, video_ids_cpu, timestamps_cpu)
+    """Tra N_i theo đúng timestamp, tính item_weight runtime (gradient chảy về τ_i), rồi"""
+    n_i, _ = compute_n_i_n_category(dataset, item_n_cache, category_n_cache, video_ids_cpu, timestamps_cpu)
     item_weight = thresholds.item_weight(n_i.to(device, non_blocking=True))
-    category_confidence = thresholds.category_confidence(n_cat.to(device, non_blocking=True))
 
     features = item_features_to_device(dataset.get_item_features(video_ids_cpu), device)
     e_i_final = item_embed(
         video_ids_cpu.to(device, non_blocking=True), features["category_ids"], features["author_idx"], features["music_idx"],
-        item_weight, category_confidence,
-        features["caption_embedding"], features["caption_mask"],
+        features["caption_embedding"], features["caption_mask"], features["tag_ids"],
     )
     return e_i_final, item_weight
 
 
 def setup_ddp() -> tuple[bool, int, int, int]:
-    """Khởi tạo DDP từ biến môi trường của torchrun. Trả về (bật, rank, local_rank, world_size).
-
-    Chạy: torchrun --nproc_per_node=2 train.py ...
-    Không qua torchrun thì không có RANK trong env -> trả về (False, 0, 0, 1) và mọi thứ
-    chạy y như cũ, không rẽ nhánh nào khác.
-
-    [LƯU Ý 2026-09-21] DDP all-reduce lấy TRUNG BÌNH gradient qua các rank. Với
-    collab_embedding gradient THƯA (mỗi rank chỉ chạm ~2,000/7,583 hàng, và là các hàng
-    KHÁC nhau), gradient của một hàng bị chia cho world_size dù chỉ 1 rank thật sự có nó.
-    Đó đúng là căn bệnh vừa chữa bằng --collab-warmup-steps, nên train() bù lại bằng một
-    param group riêng có lr × world_size cho bảng collab. Xem chỗ tạo optimizer."""
+    """Khởi tạo DDP từ biến môi trường của torchrun. Trả về (bật, rank, local_rank,..."""
     if "RANK" not in os.environ:
         return False, 0, 0, 1
     rank = int(os.environ["RANK"])
@@ -177,27 +127,17 @@ def run_batch_forward(
     category_n_cache: dict,
     num_negatives: int,
     device: torch.device,
-    static_user_weight: bool = False,  # ablation #5: u_i tĩnh per-user thay vì per-position
-    uniform_negatives: bool = False,  # ponytail: chỉ eval chẩn đoán, train luôn False
-    log_user_maturity: bool = False,  # [2026-09-22] log1p thay log(tanh) cho log_u — xem thresholds
+    static_user_weight: bool = False,
+    uniform_negatives: bool = False,
+    log_user_maturity: bool = False,
+    pmi_table: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """1 forward pass đầy đủ cho 1 batch — dùng CHUNG bởi train() và evaluate().
-
-    [SỬA 2026-09-14] Thiết kế lại theo HSTU thật (arXiv 2402.17152):
-    - Chuỗi XEN KẼ [Φ_0,a_0,…,Φ_{K-1},a_{K-1}] thay cho cộng gộp; BỎ việc nối candidate
-      vào cuối (thiết kế K+1 cũ) — xen kẽ đã cho target-aware mà KHÔNG leak action.
-    - Loss TỰ HỒI QUY toàn chuỗi: dự đoán item t+1 tại MỌI vị trí (retrieval) và a_t tại
-      MỌI vị trí (ranking) — tín hiệu ×K so với thiết kế cũ chỉ dùng 1 vị trí, cùng 1
-      forward pass (hidden mọi vị trí vốn đã tính, trước đây vứt đi 255/256).
-
-    Trả về (xem chú thích từng key ở cuối hàm): pred/target_e_i/target_log_q/neg_e_i/
-    neg_log_q/pair_valid (retrieval toàn chuỗi), hist_action/hist_valid_mask (ranking toàn
-    chuỗi), e_user_eval/cand_e_i/log_q (eval), label_action, is_user_cold, is_item_cold."""
+    """1 forward pass đầy đủ cho 1 batch — dùng CHUNG bởi train() và evaluate()."""
     hist_video_ids_cpu = batch["hist_video_ids"]
     hist_timestamps_cpu = batch["hist_timestamps"]
     hist_action = batch["hist_action"].to(device, non_blocking=True)
     key_padding_mask = batch["key_padding_mask"].to(device, non_blocking=True)
-    hist_valid_mask = batch["hist_valid_mask"].to(device, non_blocking=True)  # (B, K) True = token thật
+    hist_valid_mask = batch["hist_valid_mask"].to(device, non_blocking=True)
     label_video_id_cpu = batch["label_video_id"]
     label_timestamp_cpu = batch["label_timestamp"]
     label_action = batch["label_action"].to(device, non_blocking=True)
@@ -209,64 +149,37 @@ def run_batch_forward(
         dataset, item_embed, thresholds, item_n_cache, category_n_cache, device,
     )
     hist_e_i = hist_e_i.view(B, K, -1)
-    hist_item_weight = hist_item_weight.view(B, K)  # m_j cho pairwise bias (confidence_attention.py)
+    hist_item_weight = hist_item_weight.view(B, K)
 
-    # u_i TẠI TỪNG VỊ TRÍ (không phải 1 scalar/chuỗi như trước) — điều kiện CHẶN để số hạng
-    # γ·log(u_i)·log(m_j) không thoái hóa về đúng cơ chế λ·log(mat_j) đã bỏ 2026-09-13.
-    # Xem dataset.py hist_n_u + confidence_attention.py docstring.
-    hist_n_u = batch["hist_n_u"].to(device, non_blocking=True)  # (B, K) — N_u tại TỪNG vị trí
+    hist_n_u = batch["hist_n_u"].to(device, non_blocking=True)
     if static_user_weight:
-        # [ABLATION #5, THÊM 2026-09-15] Thay u_i per-position bằng u TĨNH per-user: lấy
-        # N_u tại điểm dự đoán (vị trí cuối) rồi broadcast ra cả K vị trí. Đây là thí
-        # nghiệm DUY NHẤT tách bạch đóng góp "cold-start là đại lượng per-position" khỏi
-        # đóng góp "bias dạng tích": cả hai nhánh đều có γ·log(u)·log(m_j), chỉ khác u
-        # biến thiên hay hằng. Nếu nhánh tĩnh ngang nhánh per-position -> luận điểm
-        # per-position KHÔNG có cơ sở thực nghiệm và phải rút khỏi paper.
         hist_n_u = hist_n_u[:, -1:].expand_as(hist_n_u)
-    hist_user_weight = thresholds.user_weight(hist_n_u)  # (B, K) — vẫn dùng cho các chỗ khác
-    # [SỬA 2026-09-22] log(u_i) cho attention bias + FiLM: dùng log1p(N_u)-log1p(τ_u) thay
-    # log(tanh(N_u/τ_u)) đang bão hoà về 0 ở user warm. Xem learnable_thresholds.py.
+    hist_user_weight = thresholds.user_weight(hist_n_u)
     hist_log_u = thresholds.log_user_maturity(hist_n_u) if log_user_maturity else None
 
     label_e_i, _ = embed_items(
         label_video_id_cpu, label_timestamp_cpu, dataset, item_embed, thresholds,
         item_n_cache, category_n_cache, device,
     )
-    # [CHẨN ĐOÁN 2026-09-16] Chụp NGAY SAU lần embed label — _last_stats bị ghi đè ở mỗi
-    # lần gọi embed_items (history/label/negative), nên phải lấy đúng ở đây mới là stats của
-    # candidate POSITIVE, thứ ta cần đối chiếu với thứ hạng của nó.
-    # [DDP 2026-09-21] .module khi item_embed là DistributedDataParallel — wrapper không
-    # chuyển tiếp thuộc tính thường, chỉ chuyển tiếp forward.
     _ie = getattr(item_embed, "module", item_embed)
     label_embed_stats = {k: v.clone() for k, v in _ie._last_stats.items()}
 
-    # --- 1 lần chạy decoder trên chuỗi XEN KẼ [Φ_0,a_0,...,Φ_{K-1},a_{K-1}] ---
-    # KHÔNG nối label vào chuỗi nữa (bỏ thiết kế K+1 cũ): xen kẽ khiến hidden tại Φ_t đã
-    # thấy (Φ_0..Φ_t, a_0..a_{t-1}) nhưng CHƯA thấy a_t — đúng thứ cần cho cả 2 việc, và
-    # tự loại bỏ leak label_action của thiết kế cũ (đã xác nhận bằng test causal, xem
-    # sequence_model.py forward docstring).
-    # [SỬA 2026-09-14] e_profile PREPEND làm token 0 của chuỗi (thay nhánh user gate cũ —
-    # xem user_embedding.py docstring: gate cũ không nhận gradient từ loss toàn chuỗi).
     user_features = dataset.get_user_features(batch["user_id"])
     e_profile = profile_embed(
         user_features["onehot"].to(device, non_blocking=True), user_features["register_days"].to(device, non_blocking=True)
-    )  # (B, dim), hoặc None nếu use_profile_token=False (ablation)
+    )
 
     hidden = seq_model(
         hist_e_i, hist_action, key_padding_mask, profile_embedding=e_profile,
         user_weight=hist_user_weight, item_weight=hist_item_weight,
         log_user_maturity=hist_log_u,
-        # [ADDED 2026-09-17] raw timestamps feed ActionEncoder (hour-of-day, see action_encoder.py).
-        # Derived at runtime, so no preprocessing rebuild was needed.
         hist_timestamps=hist_timestamps_cpu.to(device, non_blocking=True),
-    )  # (B, K, dim) tại vị trí item
+        hist_video_ids=hist_video_ids_cpu.to(device, non_blocking=True),
+        pmi_table=pmi_table,
+    )
 
-    # --- Retrieval: loss TỰ HỒI QUY toàn chuỗi (mọi vị trí dự đoán item kế tiếp) ---
-    # target[t] = item t+1: item trong window dịch trái 1, vị trí cuối là LABEL.
-    target_e_i = torch.cat([hist_e_i[:, 1:, :], label_e_i.unsqueeze(1)], dim=1)  # (B, K, dim)
+    target_e_i = torch.cat([hist_e_i[:, 1:, :], label_e_i.unsqueeze(1)], dim=1)
     target_ids_cpu = torch.cat([hist_video_ids_cpu[:, 1:], label_video_id_cpu.unsqueeze(1)], dim=1)
-    # Cặp (t -> t+1) hợp lệ khi t thật VÀ t+1 thật; vị trí cuối dự đoán label (luôn thật)
-    # nên chỉ cần t thật.
     pair_valid = hist_valid_mask.clone()
     pair_valid[:, :-1] &= hist_valid_mask[:, 1:]
 
@@ -281,46 +194,32 @@ def run_batch_forward(
     neg_e_i = neg_e_i.view(B, num_negatives, -1)
     target_log_q = neg_sampler.log_q_for(target_ids_cpu.reshape(-1).to(device, non_blocking=True)).view(B, K)
 
-    # --- Biểu diễn user tại vị trí dự đoán CUỐI (= label), dùng cho eval ---
-    # [SỬA 2026-09-14] Là hidden THUẦN từ decoder, KHÔNG qua gate nào nữa: e_profile đã nằm
-    # trong chuỗi (token 0) nên hidden tại Φ_{K-1} đã "thấy" nó qua attention. Gate ngoài
-    # giờ vừa thừa (đếm e_profile 2 lần) vừa sai (train chấm trên hidden, eval chấm trên
-    # e_u_final -> 2 đại lượng KHÁC NHAU, đúng bug đã phát hiện).
-    e_user_eval = hidden[:, -1, :]  # hidden tại Φ_{K-1} — chưa thấy a_{K-1}, dự đoán label
+    e_user_eval = hidden[:, -1, :]
 
-    # Candidate set cho EVAL (xếp hạng label giữa positive + negative) — giữ đúng cách đo
-    # cũ để so sánh được với baseline.
-    cand_e_i = torch.cat([label_e_i.unsqueeze(1), neg_e_i], dim=1)  # (B, 1+num_negatives, dim)
+    cand_e_i = torch.cat([label_e_i.unsqueeze(1), neg_e_i], dim=1)
     positive_log_q = neg_sampler.log_q_for(label_video_id_cpu.to(device, non_blocking=True)).unsqueeze(1)
     log_q = torch.cat([positive_log_q, neg_log_q], dim=1)
 
     return {
-        # loss retrieval toàn chuỗi
-        "pred": hidden,  # (B, K, dim) — hidden tại Φ_t
-        "target_e_i": target_e_i,  # (B, K, dim) — e_i_final của item t+1
-        "target_log_q": target_log_q,  # (B, K)
-        "neg_e_i": neg_e_i,  # (B, C, dim)
-        "neg_log_q": neg_log_q,  # (B, C)
-        "pair_valid": pair_valid,  # (B, K) bool
-        # ranking p(a_t | Φ_t) — hidden tại Φ_t CHƯA thấy a_t nên KHÔNG leak
-        "hist_action": hist_action,  # (B, K, NUM_ACTION_DIMS) — nhãn action tại mọi vị trí
-        "hist_valid_mask": hist_valid_mask,  # (B, K)
-        # eval
+        "pred": hidden,
+        "target_e_i": target_e_i,
+        "target_log_q": target_log_q,
+        "neg_e_i": neg_e_i,
+        "neg_log_q": neg_log_q,
+        "pair_valid": pair_valid,
+        "hist_action": hist_action,
+        "hist_valid_mask": hist_valid_mask,
         "e_user_eval": e_user_eval,
         "cand_e_i": cand_e_i,
         "log_q": log_q,
         "label_action": label_action,
         "is_user_cold": batch["is_user_cold"],
         "is_item_cold": batch["is_item_cold"],
-        "label_embed_stats": label_embed_stats,  # chẩn đoán gate, xem item_embedding.py
-        "is_user_lowhistory": batch["is_user_lowhistory"],  # few-shot, xem eval.py print_eval_report
-        # [THÊM 2026-09-22] N_u tại vị trí DỰ ĐOÁN (cuối chuỗi) — để phân tầng thứ hạng theo
-        # độ dài lịch sử. Xem _report_history_diagnostic().
+        "label_embed_stats": label_embed_stats,
+        "is_user_lowhistory": batch["is_user_lowhistory"],
+        "hist_video_ids": hist_video_ids_cpu,
+        "label_video_id": label_video_id_cpu,
         "n_u_at_pred": hist_n_u[:, -1].detach().cpu(),
-        # [THÊM 2026-09-22] tỉ lệ token lịch sử có m_j > 0.95 (vùng bão hoà của tanh, nơi
-        # log(m_j) -> 0 và số hạng β/γ mất tín hiệu). Đo được: 31.5% token của user điển
-        # hình nằm trong vùng này. Câu hỏi phép đo này trả lời: chuỗi nhiều token bão hoà
-        # có bị rank xấu hơn không? Nếu KHÔNG thì bão hoà m_j vô hại, đừng sửa.
         "m_saturated_frac": (
             (hist_item_weight > 0.95).float() * hist_valid_mask.float()
         ).sum(1).div(hist_valid_mask.float().sum(1).clamp(min=1)).detach().cpu(),
@@ -334,34 +233,32 @@ def train(
     num_layers: int = 4,
     ffn_dim: int = 256,
     batch_size: int = 64,
-    num_negatives: int = 100,
+    num_negatives: int = 512,
     t_base: float = 0.1,
     lr: float = 1e-3,
     ranking_loss_weight: float = 0.5,
     num_epochs: int = 1,
     max_steps_per_epoch: int | None = None,
-    amp: bool = True,  # [2026-09-17] fp16 autocast + GradScaler (CUDA), xem vòng lặp train
-    use_flex: bool = False,  # [2026-09-17] THỬ NGHIỆM: FlexAttention (tự tắt nếu kernel lỗi)
-    use_profile_token: bool = True,  # prepend e_profile làm token 0 (xem user_embedding.py)
-    interleave: bool = True,  # True = chuỗi xen kẽ [Φ,a,Φ,a,...] (HSTU); False = cộng gộp (ablation)
-    static_user_weight: bool = False,  # ablation #5: u_i tĩnh per-user (xem run_batch_forward)
-    use_beta: bool = True,   # ablation #3: tắt β·log m_j (xem confidence_attention.py)
-    use_gamma: bool = True,  # ablation #4: tắt γ·log u_i·log m_j — số hạng TÍCH, đóng góp chính
-    use_checkpoint: bool = False,  # gradient checkpointing — BẮT BUỘC cho nhánh có γ ở batch lớn
-    save_every: int | None = None,   # lưu checkpoint mỗi N step (None = chỉ lưu cuối epoch)
-    save_path: str | None = None,    # nơi lưu; mặc định <output_dir>/ckpt.pt
-    resume: str | None = None,       # nạp checkpoint rồi train tiếp từ đúng step đã dừng
-    eval_only: bool = False,         # bỏ qua train, chỉ nạp checkpoint và chạy evaluate()
-    uniform_negatives: bool = False, # eval với candidate uniform — chẩn đoán, xem --uniform-negatives
-    collab_warmup_steps: int = 0,    # N step đầu train RIÊNG collab (gate bỏ qua) — xem item_embedding.py
-    log_user_maturity: bool = False, # [2026-09-22] log1p(N_u)-log1p(τ_u) thay log(tanh) — xem thresholds
-    num_workers: int = 4,            # worker nạp dữ liệu — xem DataLoader dưới (nghẽn là CPU, không phải GPU)
+    amp: bool = True,
+    use_softmax: bool = False,
+    static_delta: bool = False,
+    use_pmi: bool = True,
+    use_profile_token: bool = True,
+    interleave: bool = True,
+    static_user_weight: bool = False,
+    use_beta: bool = True,
+    use_checkpoint: bool = False,
+    save_every: int | None = None,
+    save_path: str | None = None,
+    resume: str | None = None,
+    eval_only: bool = False,
+    uniform_negatives: bool = False,
+    log_user_maturity: bool = False,
+    num_workers: int = 4,
     device_str: str = "cuda" if torch.cuda.is_available() else "cpu",
 ):
     output_dir = Path(output_dir)
 
-    # [THÊM 2026-09-21] DDP (2xT4 trên Kaggle). Không qua torchrun thì ddp=False và mọi
-    # thứ dưới đây chạy y như single-GPU — không rẽ nhánh nào khác. Xem setup_ddp().
     ddp, rank, local_rank, world_size = setup_ddp()
     is_main = rank == 0
     device = torch.device(f"cuda:{local_rank}") if ddp else torch.device(device_str)
@@ -372,15 +269,6 @@ def train(
             print(*a, **kw)
 
     train_dataset = GenRecsysDataset(output_dir, split="train")
-    # [SỬA 2026-09-16] num_workers=4 + pin_memory: step đo được 1.59 s nhưng compute GPU chỉ
-    # ~125 ms (bench_t4.py, batch=256) và peak VRAM 1.73/15.6 GB — nghẽn nằm ở CPU, trong
-    # compute_n_i_n_category() (tra N_i/N_category theo timestamp, .numpy()/from_numpy mỗi
-    # step). Với num_workers=0 phần đó chạy tuần tự, GPU ngồi chờ. Worker process làm nó
-    # chồng lấn với forward/backward.
-    # Dataset dùng memmap read-only (dataset.py) nên fork sang worker an toàn: mỗi worker tự
-    # map lại, không chia sẻ file handle.
-    # DDP: mỗi rank thấy một PHẦN RIÊNG của dataset (sampler lo việc chia), nên shuffle
-    # phải do sampler làm — truyền shuffle=True kèm sampler sẽ lỗi.
     train_sampler = (
         torch.utils.data.distributed.DistributedSampler(
             train_dataset, num_replicas=world_size, rank=rank, shuffle=True,
@@ -391,16 +279,9 @@ def train(
         train_dataset, batch_size=batch_size, shuffle=(train_sampler is None),
         sampler=train_sampler,
         num_workers=num_workers, pin_memory=(device.type == "cuda"),
-        persistent_workers=num_workers > 0,  # không dựng lại 4 process mỗi epoch
-        # [THÊM 2026-09-17] prefetch_factor mặc định là 2; nâng lên 6 vì GPU đang ĐỢI CPU
-        # (fwd% đo được thấp), nên xếp sẵn nhiều batch hơn là đổi RAM lấy thời gian GPU rảnh.
+        persistent_workers=num_workers > 0,
         prefetch_factor=6 if num_workers > 0 else None,
     )
-    # [THÊM 2026-09-17] pin_memory=True vốn đã bật, nhưng MỌI `.to(device)` trước đây đều
-    # BLOCKING — tức trả tiền cho pinned memory mà không nhận lợi ích: copy H2D vẫn chặn CPU
-    # cho tới khi xong. Nay tất cả dùng non_blocking=True để copy chồng lấn với compute.
-    # An toàn vì mọi tensor nguồn đều do DataLoader cấp (đã pinned) và chỉ được đọc SAU khi
-    # kernel dùng chúng đã enqueue trên cùng stream.
 
     num_items = len(train_dataset.item_static)
     num_authors = int(train_dataset.item_static["author_idx"].max()) + 1
@@ -412,16 +293,23 @@ def train(
         num_categories=num_categories, dim=dim,
     )
     item_embed = ItemEmbedding(item_config).to(device, non_blocking=True)
-    # [SỬA 2026-09-14] Xen kẽ: chuỗi nội bộ 2K token cho K=256 lượt -> max_seq_len=512.
-    # Đo thật trên T4 (bench_t4.py, fp16, batch=256): 125.3 ms/step = 0.15 h/epoch, peak
-    # 1.73/15.6 GB — compute KHÔNG phải ràng buộc. Bỏ thiết kế K+1 cũ (nối candidate vào
-    # cuối) vì xen kẽ đã cho target-aware mà không leak action.
+
+    # Bảng PPMI (formula.md §4.1) — hằng số, KHÔNG có gradient, chỉ mu_h học được.
+    # 115 MB fp16 nên nạp thẳng lên device. Chạy build_pmi.py nếu chưa có.
+    pmi_table = None
+    if use_pmi:
+        pmi_path = Path(output_dir) / "pmi_table.npy"
+        if pmi_path.exists():
+            pmi_table = torch.from_numpy(np.load(pmi_path)).to(device)
+            print(f"[train] nạp pmi_table {tuple(pmi_table.shape)} ({pmi_table.element_size() * pmi_table.nelement() / 1e6:.0f} MB)")
+        else:
+            print(f"[train] KHÔNG thấy {pmi_path} — chạy preprocess_data/build_pmi.py. Tắt PMI bias.")
+
     seq_model = SequenceModel(
         dim=dim, num_heads=num_heads, num_layers=num_layers, ffn_dim=ffn_dim,
-        # +1 cho token profile prepend (xem sequence_model.py forward) — thiếu 1 slot ở đây
-        # là IndexError trong position_embedding ngay step đầu.
         max_seq_len=(2 * MAX_SEQ_LEN if interleave else MAX_SEQ_LEN) + 1, interleave=interleave,
-        use_beta=use_beta, use_gamma=use_gamma, use_checkpoint=use_checkpoint, use_flex=use_flex,
+        use_beta=use_beta, use_checkpoint=use_checkpoint,
+        use_softmax=use_softmax, static_delta=static_delta, use_pmi=use_pmi,
     ).to(device, non_blocking=True)
     profile_config = UserProfileConfig(
         onehot_num_categories=train_dataset.onehot_num_categories, dim=dim,
@@ -433,11 +321,6 @@ def train(
     ranking_loss_fn = RankingLoss(dim=dim).to(device, non_blocking=True)
     neg_sampler = NegativeSampler(output_dir, num_items=num_items)
 
-    # [SỬA 2026-09-17] MỌI tham số vào chung 1 optimizer. Lập luận cũ ("3 bảng ID lớn cần
-    # SparseAdam, Adam sẽ cấp state cho TOÀN BỘ bảng") đúng về nguyên tắc nhưng sai về quy mô
-    # ở đây: KuaiRand-Pure có 7,583 item, bảng 64 chiều = 1.85 MB, nên state Adam thêm ~3.7 MB
-    # — không đáng so với việc phải nuôi 2 optimizer, mất fused=True, và buộc GradScaler đi
-    # đường coalesce cho gradient thưa khi bật AMP.
     dense_params = (
         item_embed.dense_parameters()
         + list(seq_model.parameters())
@@ -446,50 +329,10 @@ def train(
         + list(retrieval_loss_fn.parameters())
         + list(ranking_loss_fn.parameters())
     )
-    # [GỠ 2026-09-17] Trước đây 2 optimizer: SparseAdam cho 3 bảng ID (sparse=True) + Adam
-    # cho phần còn lại. Với 7,583 item (bảng 1.85 MB) việc chia đó chỉ tốn phức tạp: nó chặn
-    # fused=True và bắt GradScaler đi đường coalesce khi bật AMP. Nay tất cả là dense -> 1
-    # optimizer. fused chỉ có trên CUDA.
-    # [THÊM 2026-09-21] DDP + gradient thưa: param group RIÊNG cho collab_embedding với
-    # lr × world_size. DDP all-reduce lấy TRUNG BÌNH gradient qua các rank; với bảng collab
-    # mỗi rank chỉ chạm ~2,000/7,583 hàng và là các hàng KHÁC nhau, nên gradient một hàng bị
-    # chia cho world_size dù chỉ 1 rank thật sự có nó. Không bù thì DDP làm nặng thêm đúng
-    # căn bệnh mà --collab-warmup-steps đang chữa (xem item_embedding.py).
-    #
-    # Adam CHIA cho √exp_avg_sq nên nhân lr không đơn thuần là "đi nhanh gấp đôi" — nhưng
-    # nó khôi phục đúng TỈ LỆ giữa bảng collab và phần còn lại của model, vốn là thứ DDP
-    # phá vỡ. Single-GPU (world_size=1) thì hệ số = 1, không đổi gì so với trước.
-    collab_w = item_embed.collab_embedding.weight
-    collab_ids = {id(collab_w)}
-    optimizer = torch.optim.Adam(
-        [
-            {"params": [p_ for p_ in dense_params if id(p_) not in collab_ids], "lr": lr},
-            {"params": [collab_w], "lr": lr * world_size},
-        ],
-        lr=lr,
-        fused=(device.type == "cuda"),
-    )
-    if ddp:
-        log(f"[ddp] world_size={world_size} | lr collab_embedding = {lr * world_size:.2e} "
-            f"(= lr × world_size, bù all-reduce chia trung bình trên gradient thưa)")
-    # GradScaler chỉ có tác dụng với fp16 trên CUDA; enabled=False biến mọi lời gọi thành
-    # no-op nên vòng lặp không cần rẽ nhánh.
+    optimizer = torch.optim.Adam(dense_params, lr=lr, fused=(device.type == "cuda"))
     use_amp = (device.type == "cuda") and amp
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
 
-    # [THÊM 2026-09-21] Wrap DDP. Chỉ seq_model (decoder HSTU) là phần nặng cần
-    # all-reduce qua nhiều lớp; item_embed/profile_embed cũng phải wrap để gradient của
-    # chúng được đồng bộ.
-    #
-    # find_unused_parameters=True là BẮT BUỘC ở đây, không phải tuỳ chọn: trong giai đoạn
-    # --collab-warmup-steps, forward() của ItemEmbedding trả về sớm (return e_collab) nên
-    # content_gmu + gate_mlp KHÔNG tham gia đồ thị. DDP mặc định coi mọi tham số đều phải
-    # có gradient và sẽ treo ở all-reduce khi không thấy. Cờ này đánh đổi ~5% tốc độ lấy
-    # việc chạy được — chấp nhận, vì nếu không thì warm-up và DDP loại trừ nhau.
-    #
-    # GIỮ tham chiếu tới module GỐC (item_embed/seq_model/...): vòng lặp và hàm chẩn đoán
-    # gọi thẳng .collab_warmup, .decoder.layers, .dense_parameters() — những thứ DDP wrapper
-    # không chuyển tiếp. Chỉ lời gọi forward đi qua wrapper để all-reduce được kích hoạt.
     if ddp:
         from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -499,27 +342,25 @@ def train(
     else:
         item_embed_ddp, seq_model_ddp, profile_embed_ddp = item_embed, seq_model, profile_embed
 
-    # Build 1 LẦN DUY NHẤT trước vòng lặp — KHÔNG build lại mỗi step.
     log("[train] building N_i/N_category cache (1 lần, dùng xuyên suốt training)...")
+
     item_n_cache = build_n_cache("item_N")
     category_n_cache = build_n_cache("category_N")
 
     steps_per_epoch = min(len(train_loader), max_steps_per_epoch) if max_steps_per_epoch else len(train_loader)
 
-    # Gom module vào 1 dict cho save/load — tránh lặp 6 tên ở 3 chỗ gọi khác nhau.
     ckpt_modules = {
         "item_embed": item_embed, "seq_model": seq_model, "profile_embed": profile_embed,
         "thresholds": thresholds, "retrieval_loss_fn": retrieval_loss_fn,
         "ranking_loss_fn": ranking_loss_fn,
     }
-    # Cờ ĐỔI CƠ CHẾ model — lưu kèm để resume/eval-only không âm thầm chạy nhánh ablation
-    # khác với lúc train. Không gồm lr/batch_size: đổi chúng vẫn là cùng model, hợp lệ.
     ckpt_config = {
         "dim": dim, "num_heads": num_heads, "num_layers": num_layers, "ffn_dim": ffn_dim,
-        "amp": amp, "use_flex": use_flex, "use_profile_token": use_profile_token,
+        "amp": amp, "use_softmax": use_softmax, "static_delta": static_delta,
+        "use_pmi": use_pmi, "use_profile_token": use_profile_token,
         "interleave": interleave, "static_user_weight": static_user_weight,
         "log_user_maturity": log_user_maturity,
-        "use_beta": use_beta, "use_gamma": use_gamma,
+        "use_beta": use_beta,
     }
     ckpt_path = Path(save_path) if save_path else output_dir / "ckpt.pt"
 
@@ -534,14 +375,11 @@ def train(
         log(f"[resume] nạp {src} — epoch={start_epoch} step={start_step}")
 
     if eval_only:
-        # Chỉ đo lại, không train: dùng khi cần chạy chẩn đoán nhiều lần trên CÙNG model
-        # (eval ~8 phút so với ~2 giờ train lại — và train lại còn ra model KHÁC vì seed
-        # dataloader khác, nên số đo sẽ không so sánh được với lần trước).
         evaluate(
             "val", output_dir, item_embed, seq_model, profile_embed, thresholds, neg_sampler,
             retrieval_loss_fn, item_n_cache, category_n_cache, num_negatives, batch_size, device,
             max_batches=max_steps_per_epoch, static_user_weight=static_user_weight,
-            num_workers=num_workers, uniform_negatives=uniform_negatives,
+            num_workers=num_workers, uniform_negatives=uniform_negatives, pmi_table=pmi_table,
         )
         return
 
@@ -549,62 +387,36 @@ def train(
     step_time_acc = 0.0
 
     for epoch in range(start_epoch, num_epochs):
-        # DDP: bắt buộc, nếu không mỗi epoch mọi rank thấy CÙNG một thứ tự -> mất tác dụng
-        # shuffle và các rank lặp lại nhau.
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         progress = tqdm(
             enumerate(train_loader), total=steps_per_epoch, desc=f"epoch {epoch}", unit="step",
-            disable=not is_main,  # tránh world_size thanh tiến trình chồng nhau
+            disable=not is_main,
         )
         for step, batch in progress:
             if max_steps_per_epoch is not None and step >= max_steps_per_epoch:
                 break
-            # Resume giữa epoch: bỏ qua các step ĐÃ train. Quay vòng dataloader vẫn tốn
-            # thời gian đọc nhưng không forward/backward — chấp nhận được, và giữ thứ tự
-            # batch nhất quán với lần chạy trước (shuffle dùng cùng seed torch mặc định).
             if epoch == start_epoch and step < start_step:
                 continue
 
-            # [THÊM 2026-09-21] Giai đoạn warm-up collab: gate bị bỏ qua, content tắt.
-            # Lý do đầy đủ ở item_embedding.py::__init__ (self.collab_warmup) — tóm tắt:
-            # gate đóng nhánh collab xuống 0.003 trong 50 step đầu vì content học nhanh hơn
-            # hẳn (MLP dùng chung, gradient mỗi step) so với bảng collab (mỗi hàng vài lần
-            # mỗi epoch), khiến collab_embedding vĩnh viễn kẹt ở nhiễu khởi tạo.
-            global_step_now = epoch * steps_per_epoch + step
-            warmup_active = global_step_now < collab_warmup_steps
-            if item_embed.collab_warmup != warmup_active:
-                item_embed.collab_warmup = warmup_active
-                tqdm.write(
-                    f"[collab-warmup] {'BẬT' if warmup_active else 'TẮT'} tại global_step={global_step_now}"
-                    + ("" if warmup_active else " — gate trở lại bình thường, content bật lại")
-                )
-
             step_start = time.perf_counter()
             B = batch["hist_video_ids"].shape[0]
-            # [THÊM 2026-09-17] AMP. Trên T4 (Turing) fp16 có tensor core: 8.1 -> 65 TFLOPS
-            # đỉnh, và MỌI tensor (B,H,L,L) giảm nửa (1.00 -> 0.50 GB ở B=256, L=512) — đòn
-            # bẩy lớn nhất cho cả tốc độ lẫn bộ nhớ. bf16 KHÔNG có trên sm_75, phải fp16 +
-            # GradScaler. Softmax/loss vẫn tự động chạy fp32 (autocast giữ danh sách op nhạy
-            # cảm với độ chính xác), nên chỉ matmul/conv hạ xuống fp16.
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
                 fwd = run_batch_forward(
                     batch, train_dataset, item_embed_ddp, seq_model_ddp, profile_embed_ddp,
                     thresholds, neg_sampler,
                     item_n_cache, category_n_cache, num_negatives, device,
                     static_user_weight=static_user_weight,
-                    log_user_maturity=log_user_maturity,
+                    log_user_maturity=log_user_maturity, pmi_table=pmi_table,
                 )
                 forward_time_acc += time.perf_counter() - step_start
 
-                # --- retrieval TỰ HỒI QUY toàn chuỗi: dự đoán item t+1 tại MỌI vị trí ---
                 r_loss = retrieval_loss_fn.forward_sequence(
                     fwd["pred"], fwd["target_e_i"], fwd["neg_e_i"],
                     fwd["target_log_q"], fwd["neg_log_q"], fwd["pair_valid"],
                 )
 
-                # --- ranking p(a_t | Φ_t) tại MỌI vị trí — không leak nhờ chuỗi xen kẽ ---
-                binary_labels = fwd["hist_action"][..., BINARY_ACTION_INDICES]  # (B, K, 8)
+                binary_labels = fwd["hist_action"][..., BINARY_ACTION_INDICES]
                 k_loss, _ = ranking_loss_fn.forward_sequence(
                     fwd["pred"], binary_labels, fwd["hist_valid_mask"],
                 )
@@ -612,20 +424,11 @@ def train(
                 loss = r_loss + ranking_loss_weight * k_loss
 
             optimizer.zero_grad(set_to_none=True)
-            # AMP: scaler nhân loss lên trước backward để gradient fp16 không underflow về 0,
-            # rồi unscale_ trả về thang thật TRƯỚC khi đo grad norm bên dưới — nếu không, mọi
-            # con số chẩn đoán sẽ bị nhân với scale factor (~65536) và vô nghĩa.
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
 
-            # [THÊM 2026-09-15] Đo ‖∇β‖/‖∇γ‖/‖∇δ‖ NGAY SAU backward, TRƯỚC step() — sau
-            # step() gradient vẫn còn nhưng đã bị optimizer dùng, và zero_grad() đầu vòng
-            # sau sẽ xóa. Đây là phép đo QUYẾT ĐỊNH của cả nghiên cứu: λ cũ chết vì gradient
-            # ~1.1e-17 (log(m)≈0 trên dữ liệu warm). Nếu ∇γ cũng ở bậc 1e-15 thì γ chết y
-            # hệt và phải dừng, không xây tiếp. Cộng ‖·‖ qua MỌI layer vì mỗi layer có β/γ/δ
-            # riêng — nhìn 1 layer có thể bỏ sót layer khác đang học.
             grad_norms = {}
-            for pname in ("beta", "gamma", "delta", "ts_w"):
+            for pname in ("beta", "delta", "ts_w"):
                 total = 0.0
                 for layer in seq_model.decoder.layers:
                     g = getattr(layer.attn, pname).grad
@@ -641,7 +444,7 @@ def train(
 
             if is_main and save_every and step > 0 and step % save_every == 0:
                 save_checkpoint(
-                    ckpt_path, epoch=epoch, step=step + 1,  # +1: step này ĐÃ xong
+                    ckpt_path, epoch=epoch, step=step + 1,
                     global_step=epoch * steps_per_epoch + step + 1, modules=ckpt_modules,
                     optimizer=optimizer, scaler=scaler,
                     config=ckpt_config,
@@ -654,47 +457,22 @@ def train(
                 fwd_msg = f" | fwd%={forward_pct:.0f}"
                 forward_time_acc = 0.0
                 step_time_acc = 0.0
-                # Giá trị |β|/|γ|/|δ| trung bình qua mọi head & layer — cặp với grad norm:
-                # grad cho biết "có tín hiệu học không", giá trị cho biết "đã học được gì
-                # chưa". γ→0 kèm ∇γ→0 = chết (như λ cũ); γ→0 kèm ∇γ lớn = chưa hội tụ.
                 with torch.no_grad():
                     vals = {}
-                    for pname in ("beta", "gamma", "delta", "ts_w"):
+                    for pname in ("beta", "delta", "ts_w"):
                         ps = [getattr(l.attn, pname).abs().mean().item() for l in seq_model.decoder.layers]
                         vals[pname] = sum(ps) / len(ps)
                 tqdm.write(
                     f"epoch={epoch} step={step} loss={loss.item():.4f} "
                     f"retrieval={r_loss.item():.4f} ranking={k_loss.item():.4f} "
-                    f"tau_u={snap['tau_u']:.2f} tau_i={snap['tau_i']:.2f} tau_c={snap['tau_c']:.2f}"
-                    f" | |b|={vals['beta']:.2e} |g|={vals['gamma']:.2e} |d|={vals['delta']:.2e}"
+                    f"tau_u={snap['tau_u']:.2f} tau_i={snap['tau_i']:.2f}"
+                    f" | |b|={vals['beta']:.2e} |d|={vals['delta']:.2e}"
                     f" |ts|={vals['ts_w']:.2e}"
-                    f" gb={grad_norms['beta']:.2e} gg={grad_norms['gamma']:.2e} gd={grad_norms['delta']:.2e}"
+                    f" gb={grad_norms['beta']:.2e} gd={grad_norms['delta']:.2e}"
                     f" gts={grad_norms['ts_w']:.2e}"
                     f"{fwd_msg}"
                 )
-                # [THÊM 2026-09-21] cos.std của collab_embedding — chỉ số DUY NHẤT nói được
-                # bảng collab có học gì không. Với vector ngẫu nhiên độc lập ở dim=d, cosine
-                # giữa 2 hàng bất kỳ có std = 1/√d (dim=64 -> 0.1250). Đo trên 6 checkpoint
-                # cũ: 0.1247-0.1255, tức bảng chưa bao giờ rời khỏi nhiễu khởi tạo. Con số
-                # này RỜI KHỎI 0.125 = collab bắt đầu mang thông tin thật.
-                with torch.no_grad():
-                    W = item_embed.collab_embedding.weight
-                    Wn = torch.nn.functional.normalize(W, dim=-1)
-                    g = torch.Generator(device="cpu").manual_seed(0)  # cùng cặp mỗi lần -> so sánh được
-                    ii = torch.randint(0, W.shape[0], (20000,), generator=g).to(W.device)
-                    jj = torch.randint(0, W.shape[0], (20000,), generator=g).to(W.device)
-                    msk = ii != jj
-                    cos_std = (Wn[ii[msk]] * Wn[jj[msk]]).sum(-1).std().item()
-                    tqdm.write(
-                        f"  [collab] cos.std={cos_std:.4f} (nhiễu thuần={1 / W.shape[1] ** 0.5:.4f}) "
-                        f"‖W‖={W.norm(dim=-1).mean():.4f} W.std={W.std():.4f}"
-                        f"{' | WARM-UP đang BẬT' if item_embed.collab_warmup else ''}"
-                    )
 
-        # Lưu CUỐI epoch không phụ thuộc --save-every: đây là checkpoint ta thật sự muốn
-        # giữ (train xong đủ số step), và là thứ --eval-only sẽ nạp lại.
-        # DDP: chỉ rank 0 ghi (mọi rank có tham số GIỐNG hệt nhau sau all-reduce), các rank
-        # khác chờ ở barrier để không chạy tiếp khi file đang được viết dở.
         if is_main:
             save_checkpoint(
                 ckpt_path, epoch=epoch + 1, step=0,
@@ -706,9 +484,6 @@ def train(
         if ddp:
             torch.distributed.barrier()
 
-        # --- eval trên val sau MỖI epoch — Recall/NDCG@K tách theo 4 nhóm cold-start ---
-        # DDP: chỉ rank 0 chạy eval. Chia eval cho nhiều rank rồi gộp lại phức tạp hơn giá
-        # trị nó mang lại (~8 phút/epoch), và bản báo cáo phải đến từ MỘT nguồn để đọc được.
         if not is_main:
             continue
         evaluate(
@@ -716,14 +491,12 @@ def train(
             item_n_cache, category_n_cache, num_negatives, batch_size, device,
             max_batches=max_steps_per_epoch, static_user_weight=static_user_weight,
             num_workers=num_workers, log_user_maturity=log_user_maturity,
+            pmi_table=pmi_table,
         )
 
     cleanup_ddp(ddp)
 
 
-# Mọi module có tham số học được + cả 2 optimizer. THIẾU bất kỳ cái nào là resume ra
-# model khác: τ (LearnableThresholds) quyết định item_weight/user_weight, retrieval/ranking
-# head có bảng riêng — bỏ sót chúng thì nạp lại xong metric lệch mà không báo lỗi gì.
 _CKPT_MODULES = ("item_embed", "seq_model", "profile_embed", "thresholds",
                  "retrieval_loss_fn", "ranking_loss_fn")
 
@@ -736,18 +509,7 @@ def cleanup_ddp(ddp: bool) -> None:
 
 def save_checkpoint(path: Path, *, epoch: int, step: int, global_step: int,
                     modules: dict, optimizer, scaler, config: dict) -> None:
-    """Lưu đủ để train tiếp ĐÚNG chỗ đã dừng, không chỉ để eval.
-
-    Lưu cả optimizer state: Adam mang exp_avg/exp_avg_sq: bỏ đi thì resume xong momentum
-    reset về 0 và loss nhảy vọt vài trăm step — nhìn như model hỏng, thực ra chỉ là mất
-    trạng thái optimizer.
-
-    `config` giữ các cờ ablation (use_gamma/use_beta/static_user_weight/...). Nạp lại mà
-    cấu hình lệch thì state_dict vẫn khớp shape nhưng model chạy CƠ CHẾ KHÁC — đúng loại
-    lỗi âm thầm đã tốn của ta nhiều lần chạy. load_checkpoint() so và báo.
-
-    Ghi ra .tmp rồi rename: Kaggle ngắt session giữa lúc ghi sẽ để lại file hỏng, và ta chỉ
-    phát hiện lúc nạp — sau khi đã mất phiên train."""
+    """Lưu đủ để train tiếp ĐÚNG chỗ đã dừng, không chỉ để eval."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     blob = {
@@ -764,16 +526,11 @@ def save_checkpoint(path: Path, *, epoch: int, step: int, global_step: int,
 
 def load_checkpoint(path: Path, *, modules: dict, optimizer=None, scaler=None,
                     config: dict | None = None) -> dict:
-    """Nạp checkpoint; trả về {"epoch", "step", "global_step"} để train() chạy tiếp.
-
-    optimizer=None -> chỉ nạp trọng số (đủ cho --eval-only, không cần optimizer state."""
+    """Nạp checkpoint; trả về {"epoch", "step", "global_step"} để train() chạy tiếp."""
     blob = torch.load(Path(path), map_location="cpu", weights_only=False)
 
     if config is not None:
         saved = blob.get("config", {})
-        # [SỬA 2026-09-22] Khoá VẮNG MẶT trong checkpoint cũ không phải lệch cấu hình: cờ
-        # mới thêm sau khi ckpt được lưu (log_user_maturity...) mặc định False, đúng bằng
-        # hành vi của ckpt đó. So sánh None != False sẽ chặn nhầm mọi checkpoint cũ.
         lech = {
             k: (saved.get(k), v)
             for k, v in config.items()
@@ -787,9 +544,6 @@ def load_checkpoint(path: Path, *, modules: dict, optimizer=None, scaler=None,
                              for k, (a, b) in lech.items())
             )
 
-    # Thiếu module trong checkpoint = nạp lại chỉ MỘT PHẦN model, phần còn lại giữ trọng
-    # số khởi tạo ngẫu nhiên. Im lặng bỏ qua thì metric sai mà không có dấu hiệu gì — báo
-    # thẳng còn hơn chẩn đoán ngược từ một con số vô lý.
     thieu = [n for n in _CKPT_MODULES if n not in blob]
     if thieu:
         raise SystemExit(f"[resume] checkpoint THIẾU module: {thieu} — không nạp được")
@@ -804,19 +558,11 @@ def load_checkpoint(path: Path, *, modules: dict, optimizer=None, scaler=None,
 
 
 def _report_history_diagnostic(
-    rank: torch.Tensor,     # (N,) thứ hạng positive, 0 = đứng đầu
-    n_u: torch.Tensor,      # (N,) N_u tại vị trí dự đoán
-    n_cand: torch.Tensor,   # (N,) số candidate
+    rank: torch.Tensor,
+    n_u: torch.Tensor,
+    n_cand: torch.Tensor,
 ) -> None:
-    """LỊCH SỬ DÀI có giúp hay hại? — câu hỏi gốc của chất lượng, không liên quan cold-start.
-
-    Bất thường đo được 2026-09-22: warm_warm (user NHIỀU lịch sử) có median rank 53/100,
-    TỆ HƠN đoán mò (50), trong khi cold_user (ít lịch sử) được 45. Tức càng biết nhiều về
-    user, model dự đoán càng tệ. warm_warm chiếm 138k/141k mẫu nên đây là thứ quyết định
-    gần như toàn bộ metric — quan trọng hơn hẳn ô cold-start.
-
-    Nếu rank xấu đi ĐƠN ĐIỆU theo N_u thì decoder đang xử lý lịch sử dài kém (attention
-    loãng, hoặc u_i/γ phạt user warm). Nếu rank phẳng thì bất thường đến từ chỗ khác."""
+    """LỊCH SỬ DÀI có giúp hay hại? — câu hỏi gốc của chất lượng, không liên quan cold-start."""
     print("\n--- CHẨN ĐOÁN: lịch sử DÀI giúp hay hại? (rank thấp = tốt) ---")
     C = int(n_cand.float().median().item())
     print(f"    ngẫu nhiên -> median≈{C // 2}; N_u = số tương tác của user TẠI vị trí dự đoán")
@@ -832,33 +578,20 @@ def _report_history_diagnostic(
         name = f"{lo}-{hi}" if hi < 10 ** 9 else f"{lo}+"
         print(f"    {name:<14}{n:>8}{r.median():>13.0f}{r.quantile(0.25):>7.0f}"
               f"{r.quantile(0.75):>7.0f}{top:>10.3f}")
-    # tương quan Spearman thô: N_u tăng thì rank tăng (xấu đi) hay giảm?
     ru = torch.argsort(torch.argsort(n_u.float())).float()
     rr = torch.argsort(torch.argsort(rank.float())).float()
     rho = torch.corrcoef(torch.stack([ru, rr]))[0, 1].item()
-    print(f"    tương quan hạng N_u <-> rank: rho={rho:+.4f}  "
-          f"(<0 = lịch sử dài GIÚP; >0 = lịch sử dài HẠI)")
+    print(f"    tương quan hạng N_u <-> rank: rho={rho:+.4f}")
+    print("    CẢNH BÁO: rho>0 KHÔNG có nghĩa lịch sử dài hại — đã chứng minh 2026-09-22 nó")
+    print("    là CONFOUND (user warm xem đồ ngách hơn -> bài khó hơn). Đọc bảng tiếp theo.")
 
 
 def _report_msat_diagnostic(
-    rank: torch.Tensor,   # (N,) thứ hạng positive
-    m_sat: torch.Tensor,  # (N,) tỉ lệ token lịch sử có m_j > 0.95
+    rank: torch.Tensor,
+    m_sat: torch.Tensor,
     n_cand: torch.Tensor,
 ) -> None:
-    """m_j BÃO HOÀ có hại không? — phép thử trước khi quyết định có sửa hay không.
-
-    Đo 2026-09-22: m_j = tanh(N_i/τ_i) bão hoà nặng — 110 item (1.5%) có m > 0.99 nhưng
-    chúng chiếm 21.6% TỔNG LƯỢT XEM, và lịch sử của user điển hình có 31.5% token nằm ở
-    vùng m > 0.95. |log_m| sụp 5.21 (N_i 1-10) -> 0.0218 (N_i 1000+), 239 lần.
-
-    NHƯNG bão hoà tự nó KHÔNG phải bằng chứng — bài học từ 3 giả thuyết sai trước
-    (SparseAdam, cos.std, collab warm-up). Với log_u thì có tương quan rõ (|prod| 1.50 ->
-    0.0015 kèm rank 36 -> 48, đơn điệu). Với m_j thì tương quan N_u <-> tỉ lệ bão hoà là
-    -0.21, tức NGƯỢC dấu: user nhiều lịch sử xem item ÍT phổ biến hơn. Nên m_j không cộng
-    dồn với log_u và không giải thích được nghịch lý theo N_u.
-
-    Bảng này trả lời câu còn lại: nó có phải tổn thất NỀN (đều trên mọi user) không.
-    Rank xấu đi theo tỉ lệ bão hoà -> đáng sửa. Phẳng -> để yên."""
+    """m_j BÃO HOÀ có hại không? — phép thử trước khi quyết định có sửa hay không."""
     print("\n  --- CHẨN ĐOÁN: m_j bão hoà có hại không? ---")
     C = int(n_cand.float().median().item())
     print(f"    m_j > 0.95 = vùng log(m_j) -> 0, β/γ mất tín hiệu; ngẫu nhiên -> median≈{C // 2}")
@@ -878,85 +611,45 @@ def _report_msat_diagnostic(
           f"(>0 = bão hoà m_j HẠI; ≈0 = vô hại, ĐỪNG sửa)")
 
 
-def _report_gate_diagnostic(
-    stats: dict,  # g_i, category_confidence, item_weight, norm_collab/content/content_shrunk
-    is_user_cold: torch.Tensor,
-    is_item_cold: torch.Tensor,
+def _report_confound_diagnostic(
+    rank: torch.Tensor,
+    n_u: torch.Tensor,
+    m_sat: torch.Tensor,
 ) -> None:
-    """In thành phần nội bộ của ItemEmbedding theo nhóm — trả lời 2 câu TRƯỚC khi sửa gate.
+    """"Lịch sử dài gây hại" có THẬT không, hay chỉ là user warm gặp bài KHÓ hơn?"""
+    def _rho(a: torch.Tensor, b: torch.Tensor) -> float:
+        if a.numel() < 30:
+            return float("nan")
+        ra = torch.argsort(torch.argsort(a.float())).float()
+        rb = torch.argsort(torch.argsort(b.float())).float()
+        return torch.corrcoef(torch.stack([ra, rb]))[0, 1].item()
 
-    Công thức hiện tại (item_embedding.py):
-        e_i = g_i·e_collab + (1−g_i)·e_content·c        với g_i = σ(MLP([m, e_collab, e_content]))
-
-    Nghi vấn 1 — GATE có làm đúng việc không? Item cold (m→0) LẼ RA phải đẩy g_i→0 để dựa
-    vào content. Nếu g_i vẫn ≈0.5 hoặc cao ở nhóm item-cold thì gate hỏng, và việc thêm c
-    vào gate không cứu được gì.
-
-    Nghi vấn 2 — c có THẬT SỰ biến thiên không? [ĐÃ TRẢ LỜI + ĐÃ SỬA 2026-09-16] Ban đầu
-    KHÔNG: c kẹt ~0.0006 vì τ_c=53486 sai thang đo (lớn hơn max(N_category)=805 tới 66 lần).
-    Sau khi sửa τ_c=34.0: c p50=0.8165 std=0.4153 — c sống, và τ_c bắt đầu HỌC thật
-    (34.00 -> 34.90 sau 3000 step, trước đó đứng im 53486.10 -> 53486.10).
-
-    Nghi vấn 3 — nhánh content bị co bao nhiêu? [ĐÃ SỬA 2026-09-16] Trước: ‖content‖=18.57
-    -> ‖content·c‖=0.0238, co 780 lần, nhánh content vô hiệu. Sau khi sửa τ_c + bỏ phép nhân
-    (c vào gate thay vì nhân thẳng): ‖content‖=9.01 -> 6.30, co 1.4 lần — đúng mức của một
-    trọng số trộn. Cột này giờ là HỒI QUY: nếu ->co lại nhỏ hơn ‖content‖ hàng trăm lần thì
-    phép nhân đã quay lại (test_item_gate.py::[2] cũng chặn)."""
-    groups = {
-        "warm_warm": (~is_user_cold) & (~is_item_cold),
-        "cold_user_warm_item": is_user_cold & (~is_item_cold),
-        "warm_user_cold_item": (~is_user_cold) & is_item_cold,
-        "cold_cold": is_user_cold & is_item_cold,
-    }
-    print(f"\n  --- CHẨN ĐOÁN gate ItemEmbedding (candidate positive) ---")
-    print("    g_i→1 = tin collab, g_i→0 = tin content; c = category_confidence")
-    for name, mask in groups.items():
-        n = int(mask.sum().item())
-        if n == 0:
-            print(f"    [{name}] n=0")
+    print("\n  --- CHẨN ĐOÁN: 'lịch sử dài hại' là THẬT hay chỉ là ĐỘ KHÓ? ---")
+    print(f"    rho tổng thể (N_u <-> rank) = {_rho(n_u, rank):+.4f}")
+    print(f"    rho (N_u <-> m_sat)         = {_rho(n_u, m_sat):+.4f}  "
+          f"(<0 = user warm xem đồ ÍT phổ biến -> bài khó hơn)")
+    print(f"\n    Khống chế độ khó — rho(N_u <-> rank) TRONG từng tầng m_sat:")
+    print(f"    {'tầng m_sat':<16}{'n':>9}{'rho':>10}{'median rank':>13}")
+    for lo, hi, ten in [(0.0, 0.15, "0-15%"), (0.15, 0.30, "15-30%"),
+                        (0.30, 0.45, "30-45%"), (0.45, 1.01, "45%+")]:
+        k = (m_sat >= lo) & (m_sat < hi)
+        n = int(k.sum())
+        if n < 30:
             continue
-        g = stats["g_i"][mask]
-        c = stats["category_confidence"][mask]
-        m = stats["item_weight"][mask]
-        print(
-            f"    [{name}] n={n} "
-            f"g_i={g.mean():.4f}±{g.std():.4f} "
-            f"c={c.mean():.4f}±{c.std():.4f} "
-            f"m={m.mean():.4f}±{m.std():.4f} | "
-            f"‖collab‖={stats['norm_collab'][mask].mean():.4f} "
-            f"‖content‖={stats['norm_content'][mask].mean():.4f} "
-            f"->co={stats['norm_content_shrunk'][mask].mean():.4f}"
-        )
-    c_all = stats["category_confidence"]
-    print(f"    [toàn bộ] c: min={c_all.min():.4f} p50={c_all.median():.4f} "
-          f"max={c_all.max():.4f} std={c_all.std():.4f}"
-          f"  <- std<0.05 = c vô dụng trong gate (τ_c sai thang đo); "
-          f"đo 2026-09-16 sau khi sửa τ_c=34: p50=0.82 std=0.42")
+        print(f"    {ten:<16}{n:>9}{_rho(n_u[k], rank[k]):>10.4f}{rank[k].float().median():>13.0f}")
+    print("    -> rho sụp về ~0 trong mọi tầng = CONFOUND, không có gì để sửa;")
+    print("       rho giữ nguyên = lịch sử dài hại thật, độc lập độ khó.")
 
 
 def _report_rank_diagnostic(
-    rank: torch.Tensor,        # (N,) thứ hạng positive, 0 = đứng đầu
-    norm_user: torch.Tensor,   # (N,) ‖e_user_eval‖
-    norm_pos: torch.Tensor,    # (N,) ‖e_i của positive‖
-    n_cand: torch.Tensor,      # (N,) số candidate = 1 + num_negatives
+    rank: torch.Tensor,
+    norm_user: torch.Tensor,
+    norm_pos: torch.Tensor,
+    n_cand: torch.Tensor,
     is_user_cold: torch.Tensor,
     is_item_cold: torch.Tensor,
 ) -> None:
-    """In phân bố THỨ HẠNG positive theo nhóm — phân định nguyên nhân recall=0.
-
-    Recall@K chỉ là (rank < K), nó bằng 0 trong HAI tình huống hoàn toàn khác nhau và
-    không cho biết là tình huống nào:
-
-      (a) rank dồn về ĐÁY (median ≈ C−1): positive bị đẩy xuống hệ thống. Nguyên nhân
-          thường là embedding positive bị triệt tiêu (‖e_pos‖→0) hoặc logit NaN/-inf —
-          tức LỖI, không phải chất lượng model.
-      (b) rank RẢI ĐỀU (median ≈ C/2): model đoán mò, không biết gì về item cold. Đó là
-          giới hạn học được thật, không phải bug.
-
-    Cột random= là mốc đối chiếu: median của model ngẫu nhiên hoàn toàn. So median quan
-    sát với nó là đọc được ngay (a) hay (b). ‖e_pos‖ tách riêng để bắt trường hợp
-    embedding cold bị nhân về 0 (xem item_embedding.py: g_i·e_collab + (1−g_i)·e_content
-    ·category_confidence — cả hai nhánh đều co lại khi N nhỏ)."""
+    """In phân bố THỨ HẠNG positive theo nhóm — phân định nguyên nhân recall=0."""
     groups = {
         "warm_warm": (~is_user_cold) & (~is_item_cold),
         "cold_user_warm_item": is_user_cold & (~is_item_cold),
@@ -997,14 +690,13 @@ def evaluate(
     batch_size: int,
     device: torch.device,
     max_batches: int | None = None,
-    static_user_weight: bool = False,  # PHẢI khớp cấu hình lúc train, nếu không train/eval lệch
+    static_user_weight: bool = False,
     num_workers: int = 4,
-    uniform_negatives: bool = False,  # ponytail: candidate uniform thay vì theo tần suất
-    log_user_maturity: bool = False,  # PHẢI khớp lúc train, nếu không train/eval lệch
+    uniform_negatives: bool = False,
+    log_user_maturity: bool = False,
+    pmi_table: torch.Tensor | None = None,
 ) -> None:
-    """Đánh giá Recall/NDCG@K trên split (val/test), tách theo 4 nhóm cold-start — xem
-    eval.py. Dùng đúng candidate-sampling như lúc train (positive + N negative theo tần
-    suất) — KHÔNG rank full-catalog mỗi sample (không khả thi)."""
+    """Đánh giá Recall/NDCG@K trên split (val/test), tách theo 4 nhóm cold-start — xem"""
     dataset = GenRecsysDataset(output_dir, split=split)
     loader = DataLoader(
         dataset, batch_size=batch_size, shuffle=False,
@@ -1017,10 +709,16 @@ def evaluate(
 
     all_metrics: dict[str, list[torch.Tensor]] = {}
     all_user_cold, all_item_cold, all_user_lowhist = [], [], []
-    all_n_u = []  # [2026-09-22] N_u tại vị trí dự đoán — xem _report_history_diagnostic
-    all_m_sat = []  # [2026-09-22] tỉ lệ token có m_j bão hoà — xem _report_msat_diagnostic
-    all_rank, all_norm_user, all_norm_pos, all_n_cand = [], [], [], []  # chẩn đoán, xem dưới
-    all_embed_stats: dict[str, list[torch.Tensor]] = {}  # g_i, c, ‖e_collab‖... của candidate positive
+    all_hist_ids, all_label_id, all_valid = [], [], []
+
+    # (num_items, num_tags) bool — dùng phân loại vị trí tín hiệu. Dựng 1 lần mỗi eval.
+    tag_ids = torch.from_numpy(dataset.item_static["tag_ids"].astype("int64"))
+    item_tag_table = torch.zeros(tag_ids.shape[0], int(tag_ids.max()) + 1, dtype=torch.bool)
+    item_tag_table.scatter_(1, tag_ids, True)
+    item_tag_table[:, 0] = False          # index 0 là padding, không phải tag thật
+    all_n_u = []
+    all_m_sat = []
+    all_rank, all_norm_user, all_norm_pos, all_n_cand = [], [], [], []
 
     total = min(len(loader), max_batches) if max_batches else len(loader)
     for i, batch in enumerate(tqdm(loader, total=total, desc=f"eval[{split}]", unit="batch")):
@@ -1031,34 +729,25 @@ def evaluate(
             batch, dataset, item_embed, seq_model, profile_embed, thresholds, neg_sampler,
             item_n_cache, category_n_cache, num_negatives, device,
             static_user_weight=static_user_weight, uniform_negatives=uniform_negatives,
-            log_user_maturity=log_user_maturity,
+            log_user_maturity=log_user_maturity, pmi_table=pmi_table,
         )
-        # [SỬA 2026-09-15] eval_logit = dot-product THUẦN, KHÔNG trừ log_q. Trước đây dùng
-        # scaled_logit() (có log_q) -> recall@5 = 1.0000 ở ô item-cold, vì log_q cộng ~3.90
-        # điểm cho item hiếm trong khi tín hiệu thật chỉ ±1. log_q chỉ hợp lệ khi mọi
-        # candidate cùng phân phối lấy mẫu — đúng lúc train, SAI lúc eval (positive từ dữ
-        # liệu thật, negative từ tần suất). Xem retrieval.py::eval_logit() docstring.
         eval_logit = retrieval_loss_fn.eval_logit(fwd["e_user_eval"], fwd["cand_e_i"])
 
-        batch_metrics = compute_recall_ndcg_at_k(eval_logit)
-        # [CHẨN ĐOÁN 2026-09-16] Vì sao ô item-cold ra recall=0.0000 TUYỆT ĐỐI? Recall chỉ
-        # nói "có lọt top-K không", không phân biệt HAI nguyên nhân rất khác nhau:
-        #   rank dồn ở đáy (~C-1) -> positive bị ĐẨY xuống hệ thống (embedding hỏng/triệt tiêu)
-        #   rank rải đều 0..C-1   -> model chỉ đơn giản KHÔNG BIẾT item cold (đoán mò)
-        # Giữ rank thô + norm embedding để phân định; in 1 lần ở cuối, không spam mỗi batch.
+        batch_metrics = compute_metrics_at_k(eval_logit)
         order = torch.argsort(eval_logit, dim=1, descending=True)
-        rank = (order == 0).float().argmax(dim=1)  # thứ hạng positive, 0 = đứng đầu
+        rank = (order == 0).float().argmax(dim=1)
         all_rank.append(rank.cpu())
         all_norm_user.append(fwd["e_user_eval"].norm(dim=-1).cpu())
         all_norm_pos.append(fwd["cand_e_i"][:, 0].norm(dim=-1).cpu())
         all_n_cand.append(torch.full_like(rank.cpu(), eval_logit.shape[1]))
-        for k, v in fwd["label_embed_stats"].items():
-            all_embed_stats.setdefault(k, []).append(v.cpu())
         for k, v in batch_metrics.items():
             all_metrics.setdefault(k, []).append(v.cpu())
         all_user_cold.append(fwd["is_user_cold"])
         all_item_cold.append(fwd["is_item_cold"])
         all_user_lowhist.append(fwd["is_user_lowhistory"])
+        all_hist_ids.append(fwd["hist_video_ids"])
+        all_label_id.append(fwd["label_video_id"])
+        all_valid.append(fwd["hist_valid_mask"].cpu())
         all_n_u.append(fwd["n_u_at_pred"])
         all_m_sat.append(fwd["m_saturated_frac"])
 
@@ -1066,8 +755,6 @@ def evaluate(
     is_user_cold = torch.cat(all_user_cold)
     is_item_cold = torch.cat(all_item_cold)
 
-    # [SỬA 2026-09-15] HAI bảng: strict holdout (zero-shot, n nhỏ) + few-shot (nơi γ thật
-    # sự học được). Không gộp — hai định nghĩa trả lời hai câu hỏi khác nhau, xem eval.py.
     is_user_lowhist = torch.cat(all_user_lowhist)
     _report_rank_diagnostic(
         torch.cat(all_rank), torch.cat(all_norm_user), torch.cat(all_norm_pos),
@@ -1075,12 +762,24 @@ def evaluate(
     )
     _report_history_diagnostic(torch.cat(all_rank), torch.cat(all_n_u), torch.cat(all_n_cand))
     _report_msat_diagnostic(torch.cat(all_rank), torch.cat(all_m_sat), torch.cat(all_n_cand))
-    _report_gate_diagnostic(
-        {k: torch.cat(v) for k, v in all_embed_stats.items()}, is_user_cold, is_item_cold,
-    )
-    result = aggregate_by_cold_group(per_sample_metrics, is_user_cold, is_item_cold)
-    result_low = aggregate_by_cold_group(per_sample_metrics, is_user_lowhist, is_item_cold)
-    print_eval_report(result, thresholds.get_tau_snapshot(), result_lowhistory=result_low)
+    _report_confound_diagnostic(torch.cat(all_rank), torch.cat(all_n_u), torch.cat(all_m_sat))
+    n_all = next(iter(per_sample_metrics.values())).shape[0]
+    result_overall = aggregate_by_group(
+        per_sample_metrics, {"all": torch.ones(n_all, dtype=torch.bool)})
+
+    # Truc CHINH: tag item dich nam o lich su gan / xa / ca hai / khong dau (formula.md §−1).
+    signal_masks = classify_signal_position(
+        torch.cat(all_hist_ids), torch.cat(all_label_id), torch.cat(all_valid), item_tag_table)
+    result_signal = aggregate_by_group(per_sample_metrics, signal_masks)
+
+    # Lat cat phu: cold user theo hai dinh nghia (strict holdout / few-shot).
+    result_cold = aggregate_by_group(per_sample_metrics, {
+        "warm_user": ~is_user_cold,
+        "cold_user": is_user_cold,
+        "lowhistory": is_user_lowhist,
+    })
+    print_eval_report(result_overall, thresholds.get_tau_snapshot(),
+                      result_signal=result_signal, result_cold=result_cold)
 
     item_embed.train()
     seq_model.train()
@@ -1093,20 +792,20 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-epochs", type=int, default=1)
     parser.add_argument("--max-steps-per-epoch", type=int, default=None)
-    parser.add_argument("--flex-attention", action="store_true", help="THỬ NGHIỆM [2026-09-17]: dùng FlexAttention (kernel fused, không materialize (B,H,L,L)). Chưa kiểm chứng trên T4/Turing — TỰ ĐỘNG quay về đường thủ công nếu kernel lỗi, xem log [flex]")
+    parser.add_argument("--softmax-attn", action="store_true", help="ABLATION (formula.md §4.4): softmax thay cho sigmoid")
+    parser.add_argument("--static-delta", action="store_true", help="ABLATION (formula.md §4.4): delta hằng số thay cho delta_h(x_q)")
+    parser.add_argument("--no-pmi", action="store_true", help="ABLATION: tắt PMI bias")
     parser.add_argument("--no-amp", action="store_true", help="Tắt fp16 autocast + GradScaler (mặc định BẬT trên CUDA). Dùng khi nghi ngờ vấn đề độ chính xác")
     parser.add_argument("--no-profile-token", action="store_true", help="Không prepend e_profile làm token 0 của chuỗi — ablation (xem user_embedding.py)")
     parser.add_argument("--no-interleave", action="store_true", help="Cộng gộp item+action vào 1 token (chuỗi K) thay vì xen kẽ [Φ,a,Φ,a,...] (chuỗi 2K, đúng HSTU) — ablation")
     parser.add_argument("--static-user-weight", action="store_true", help="ABLATION #5: u_i TĨNH per-user (N_u tại điểm dự đoán, broadcast ra K vị trí) thay vì per-position. Thí nghiệm tách bạch đóng góp 'cold-start là đại lượng per-position' — xem run_batch_forward()")
     parser.add_argument("--no-beta", action="store_true", help="ABLATION #3: tắt số hạng β·log m_j trong attention bias")
-    parser.add_argument("--no-gamma", action="store_true", help="ABLATION #4: tắt số hạng TÍCH γ·log(u_i)·log(m_j) — đóng góp chính, ablation quan trọng nhất")
     parser.add_argument("--save-every", type=int, default=None, help="Lưu checkpoint mỗi N step (ngoài lần lưu cuối mỗi epoch, vốn LUÔN chạy). Dùng khi session hay bị ngắt giữa chừng")
     parser.add_argument("--save-path", default=None, help="Đường dẫn checkpoint; mặc định <output-dir>/ckpt.pt. Trên Kaggle nên trỏ vào /kaggle/working (output-dir có thể read-only)")
     parser.add_argument("--resume", default=None, help="Nạp checkpoint và train TIẾP từ đúng step đã dừng (gồm cả optimizer state)")
     parser.add_argument("--num-workers", type=int, default=4, help="Worker nạp dữ liệu (mặc định 4). Nghẽn là CPU chứ không phải GPU — đặt 0 để debug hoặc khi môi trường không cho fork")
     parser.add_argument("--eval-only", action="store_true", help="Không train, chỉ nạp checkpoint (--resume/--save-path) và chạy evaluate() — dùng để chạy lại chẩn đoán trên CÙNG model, ~8 phút thay vì train lại ~2 giờ")
-    parser.add_argument("--log-user-maturity", action="store_true", help="SỬA GỐC [2026-09-22]: dùng log1p(N_u)-log1p(τ_u) thay log(tanh(N_u/τ_u)) cho log_u trong attention bias + FiLM. Cái cũ BÃO HOÀ VỀ 0 với user nhiều lịch sử: |prod| yếu đi 1,000 lần từ N_u 0-20 xuống N_u 301+, và median rank xấu đi đơn điệu 36->48. Nhắm nhóm warm_warm = 138k/141k mẫu")
-    parser.add_argument("--collab-warmup-steps", type=int, default=0, help="SỬA GỐC [2026-09-21]: N global-step ĐẦU train RIÊNG collab_embedding (gate bỏ qua, w_collab=1, content TẮT). Không có nó, gate đóng collab xuống 0.003 trong 50 step đầu và bảng collab kẹt ở nhiễu khởi tạo VĨNH VIỄN (đo: cos.std=0.1254 vs 0.1250 của vector ngẫu nhiên). Thử 300-500. Theo dõi log [collab] cos.std — rời khỏi 0.125 là có tác dụng")
+    parser.add_argument("--log-user-maturity", action="store_true", help="[ĐÃ THỬ, CÓ HẠI — ĐỪNG BẬT] log1p(N_u)-log1p(τ_u) thay log(tanh(N_u/τ_u)) cho log_u. Bão hoà của cái cũ CÓ THẬT (|prod| yếu đi 1,000 lần ở user warm) nhưng KHÔNG phải nguyên nhân rank xấu: train lại cho warm_warm 0.2574->0.2175 (-16%%) và rho(N_u,rank) không nhúc nhích (+0.081->+0.0755, còn tệ hơn: +0.120). Nguyên nhân thật là CONFOUND độ khó — xem _report_confound_diagnostic(). Giữ lại để ablation")
     parser.add_argument("--uniform-negatives", action="store_true", help="CHẨN ĐOÁN [2026-09-21]: eval với candidate rút UNIFORM thay vì theo tần suất. Trả lời: item cold recall=0 vì embedding rác, hay vì luôn phải đấu 100 item warm? Chỉ dùng với --eval-only")
     parser.add_argument("--checkpoint", action="store_true", help="Gradient checkpointing: chậm ~30%%, tiết kiệm ~70%% VRAM. BẮT BUỘC cho nhánh có γ ở batch=256 trên T4 15GB (nếu không sẽ CUDA OOM ở loss.backward)")
     args = parser.parse_args()
@@ -1116,19 +815,19 @@ if __name__ == "__main__":
         num_epochs=args.num_epochs,
         max_steps_per_epoch=args.max_steps_per_epoch,
         amp=not args.no_amp,
-        use_flex=args.flex_attention,
+        use_softmax=args.softmax_attn,
+        static_delta=args.static_delta,
+        use_pmi=not args.no_pmi,
         use_profile_token=not args.no_profile_token,
         interleave=not args.no_interleave,
         static_user_weight=args.static_user_weight,
         use_beta=not args.no_beta,
-        use_gamma=not args.no_gamma,
         use_checkpoint=args.checkpoint,
         save_every=args.save_every,
         save_path=args.save_path,
         resume=args.resume,
         eval_only=args.eval_only,
         uniform_negatives=args.uniform_negatives,
-        collab_warmup_steps=args.collab_warmup_steps,
         log_user_maturity=args.log_user_maturity,
         num_workers=args.num_workers,
     )

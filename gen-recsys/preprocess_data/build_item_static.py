@@ -49,6 +49,27 @@ VIDEO_BASIC_FILE = LOG_DIR / "video_features_basic_pure.csv"
 OUT_DIR = Path(__file__).parent / "output"
 
 
+MAX_TAGS_PER_ITEM = 3  # do duoc tu Pure: 1 tag 75.1%, 2 tag 23.2%, 3 tag 0.4%
+TAG_PAD = 0  # index 0 = "khong co tag" (96 item null) -> padding_idx cua nn.Embedding
+
+
+def _parse_multi_tag(series: pl.Series) -> tuple[np.ndarray, int]:
+    """`tag` la MULTI-LABEL ("20,43") — tach thanh multi-hot thay vi factorize ca chuoi.
+
+    factorize("20,43") cu tao ra 1 ma RIENG, khac ca "20" lan "43": 111 nhan gia thay vi
+    46 tag that, va item chung tag 20 mat lien ket. Tra ve (n_item, MAX_TAGS_PER_ITEM)
+    int32 da pad TAG_PAD, cong 1 de danh index 0 cho padding.
+    """
+    raw = series.cast(pl.Utf8).fill_null("").to_list()
+    lists = [[int(x) for x in s.split(",") if x != ""] for s in raw]
+    vocab = {t: i + 1 for i, t in enumerate(sorted({t for l in lists for t in l}))}
+    out = np.full((len(lists), MAX_TAGS_PER_ITEM), TAG_PAD, dtype=np.int32)
+    for i, l in enumerate(lists):
+        for j, t in enumerate(l[:MAX_TAGS_PER_ITEM]):
+            out[i, j] = vocab[t]
+    return out, len(vocab) + 1
+
+
 def _factorize(series: pl.Series) -> np.ndarray:
     """category id/name -> index liên tục [0, n), null gộp thành 1 code riêng."""
     codes, _ = series.to_pandas().factorize()
@@ -62,6 +83,7 @@ def build_item_static() -> None:
     df = pl.read_csv(VIDEO_BASIC_FILE, columns=basic_cols).sort("video_id")
 
     category_codes = _factorize(df[VIDEO_BASIC_CATEGORY_FIELD])
+    tag_ids, num_tags = _parse_multi_tag(df[VIDEO_BASIC_CATEGORY_FIELD])
     author_idx = _factorize(df["author_id"])
     music_idx = _factorize(df["music_id"])
     video_type_id = _factorize(df["video_type"])
@@ -72,6 +94,7 @@ def build_item_static() -> None:
         dtype=np.dtype([
             ("video_id", np.int64),
             ("category_id", np.int32),
+            ("tag_ids", np.int32, (MAX_TAGS_PER_ITEM,)),
             ("author_idx", np.int32),
             ("music_idx", np.int32),
             ("video_type_id", np.int32),
@@ -80,6 +103,7 @@ def build_item_static() -> None:
     )
     item_static["video_id"] = df["video_id"].to_numpy().astype(np.int64)
     item_static["category_id"] = category_codes
+    item_static["tag_ids"] = tag_ids
     item_static["author_idx"] = author_idx
     item_static["music_idx"] = music_idx
     item_static["video_type_id"] = video_type_id
@@ -90,7 +114,8 @@ def build_item_static() -> None:
     print(
         f"[build_item_static] {len(df)} items -> item_static.npy "
         f"(author={author_idx.max()+1}, music={music_idx.max()+1}, "
-        f"video_type={video_type_id.max()+1}, music_type={music_type_id.max()+1})"
+        f"video_type={video_type_id.max()+1}, music_type={music_type_id.max()+1}, "
+        f"tags={num_tags} multi-hot)"
     )
 
 
