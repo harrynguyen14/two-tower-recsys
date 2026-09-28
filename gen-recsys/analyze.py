@@ -180,7 +180,7 @@ def m4_short_vs_long() -> None:
     rng = np.random.default_rng(SEED)
     logm = np.log(d["cnt_tr"] + 1e-6)            # popularity TRAIN-ONLY
     cat = d["old_cat"]
-    R = {k: [] for k in ("ngan", "dai", "cong", "pop", "oracle")}
+    R = {k: [] for k in ("ngan", "dai", "cong", "max", "nhan", "pop", "oracle")}
 
     for pos, st in iter_eval(50, cap=15000):
         cand = rng.choice(d["n_items"], N_NEG + 1, replace=False)
@@ -195,17 +195,24 @@ def m4_short_vs_long() -> None:
         R["ngan"].append(rank_of_target(fs))
         R["dai"].append(rank_of_target(fl))
         R["cong"].append(rank_of_target(fs + fl))
+        # OR o muc TOKEN (de xuat 2026-09-28): giu token neu ngan HOAC dai bat.
+        # sigmoid de a_s/a_l vao [0,1] truoc khi gop, vi max tren logit tho vo nghia.
+        a_s, a_l = 1 / (1 + np.exp(-fs)), 1 / (1 + np.exp(-fl))
+        R["max"].append(rank_of_target(np.maximum(a_s, a_l)))
+        R["nhan"].append(rank_of_target(a_s * a_l))          # AND — doi chung
         R["pop"].append(rank_of_target(nrm(logm[cand])))
         R["oracle"].append(min(R["ngan"][-1], R["dai"][-1]))
 
     want = {"ngan": (.2617, .2301), "dai": (.2042, .2004), "cong": (.2001, .1946),
-            "pop": (.3087, .1427), "oracle": (.3438, .3191)}
+            "pop": (.3087, .1427), "oracle": (.3438, .3191),
+            "max": (0., 0.), "nhan": (0., 0.)}          # CHUA co ky vong: dang do lan dau
     print(f"  n={len(R['ngan'])}")
-    for k in ("ngan", "dai", "cong", "pop", "oracle"):
+    for k in ("ngan", "dai", "cong", "max", "nhan", "pop", "oracle"):
         r = np.array(R[k])
         hr, mrr = (r <= 10).mean(), (1 / r).mean()
-        f1 = " " if abs(hr - want[k][0]) <= 0.01 else "[!]"
-        f2 = " " if abs(mrr - want[k][1]) <= 0.01 else "[!]"
+        new = k in ("max", "nhan")                # chua co ky vong -> khong gan co
+        f1 = " " if new or abs(hr - want[k][0]) <= 0.01 else "[!]"
+        f2 = " " if new or abs(mrr - want[k][1]) <= 0.01 else "[!]"
         print(f"  {f1}{f2} {k:<8} HR@10={hr:.4f} (ky vong {want[k][0]:.4f})   "
               f"MRR={mrr:.4f} (ky vong {want[k][1]:.4f})")
     print("      => CONG DEU te hon CA HAI thanh phan: tron TINH pha tin hieu")

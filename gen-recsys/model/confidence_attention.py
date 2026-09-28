@@ -64,6 +64,7 @@ class ConfidenceModulatedAttention(nn.Module):
         use_softmax: bool = False,
         static_delta: bool = False,
         use_pmi: bool = True,
+        use_qk: bool = True,
     ):
         super().__init__()
         assert dim % num_heads == 0, "dim phải chia hết cho num_heads"
@@ -74,6 +75,9 @@ class ConfidenceModulatedAttention(nn.Module):
         self.use_softmax = use_softmax
         self.static_delta = static_delta
         self.use_pmi = use_pmi
+        # ABLATION FuXi-beta (arXiv 2508.10615): ho bao BO q.k lai TOT HON tren MovieLens.
+        # Tat q.k => attention chi con cac bias (rab tinh/dong + PMI + maturity + time).
+        self.use_qk = use_qk
 
         self.q_proj = nn.Linear(dim, dim)
         self.k_proj = nn.Linear(dim, dim)
@@ -113,8 +117,12 @@ class ConfidenceModulatedAttention(nn.Module):
         k = self.k_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
 
-        logit = q @ k.transpose(-2, -1)
-        logit.div_(math.sqrt(self.head_dim))
+        if self.use_qk:
+            logit = q @ k.transpose(-2, -1)
+            logit.div_(math.sqrt(self.head_dim))
+        else:
+            # khong co q.k: logit khoi dau = 0, moi tin hieu den TU BIAS.
+            logit = torch.zeros(B, self.num_heads, L, L, dtype=q.dtype, device=q.device)
 
         if log_m is not None and self.use_beta:
             logit.add_(self.beta.view(1, -1, 1, 1) * log_m.view(B, 1, 1, L))

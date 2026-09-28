@@ -43,6 +43,7 @@ class DecoderBlock(nn.Module):
         use_softmax: bool = False,
         static_delta: bool = False,
         use_pmi: bool = True,
+        use_qk: bool = True,
     ):
         super().__init__()
         self.film = ConditionalFiLM(dim, profile_dim) if profile_dim is not None else None
@@ -50,6 +51,7 @@ class DecoderBlock(nn.Module):
         self.attn = ConfidenceModulatedAttention(
             dim, num_heads, dropout, max_seq_len=max_seq_len, use_beta=use_beta,
             use_softmax=use_softmax, static_delta=static_delta, use_pmi=use_pmi,
+            use_qk=use_qk,
         )
         self.norm2 = nn.LayerNorm(dim)
         self.ffn = nn.Sequential(
@@ -89,6 +91,7 @@ class SequenceDecoder(nn.Module):
         use_softmax: bool = False,
         static_delta: bool = False,
         use_pmi: bool = True,
+        use_qk: bool = True,
     ):
         super().__init__()
         self.use_checkpoint = use_checkpoint
@@ -97,6 +100,7 @@ class SequenceDecoder(nn.Module):
                 dim, num_heads, ffn_dim, dropout, max_seq_len=max_seq_len,
                 use_beta=use_beta, profile_dim=profile_dim,
                 use_softmax=use_softmax, static_delta=static_delta, use_pmi=use_pmi,
+                use_qk=use_qk,
             )
             for _ in range(num_layers)
         ])

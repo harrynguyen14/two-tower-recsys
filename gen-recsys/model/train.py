@@ -243,6 +243,7 @@ def train(
     use_softmax: bool = False,
     static_delta: bool = False,
     use_pmi: bool = True,
+    use_qk: bool = True,
     use_profile_token: bool = True,
     interleave: bool = True,
     static_user_weight: bool = False,
@@ -309,7 +310,7 @@ def train(
         dim=dim, num_heads=num_heads, num_layers=num_layers, ffn_dim=ffn_dim,
         max_seq_len=(2 * MAX_SEQ_LEN if interleave else MAX_SEQ_LEN) + 1, interleave=interleave,
         use_beta=use_beta, use_checkpoint=use_checkpoint,
-        use_softmax=use_softmax, static_delta=static_delta, use_pmi=use_pmi,
+        use_softmax=use_softmax, static_delta=static_delta, use_pmi=use_pmi, use_qk=use_qk,
     ).to(device, non_blocking=True)
     profile_config = UserProfileConfig(
         onehot_num_categories=train_dataset.onehot_num_categories, dim=dim,
@@ -357,7 +358,7 @@ def train(
     ckpt_config = {
         "dim": dim, "num_heads": num_heads, "num_layers": num_layers, "ffn_dim": ffn_dim,
         "amp": amp, "use_softmax": use_softmax, "static_delta": static_delta,
-        "use_pmi": use_pmi, "use_profile_token": use_profile_token,
+        "use_pmi": use_pmi, "use_qk": use_qk, "use_profile_token": use_profile_token,
         "interleave": interleave, "static_user_weight": static_user_weight,
         "log_user_maturity": log_user_maturity,
         "use_beta": use_beta,
@@ -795,6 +796,9 @@ if __name__ == "__main__":
     parser.add_argument("--softmax-attn", action="store_true", help="ABLATION (formula.md §4.4): softmax thay cho sigmoid")
     parser.add_argument("--static-delta", action="store_true", help="ABLATION (formula.md §4.4): delta hằng số thay cho delta_h(x_q)")
     parser.add_argument("--no-pmi", action="store_true", help="ABLATION: tắt PMI bias")
+    parser.add_argument("--no-qk", action="store_true",
+                        help="ABLATION FuXi-beta (arXiv 2508.10615): bo han q.k, attention chi "
+                             "con bias. Ho bao bo q.k TOT HON tren MovieLens — kiem tren KuaiRand.")
     parser.add_argument("--no-amp", action="store_true", help="Tắt fp16 autocast + GradScaler (mặc định BẬT trên CUDA). Dùng khi nghi ngờ vấn đề độ chính xác")
     parser.add_argument("--no-profile-token", action="store_true", help="Không prepend e_profile làm token 0 của chuỗi — ablation (xem user_embedding.py)")
     parser.add_argument("--no-interleave", action="store_true", help="Cộng gộp item+action vào 1 token (chuỗi K) thay vì xen kẽ [Φ,a,Φ,a,...] (chuỗi 2K, đúng HSTU) — ablation")
@@ -818,6 +822,7 @@ if __name__ == "__main__":
         use_softmax=args.softmax_attn,
         static_delta=args.static_delta,
         use_pmi=not args.no_pmi,
+        use_qk=not args.no_qk,
         use_profile_token=not args.no_profile_token,
         interleave=not args.no_interleave,
         static_user_weight=args.static_user_weight,

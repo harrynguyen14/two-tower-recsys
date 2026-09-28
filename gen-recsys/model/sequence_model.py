@@ -24,6 +24,7 @@ class SequenceModel(nn.Module):
         use_softmax: bool = False,
         static_delta: bool = False,
         use_pmi: bool = True,
+        use_qk: bool = True,
     ):
         super().__init__()
         self.dim = dim
@@ -36,7 +37,7 @@ class SequenceModel(nn.Module):
         self.decoder = SequenceDecoder(
             dim, num_heads, num_layers, ffn_dim, dropout, max_seq_len=max_seq_len,
             use_beta=use_beta, use_checkpoint=use_checkpoint, profile_dim=dim,
-            use_softmax=use_softmax, static_delta=static_delta, use_pmi=use_pmi,
+            use_softmax=use_softmax, static_delta=static_delta, use_pmi=use_pmi, use_qk=use_qk,
         )
 
     def forward(
