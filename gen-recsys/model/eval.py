@@ -87,6 +87,80 @@ def aggregate_by_group(
     return result
 
 
+def cold_vs_warm_matched(
+    per_sample_metrics: dict[str, torch.Tensor],
+    is_user_cold: torch.Tensor,
+    n_u: torch.Tensor,
+    metric: str = "hr@10",
+) -> dict[str, dict[str, float]]:
+    """So cold vs warm KHOP THEO n_u — lat cat cold DUY NHAT so sanh duoc.
+
+    Vi sao can (do 2026-09-29, `probes/probe_cold_vs_warm_matched.py`): lat cat
+    `cold_user`/`warm_user` tho KHONG so sanh duoc vi hai nhom cham o VI TRI CHUOI khac
+    nhau — median n_u cold=20 vs warm=69; 51% cold co n_u<=20 so voi 7% warm (lech 6.9x).
+    Du doan tuong tac thu 20 DE HON thu 69, nen cold cao hon warm la artefact cua thiet ke
+    lat cat, khong phai ket qua.
+
+    Cach sua: chia tang n_u, tinh metric trong TUNG tang, roi gop lai bang trung binh co
+    trong so theo so sample WARM cua tang do (direct standardisation — chuan hoa cold ve
+    dung phan bo n_u cua warm). Ket qua tra ve co khoa `cold_std` so sanh truc tiep duoc
+    voi `warm`.
+    """
+    bins = [(0, 5), (6, 20), (21, 50), (51, 100), (101, 300), (301, 10 ** 9)]
+    out: dict[str, dict[str, float]] = {}
+    vals = per_sample_metrics[metric]
+    num = num_w = den = 0.0
+    for lo, hi in bins:
+        in_bin = (n_u >= lo) & (n_u <= hi)
+        c, w = in_bin & is_user_cold, in_bin & ~is_user_cold
+        nc, nw = int(c.sum()), int(w.sum())
+        out[f"n_u {lo}-{hi if hi < 10 ** 9 else '+'}"] = {
+            "n_samples": nc + nw,
+            "n_cold": nc, "n_warm": nw,
+            f"cold_{metric}": float(vals[c].mean()) if nc else float("nan"),
+            f"warm_{metric}": float(vals[w].mean()) if nw else float("nan"),
+        }
+        # Chuan hoa: chi cong tang co DU sample CA HAI ben (n>=30). CA HAI phia deu phai
+        # cong tren CUNG tap tang, neu khong thi lai so hai phan bo khac nhau (bug da bat
+        # duoc bang kiem dinh tong hop 2026-09-29).
+        if nc >= 30 and nw >= 30:
+            num += float(vals[c].mean()) * nw
+            num_w += float(vals[w].mean()) * nw
+            den += nw
+    n_cold_tot, n_warm_tot = int(is_user_cold.sum()), int((~is_user_cold).sum())
+    out["TONG"] = {
+        "n_samples": n_cold_tot + n_warm_tot,
+        "n_cold": n_cold_tot, "n_warm": n_warm_tot,
+        f"cold_{metric}": float(vals[is_user_cold].mean()) if n_cold_tot else float("nan"),
+        f"warm_{metric}": float(vals[~is_user_cold].mean()) if n_warm_tot else float("nan"),
+    }
+    out["cold_CHUAN_HOA"] = {
+        "n_samples": int(den),
+        f"cold_{metric}": num / den if den else float("nan"),
+        f"warm_{metric}": num_w / den if den else float("nan"),
+    }
+    return out
+
+
+def print_cold_matched(res: dict[str, dict[str, float]], metric: str = "hr@10") -> None:
+    print()
+    print("  --- COLD vs WARM KHOP n_u (lat cat tho KHONG so sanh duoc, xem eval.py) ---")
+    print(f"    {'tang n_u':<14} {'n_cold':>7} {'n_warm':>8} {'cold':>8} {'warm':>8}   ghi chu")
+    for k, v in res.items():
+        if k in ("TONG", "cold_CHUAN_HOA"):
+            continue
+        c, w = v[f"cold_{metric}"], v[f"warm_{metric}"]
+        note = "n nho, bo qua" if (v["n_cold"] < 30 or v["n_warm"] < 30) else ""
+        print(f"    {k:<14} {v['n_cold']:>7,} {v['n_warm']:>8,} {c:>8.4f} {w:>8.4f}   {note}")
+    t, std = res["TONG"], res["cold_CHUAN_HOA"]
+    print(f"    {'TONG (tho)':<14} {t['n_cold']:>7,} {t['n_warm']:>8,} "
+          f"{t[f'cold_{metric}']:>8.4f} {t[f'warm_{metric}']:>8.4f}   <- KHONG so sanh duoc")
+    cs, ws = std[f"cold_{metric}"], std[f"warm_{metric}"]
+    verdict = "WARM > COLD (dung quy luat)" if ws > cs else "COLD > WARM (VI PHAM quy luat)"
+    print(f"    {'CHUAN HOA':<14} {'':>7} {std['n_samples']:>8,} "
+          f"{cs:>8.4f} {ws:>8.4f}   <- {verdict}")
+
+
 def _ci95(p: float, n: int) -> float:
     """Nửa khoảng tin cậy 95% (xấp xỉ Wald). In kèm mọi hr/recall để KHÔNG ai đọc một
     con số lẻ trên nhóm n nhỏ rồi kết luận."""

@@ -31,8 +31,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "preprocess_data"))
 from build_n_cumulative import build_n_cache, lookup_n_at_t_batch_cached
 
 from dataset import ACTION_VECTOR_FIELDS, GenRecsysDataset, ITEM_CATEGORICAL_FIELDS, MAX_SEQ_LEN
-from eval import (aggregate_by_group, classify_signal_position, compute_metrics_at_k,
-                  print_eval_report)
+from eval import (aggregate_by_group, classify_signal_position, cold_vs_warm_matched,
+                  compute_metrics_at_k, print_cold_matched, print_eval_report)
 from item_embedding import ItemEmbedding, ItemEmbeddingConfig
 from learnable_thresholds import LearnableThresholds
 from negative_sampler import NegativeSampler
@@ -781,6 +781,10 @@ def evaluate(
     })
     print_eval_report(result_overall, thresholds.get_tau_snapshot(),
                       result_signal=result_signal, result_cold=result_cold)
+
+    # Lat cat cold DUY NHAT so sanh duoc: khop n_u (do 2026-09-29, xem eval.py).
+    print_cold_matched(cold_vs_warm_matched(
+        per_sample_metrics, is_user_cold, torch.cat(all_n_u)))
 
     item_embed.train()
     seq_model.train()
