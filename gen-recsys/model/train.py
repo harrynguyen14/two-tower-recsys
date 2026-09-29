@@ -244,6 +244,7 @@ def train(
     static_delta: bool = False,
     use_pmi: bool = True,
     use_qk: bool = True,
+    num_user_vectors: int = 1,
     use_profile_token: bool = True,
     interleave: bool = True,
     static_user_weight: bool = False,
@@ -318,7 +319,8 @@ def train(
     )
     profile_embed = UserProfileEmbedding(profile_config).to(device, non_blocking=True)
     thresholds = LearnableThresholds().to(device, non_blocking=True)
-    retrieval_loss_fn = RetrievalLoss(dim=dim, t_base=t_base).to(device, non_blocking=True)
+    retrieval_loss_fn = RetrievalLoss(dim=dim, t_base=t_base,
+                                      num_user_vectors=num_user_vectors).to(device, non_blocking=True)
     ranking_loss_fn = RankingLoss(dim=dim).to(device, non_blocking=True)
     neg_sampler = NegativeSampler(output_dir, num_items=num_items)
 
@@ -358,7 +360,8 @@ def train(
     ckpt_config = {
         "dim": dim, "num_heads": num_heads, "num_layers": num_layers, "ffn_dim": ffn_dim,
         "amp": amp, "use_softmax": use_softmax, "static_delta": static_delta,
-        "use_pmi": use_pmi, "use_qk": use_qk, "use_profile_token": use_profile_token,
+        "use_pmi": use_pmi, "use_qk": use_qk, "num_user_vectors": num_user_vectors,
+        "use_profile_token": use_profile_token,
         "interleave": interleave, "static_user_weight": static_user_weight,
         "log_user_maturity": log_user_maturity,
         "use_beta": use_beta,
@@ -719,6 +722,7 @@ def evaluate(
     item_tag_table[:, 0] = False          # index 0 là padding, không phải tag thật
     all_n_u = []
     all_m_sat = []
+    all_uv_cos: list[float] = []
     all_rank, all_norm_user, all_norm_pos, all_n_cand = [], [], [], []
 
     total = min(len(loader), max_batches) if max_batches else len(loader)
@@ -733,6 +737,8 @@ def evaluate(
             log_user_maturity=log_user_maturity, pmi_table=pmi_table,
         )
         eval_logit = retrieval_loss_fn.eval_logit(fwd["e_user_eval"], fwd["cand_e_i"])
+        if retrieval_loss_fn.num_user_vectors > 1:
+            all_uv_cos.append(retrieval_loss_fn.user_vector_cosine(fwd["e_user_eval"]))
 
         batch_metrics = compute_metrics_at_k(eval_logit)
         order = torch.argsort(eval_logit, dim=1, descending=True)
@@ -751,6 +757,14 @@ def evaluate(
         all_valid.append(fwd["hist_valid_mask"].cpu())
         all_n_u.append(fwd["n_u_at_pred"])
         all_m_sat.append(fwd["m_saturated_frac"])
+
+    if all_uv_cos:
+        # CHI SO THOAI HOA: cosine -> 1 nghia la M vector da hoi tu ve mot, M chi ton tham so.
+        c = sum(all_uv_cos) / len(all_uv_cos)
+        flag = "  [!] DA THOAI HOA ve mot vector" if c > 0.95 else ""
+        print()
+        print(f"  --- MULTI-VECTOR: cosine trung binh giua "
+              f"{retrieval_loss_fn.num_user_vectors} vector user = {c:.4f}{flag}")
 
     per_sample_metrics = {k: torch.cat(v) for k, v in all_metrics.items()}
     is_user_cold = torch.cat(all_user_cold)
@@ -800,6 +814,10 @@ if __name__ == "__main__":
     parser.add_argument("--softmax-attn", action="store_true", help="ABLATION (formula.md §4.4): softmax thay cho sigmoid")
     parser.add_argument("--static-delta", action="store_true", help="ABLATION (formula.md §4.4): delta hằng số thay cho delta_h(x_q)")
     parser.add_argument("--no-pmi", action="store_true", help="ABLATION: tắt PMI bias")
+    parser.add_argument("--num-user-vectors", type=int, default=1,
+                        help="M vector user + max-similarity (formula.md §5). M=1 la ban cu. "
+                             "Nham go nghen nhom `both`: attention tach 2 che do nhin nhung "
+                             "output nen vao 1 vector.")
     parser.add_argument("--no-qk", action="store_true",
                         help="ABLATION FuXi-beta (arXiv 2508.10615): bo han q.k, attention chi "
                              "con bias. Ho bao bo q.k TOT HON tren MovieLens — kiem tren KuaiRand.")
@@ -827,6 +845,7 @@ if __name__ == "__main__":
         static_delta=args.static_delta,
         use_pmi=not args.no_pmi,
         use_qk=not args.no_qk,
+        num_user_vectors=args.num_user_vectors,
         use_profile_token=not args.no_profile_token,
         interleave=not args.no_interleave,
         static_user_weight=args.static_user_weight,

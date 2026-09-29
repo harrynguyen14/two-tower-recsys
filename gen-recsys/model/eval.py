@@ -156,9 +156,19 @@ def print_cold_matched(res: dict[str, dict[str, float]], metric: str = "hr@10") 
     print(f"    {'TONG (tho)':<14} {t['n_cold']:>7,} {t['n_warm']:>8,} "
           f"{t[f'cold_{metric}']:>8.4f} {t[f'warm_{metric}']:>8.4f}   <- KHONG so sanh duoc")
     cs, ws = std[f"cold_{metric}"], std[f"warm_{metric}"]
-    verdict = "WARM > COLD (dung quy luat)" if ws > cs else "COLD > WARM (VI PHAM quy luat)"
+    # So CO TINH SAI SO: nhom cold nho (n~2000 -> +-0.012 o hr@10) nen chenh lech vai %
+    # KHONG phan biet duoc voi 0. So cung `ws > cs` se gan nhan "VI PHAM" cho nhieu.
+    ci = _ci95(cs, max(t["n_cold"], 1))
+    if abs(ws - cs) <= ci:
+        verdict = f"KHONG PHAN BIET DUOC (lech {abs(ws - cs):.4f} <= CI95 {ci:.4f})"
+    elif ws > cs:
+        verdict = "WARM > COLD (dung quy luat)"
+    else:
+        verdict = "COLD > WARM (vuot sai so — can dieu tra)"
     print(f"    {'CHUAN HOA':<14} {'':>7} {std['n_samples']:>8,} "
           f"{cs:>8.4f} {ws:>8.4f}   <- {verdict}")
+    print("    (chuan hoa chi dung tang co n>=30 CA HAI ben; cold hau nhu khong ton tai "
+          "o n_u>50 nen hai nhom chi chong nhau o vung n_u nho)")
 
 
 def _ci95(p: float, n: int) -> float:
