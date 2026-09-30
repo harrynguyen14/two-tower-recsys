@@ -248,6 +248,7 @@ def train(
     use_qk: bool = True,
     num_user_vectors: int = 1,
     routing_reg_weight: float = 0.0,
+    full_ranking: bool = False,
     use_profile_token: bool = True,
     interleave: bool = True,
     static_user_weight: bool = False,
@@ -388,6 +389,7 @@ def train(
             retrieval_loss_fn, item_n_cache, category_n_cache, num_negatives, batch_size, device,
             max_batches=max_steps_per_epoch, static_user_weight=static_user_weight,
             num_workers=num_workers, uniform_negatives=uniform_negatives, pmi_table=pmi_table,
+            full_ranking=full_ranking,
         )
         return
 
@@ -522,7 +524,7 @@ def train(
             item_n_cache, category_n_cache, num_negatives, batch_size, device,
             max_batches=max_steps_per_epoch, static_user_weight=static_user_weight,
             num_workers=num_workers, log_user_maturity=log_user_maturity,
-            pmi_table=pmi_table,
+            pmi_table=pmi_table, full_ranking=full_ranking,
         )
 
     cleanup_ddp(ddp)
@@ -726,6 +728,7 @@ def evaluate(
     uniform_negatives: bool = False,
     log_user_maturity: bool = False,
     pmi_table: torch.Tensor | None = None,
+    full_ranking: bool = False,
 ) -> None:
     """Đánh giá Recall/NDCG@K trên split (val/test), tách theo 4 nhóm cold-start — xem"""
     dataset = GenRecsysDataset(output_dir, split=split)
@@ -752,6 +755,26 @@ def evaluate(
     all_uv_cos: list[float] = []
     all_rank, all_norm_user, all_norm_pos, all_n_cand = [], [], [], []
 
+    # FULL RANKING (Krichene & Rendle KDD 2020): sampled metric KHONG bao toan phat bieu
+    # so sanh ("A tot hon B" co the lat khi do full), nen bang 2x3 do bang 512 negative
+    # CHUA chac giu thu tu. 7583 item du nho de xep hang TOAN BO.
+    # Nhung item embedding KHONG phu thuoc timestamp o nhanh candidate: dong 160/190 deu
+    # vut bo `item_weight` (`label_e_i, _` / `neg_e_i, _`), no chi dung cho history.
+    # => nhung ca catalog MOT LAN, dung lai cho moi batch.
+    all_item_e = None
+    if full_ranking:
+        ids = torch.arange(dataset.item_static.shape[0])
+        ts0 = torch.zeros(ids.shape[0], dtype=torch.int64)
+        with torch.no_grad():
+            chunks = []
+            for lo in range(0, ids.shape[0], 2048):
+                e, _ = embed_items(ids[lo:lo + 2048], ts0[lo:lo + 2048], dataset, item_embed,
+                                   thresholds, item_n_cache, category_n_cache, device)
+                chunks.append(e)
+            all_item_e = torch.cat(chunks, dim=0)          # (num_items, d)
+        print(f"  [full-ranking] xep hang tren TOAN BO {all_item_e.shape[0]:,} item "
+              f"(thay vi {num_negatives + 1} mau)")
+
     total = min(len(loader), max_batches) if max_batches else len(loader)
     for i, batch in enumerate(tqdm(loader, total=total, desc=f"eval[{split}]", unit="batch")):
         if max_batches is not None and i >= max_batches:
@@ -766,7 +789,18 @@ def evaluate(
         # M=1: e_user_eval (B,d). M>1: pool Poly-encoder tu TOAN chuoi -> (B,M,d).
         e_u = fwd["e_user_eval"] if retrieval_loss_fn.num_user_vectors == 1 else \
             retrieval_loss_fn.user_vectors(fwd["pred"], fwd["key_padding_mask"])[0]
-        eval_logit = retrieval_loss_fn.eval_logit(e_u, fwd["cand_e_i"])
+        if full_ranking:
+            # Dat positive vao COT 0 nhu cand_e_i de compute_metrics_at_k khong doi:
+            # cham diem toan catalog, roi hoan vi cot cua item dich ve dau.
+            B_ = e_u.shape[0]
+            cand = all_item_e.unsqueeze(0).expand(B_, -1, -1)
+            eval_logit = retrieval_loss_fn.eval_logit(e_u, cand)      # (B, num_items)
+            lbl = fwd["label_video_id"].to(eval_logit.device).view(-1, 1)
+            pos_col = eval_logit.gather(1, lbl)
+            eval_logit = eval_logit.scatter(1, lbl, eval_logit[:, :1])
+            eval_logit = torch.cat([pos_col, eval_logit[:, 1:]], dim=1)
+        else:
+            eval_logit = retrieval_loss_fn.eval_logit(e_u, fwd["cand_e_i"])
         if retrieval_loss_fn.num_user_vectors > 1:
             all_uv_cos.append(retrieval_loss_fn.user_vector_cosine(e_u))
 
@@ -860,6 +894,13 @@ if __name__ == "__main__":
                              "(formula.md §5). M=1 la ban cu. HAI LAN TRUOC DEU COLLAPSE "
                              "(cosine 0.98) — doc memory gen-recsys-multi-interest-literature "
                              "truoc khi thu lai. Dung KEM --routing-reg-weight.")
+    parser.add_argument("--full-ranking", action="store_true",
+                        help="Eval xep hang tren TOAN BO catalog thay vi 1 positive + "
+                             "--num-negatives mau. Krichene & Rendle (KDD 2020) chung minh "
+                             "sampled metric KHONG bao toan phat bieu so sanh: 'A tot hon B' "
+                             "co the LAT khi do full (BERT4Rec vs SASRec la vi du that). "
+                             "7583 item du nho de xep hang toan bo. SO SE TUT MANH — day la "
+                             "so THAT va so duoc voi literature.")
     parser.add_argument("--routing-reg-weight", type=float, default=0.0,
                         help="RR cua REMI (arXiv 2302.14532 eq.13): phat phuong sai routing "
                              "de bo sparsity. Trong Table 4 cua ho, RR manh hon HAN "
@@ -895,6 +936,7 @@ if __name__ == "__main__":
         use_qk=not args.no_qk,
         num_user_vectors=args.num_user_vectors,
         routing_reg_weight=args.routing_reg_weight,
+        full_ranking=args.full_ranking,
         use_profile_token=not args.no_profile_token,
         interleave=not args.no_interleave,
         static_user_weight=args.static_user_weight,
