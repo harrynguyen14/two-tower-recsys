@@ -31,8 +31,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "preprocess_data"))
 from build_n_cumulative import build_n_cache, lookup_n_at_t_batch_cached
 
 from dataset import ACTION_VECTOR_FIELDS, GenRecsysDataset, ITEM_CATEGORICAL_FIELDS, MAX_SEQ_LEN
-from eval import (aggregate_by_group, classify_signal_position, cold_vs_warm_matched,
-                  compute_metrics_at_k, print_cold_matched, print_eval_report)
+from eval import (aggregate_by_group, classify_signal_position, matched_by_n_u,
+                  compute_metrics_at_k, print_matched, print_eval_report)
 from item_embedding import ItemEmbedding, ItemEmbeddingConfig
 from learnable_thresholds import LearnableThresholds
 from negative_sampler import NegativeSampler
@@ -210,6 +210,8 @@ def run_batch_forward(
         "hist_action": hist_action,
         "hist_valid_mask": hist_valid_mask,
         "e_user_eval": e_user_eval,
+        # Poly-encoder (M>1) pool tu TOAN chuoi, khong chi vi tri cuoi — can ca hai o day.
+        "key_padding_mask": key_padding_mask,
         "cand_e_i": cand_e_i,
         "log_q": log_q,
         "label_action": label_action,
@@ -245,6 +247,7 @@ def train(
     use_pmi: bool = True,
     use_qk: bool = True,
     num_user_vectors: int = 1,
+    routing_reg_weight: float = 0.0,
     use_profile_token: bool = True,
     interleave: bool = True,
     static_user_weight: bool = False,
@@ -361,6 +364,7 @@ def train(
         "dim": dim, "num_heads": num_heads, "num_layers": num_layers, "ffn_dim": ffn_dim,
         "amp": amp, "use_softmax": use_softmax, "static_delta": static_delta,
         "use_pmi": use_pmi, "use_qk": use_qk, "num_user_vectors": num_user_vectors,
+        "routing_reg_weight": routing_reg_weight,
         "use_profile_token": use_profile_token,
         "interleave": interleave, "static_user_weight": static_user_weight,
         "log_user_maturity": log_user_maturity,
@@ -419,6 +423,29 @@ def train(
                     fwd["pred"], fwd["target_e_i"], fwd["neg_e_i"],
                     fwd["target_log_q"], fwd["neg_log_q"], fwd["pair_valid"],
                 )
+
+                if retrieval_loss_fn.num_user_vectors > 1:
+                    # forward_sequence cham MOI vi tri nen KHONG dung den cac `codes`.
+                    # Khong co loss nay thi codes khong nhan gradient nao. Loss o vi tri
+                    # CUOI chuoi — dung cho ham cham diem ma eval dung.
+                    e_u, routing = retrieval_loss_fn.user_vectors(
+                        fwd["pred"], fwd["key_padding_mask"])
+                    r_loss = r_loss + retrieval_loss_fn(
+                        e_u, fwd["cand_e_i"], fwd["log_q"],
+                        torch.zeros(e_u.shape[0], dtype=torch.long, device=e_u.device),
+                    )
+                    # CANH BAO (2026-09-30): loss CHINH (forward_sequence) van la
+                    # dot-product THUAN o moi vi tri => no huan luyen `hidden` de
+                    # dot-product thuan la tot, tuc TRUC TIEP thuong cho collapse.
+                    # Nhanh multi-vector nay chi la PHU, o 1 vi tri. Chua sua duoc vi
+                    # pool toan chuoi chi dinh nghia duoc o vi tri cuoi (ap moi vi tri
+                    # se RO RI tuong lai). Xem memory gen-recsys-multi-interest-literature.
+                    if routing_reg_weight > 0.0:
+                        # RR cua REMI: phat phuong sai routing. Repo goc lambda=100 cho
+                        # ca 3 dataset, nhung ho SUM theo batch con ta MEAN => thang do
+                        # KHAC, phai quet lai chu khong be nguyen 100.
+                        r_loss = r_loss + routing_reg_weight * (
+                            retrieval_loss_fn.routing_regularization(routing))
 
                 binary_labels = fwd["hist_action"][..., BINARY_ACTION_INDICES]
                 k_loss, _ = ranking_loss_fn.forward_sequence(
@@ -736,9 +763,12 @@ def evaluate(
             static_user_weight=static_user_weight, uniform_negatives=uniform_negatives,
             log_user_maturity=log_user_maturity, pmi_table=pmi_table,
         )
-        eval_logit = retrieval_loss_fn.eval_logit(fwd["e_user_eval"], fwd["cand_e_i"])
+        # M=1: e_user_eval (B,d). M>1: pool Poly-encoder tu TOAN chuoi -> (B,M,d).
+        e_u = fwd["e_user_eval"] if retrieval_loss_fn.num_user_vectors == 1 else \
+            retrieval_loss_fn.user_vectors(fwd["pred"], fwd["key_padding_mask"])[0]
+        eval_logit = retrieval_loss_fn.eval_logit(e_u, fwd["cand_e_i"])
         if retrieval_loss_fn.num_user_vectors > 1:
-            all_uv_cos.append(retrieval_loss_fn.user_vector_cosine(fwd["e_user_eval"]))
+            all_uv_cos.append(retrieval_loss_fn.user_vector_cosine(e_u))
 
         batch_metrics = compute_metrics_at_k(eval_logit)
         order = torch.argsort(eval_logit, dim=1, descending=True)
@@ -797,8 +827,19 @@ def evaluate(
                       result_signal=result_signal, result_cold=result_cold)
 
     # Lat cat cold DUY NHAT so sanh duoc: khop n_u (do 2026-09-29, xem eval.py).
-    print_cold_matched(cold_vs_warm_matched(
-        per_sample_metrics, is_user_cold, torch.cat(all_n_u)))
+    n_u_all = torch.cat(all_n_u)
+    print_matched(matched_by_n_u(
+        per_sample_metrics, is_user_cold, ~is_user_cold, n_u_all,
+        name_a="cold", name_b="warm"), expect="b>a")
+
+    # `both` vs `only_short` KHOP n_u — phep do QUYET DINH cho gia thuyet nghen output.
+    # Tho: both 0.0491 < only_short 0.0828, dung lam co so cho ca huong multi-vector.
+    # Nhung `both` median n_u=68 vs only_short=17 (lech 4.0x) va n_u<=10 thi vung `far`
+    # RONG nen KHONG THE vao `both` — dung confound da giet ket luan cold>warm.
+    # Ky vong NEU nghen output la that: both VAN thap hon sau khi khop (a>b sai ky vong).
+    print_matched(matched_by_n_u(
+        per_sample_metrics, signal_masks["both"], signal_masks["only_short"], n_u_all,
+        name_a="both", name_b="onlyshort"), expect="a>b")
 
     item_embed.train()
     seq_model.train()
@@ -815,9 +856,16 @@ if __name__ == "__main__":
     parser.add_argument("--static-delta", action="store_true", help="ABLATION (formula.md §4.4): delta hằng số thay cho delta_h(x_q)")
     parser.add_argument("--no-pmi", action="store_true", help="ABLATION: tắt PMI bias")
     parser.add_argument("--num-user-vectors", type=int, default=1,
-                        help="M vector user + max-similarity (formula.md §5). M=1 la ban cu. "
-                             "Nham go nghen nhom `both`: attention tach 2 che do nhin nhung "
-                             "output nen vao 1 vector.")
+                        help="M vector user, routing kieu ComiRec-SA + argmax readout "
+                             "(formula.md §5). M=1 la ban cu. HAI LAN TRUOC DEU COLLAPSE "
+                             "(cosine 0.98) — doc memory gen-recsys-multi-interest-literature "
+                             "truoc khi thu lai. Dung KEM --routing-reg-weight.")
+    parser.add_argument("--routing-reg-weight", type=float, default=0.0,
+                        help="RR cua REMI (arXiv 2302.14532 eq.13): phat phuong sai routing "
+                             "de bo sparsity. Trong Table 4 cua ho, RR manh hon HAN "
+                             "regularization tren khong gian bieu dien (+28~47%% vs +1~7%%). "
+                             "Repo goc lambda=100 nhung ho SUM theo batch, ta MEAN => PHAI QUET. "
+                             "0 = tat. Chi co tac dung khi --num-user-vectors > 1.")
     parser.add_argument("--no-qk", action="store_true",
                         help="ABLATION FuXi-beta (arXiv 2508.10615): bo han q.k, attention chi "
                              "con bias. Ho bao bo q.k TOT HON tren MovieLens — kiem tren KuaiRand.")
@@ -846,6 +894,7 @@ if __name__ == "__main__":
         use_pmi=not args.no_pmi,
         use_qk=not args.no_qk,
         num_user_vectors=args.num_user_vectors,
+        routing_reg_weight=args.routing_reg_weight,
         use_profile_token=not args.no_profile_token,
         interleave=not args.no_interleave,
         static_user_weight=args.static_user_weight,

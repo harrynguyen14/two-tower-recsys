@@ -87,13 +87,18 @@ def aggregate_by_group(
     return result
 
 
-def cold_vs_warm_matched(
+def matched_by_n_u(
     per_sample_metrics: dict[str, torch.Tensor],
-    is_user_cold: torch.Tensor,
+    mask_a: torch.Tensor,
+    mask_b: torch.Tensor,
     n_u: torch.Tensor,
     metric: str = "hr@10",
+    name_a: str = "cold",
+    name_b: str = "warm",
 ) -> dict[str, dict[str, float]]:
-    """So cold vs warm KHOP THEO n_u — lat cat cold DUY NHAT so sanh duoc.
+    """So hai nhom KHOP THEO n_u — cach DUY NHAT so sanh duoc khi hai nhom cham o
+    vi tri chuoi khac nhau. Dung cho cold/warm VA cho nhom tin hieu (`both` median n_u=68
+    vs `only_short`=17, lech 4.0x — do 2026-09-30, `probes/probe_both_confound.py`).
 
     Vi sao can (do 2026-09-29, `probes/probe_cold_vs_warm_matched.py`): lat cat
     `cold_user`/`warm_user` tho KHONG so sanh duoc vi hai nhom cham o VI TRI CHUOI khac
@@ -107,68 +112,73 @@ def cold_vs_warm_matched(
     voi `warm`.
     """
     bins = [(0, 5), (6, 20), (21, 50), (51, 100), (101, 300), (301, 10 ** 9)]
-    out: dict[str, dict[str, float]] = {}
+    out: dict[str, dict[str, float]] = {"_names": {"a": name_a, "b": name_b}}
     vals = per_sample_metrics[metric]
-    num = num_w = den = 0.0
+    num_a = num_b = den = 0.0
     for lo, hi in bins:
         in_bin = (n_u >= lo) & (n_u <= hi)
-        c, w = in_bin & is_user_cold, in_bin & ~is_user_cold
-        nc, nw = int(c.sum()), int(w.sum())
+        a, b = in_bin & mask_a, in_bin & mask_b
+        na, nb = int(a.sum()), int(b.sum())
         out[f"n_u {lo}-{hi if hi < 10 ** 9 else '+'}"] = {
-            "n_samples": nc + nw,
-            "n_cold": nc, "n_warm": nw,
-            f"cold_{metric}": float(vals[c].mean()) if nc else float("nan"),
-            f"warm_{metric}": float(vals[w].mean()) if nw else float("nan"),
+            "n_samples": na + nb,
+            "n_a": na, "n_b": nb,
+            f"a_{metric}": float(vals[a].mean()) if na else float("nan"),
+            f"b_{metric}": float(vals[b].mean()) if nb else float("nan"),
         }
         # Chuan hoa: chi cong tang co DU sample CA HAI ben (n>=30). CA HAI phia deu phai
         # cong tren CUNG tap tang, neu khong thi lai so hai phan bo khac nhau (bug da bat
-        # duoc bang kiem dinh tong hop 2026-09-29).
-        if nc >= 30 and nw >= 30:
-            num += float(vals[c].mean()) * nw
-            num_w += float(vals[w].mean()) * nw
-            den += nw
-    n_cold_tot, n_warm_tot = int(is_user_cold.sum()), int((~is_user_cold).sum())
+        # duoc bang kiem dinh tong hop 2026-09-29). Trong so = n cua nhom B (nhom THAM CHIEU).
+        if na >= 30 and nb >= 30:
+            num_a += float(vals[a].mean()) * nb
+            num_b += float(vals[b].mean()) * nb
+            den += nb
+    na_tot, nb_tot = int(mask_a.sum()), int(mask_b.sum())
     out["TONG"] = {
-        "n_samples": n_cold_tot + n_warm_tot,
-        "n_cold": n_cold_tot, "n_warm": n_warm_tot,
-        f"cold_{metric}": float(vals[is_user_cold].mean()) if n_cold_tot else float("nan"),
-        f"warm_{metric}": float(vals[~is_user_cold].mean()) if n_warm_tot else float("nan"),
+        "n_samples": na_tot + nb_tot,
+        "n_a": na_tot, "n_b": nb_tot,
+        f"a_{metric}": float(vals[mask_a].mean()) if na_tot else float("nan"),
+        f"b_{metric}": float(vals[mask_b].mean()) if nb_tot else float("nan"),
     }
-    out["cold_CHUAN_HOA"] = {
+    out["CHUAN_HOA"] = {
         "n_samples": int(den),
-        f"cold_{metric}": num / den if den else float("nan"),
-        f"warm_{metric}": num_w / den if den else float("nan"),
+        f"a_{metric}": num_a / den if den else float("nan"),
+        f"b_{metric}": num_b / den if den else float("nan"),
     }
     return out
 
 
-def print_cold_matched(res: dict[str, dict[str, float]], metric: str = "hr@10") -> None:
+def print_matched(res: dict[str, dict[str, float]], metric: str = "hr@10",
+                  expect: str = "b>a") -> None:
+    """In bang khop n_u. `expect` = quan he KY VONG neu quy luat dung ("b>a" hoac "a>b")."""
+    na_, nb_ = res["_names"]["a"], res["_names"]["b"]
     print()
-    print("  --- COLD vs WARM KHOP n_u (lat cat tho KHONG so sanh duoc, xem eval.py) ---")
-    print(f"    {'tang n_u':<14} {'n_cold':>7} {'n_warm':>8} {'cold':>8} {'warm':>8}   ghi chu")
+    print(f"  --- {na_.upper()} vs {nb_.upper()} KHOP n_u "
+          f"(lat cat tho KHONG so sanh duoc, xem eval.py) ---")
+    print(f"    {'tang n_u':<14} {f'n {na_}':>9} {f'n {nb_}':>9} {na_:>9} {nb_:>9}   ghi chu")
     for k, v in res.items():
-        if k in ("TONG", "cold_CHUAN_HOA"):
+        if k in ("TONG", "CHUAN_HOA", "_names"):
             continue
-        c, w = v[f"cold_{metric}"], v[f"warm_{metric}"]
-        note = "n nho, bo qua" if (v["n_cold"] < 30 or v["n_warm"] < 30) else ""
-        print(f"    {k:<14} {v['n_cold']:>7,} {v['n_warm']:>8,} {c:>8.4f} {w:>8.4f}   {note}")
-    t, std = res["TONG"], res["cold_CHUAN_HOA"]
-    print(f"    {'TONG (tho)':<14} {t['n_cold']:>7,} {t['n_warm']:>8,} "
-          f"{t[f'cold_{metric}']:>8.4f} {t[f'warm_{metric}']:>8.4f}   <- KHONG so sanh duoc")
-    cs, ws = std[f"cold_{metric}"], std[f"warm_{metric}"]
-    # So CO TINH SAI SO: nhom cold nho (n~2000 -> +-0.012 o hr@10) nen chenh lech vai %
-    # KHONG phan biet duoc voi 0. So cung `ws > cs` se gan nhan "VI PHAM" cho nhieu.
-    ci = _ci95(cs, max(t["n_cold"], 1))
-    if abs(ws - cs) <= ci:
-        verdict = f"KHONG PHAN BIET DUOC (lech {abs(ws - cs):.4f} <= CI95 {ci:.4f})"
-    elif ws > cs:
-        verdict = "WARM > COLD (dung quy luat)"
+        a, b = v[f"a_{metric}"], v[f"b_{metric}"]
+        note = "n nho, bo qua" if (v["n_a"] < 30 or v["n_b"] < 30) else ""
+        print(f"    {k:<14} {v['n_a']:>9,} {v['n_b']:>9,} {a:>9.4f} {b:>9.4f}   {note}")
+    t, std = res["TONG"], res["CHUAN_HOA"]
+    print(f"    {'TONG (tho)':<14} {t['n_a']:>9,} {t['n_b']:>9,} "
+          f"{t[f'a_{metric}']:>9.4f} {t[f'b_{metric}']:>9.4f}   <- KHONG so sanh duoc")
+    av, bv = std[f"a_{metric}"], std[f"b_{metric}"]
+    # So CO TINH SAI SO: nhom nho (n~2000 -> +-0.012 o hr@10) nen chenh lech vai %
+    # KHONG phan biet duoc voi 0. So cung se gan nhan "VI PHAM" cho nhieu.
+    ci = _ci95(av, max(min(t["n_a"], t["n_b"]), 1))
+    hi, lo = (bv, av) if expect == "b>a" else (av, bv)
+    hi_n, lo_n = (nb_, na_) if expect == "b>a" else (na_, nb_)
+    if abs(bv - av) <= ci:
+        verdict = f"KHONG PHAN BIET DUOC (lech {abs(bv - av):.4f} <= CI95 {ci:.4f})"
+    elif hi > lo:
+        verdict = f"{hi_n.upper()} > {lo_n.upper()} (dung ky vong)"
     else:
-        verdict = "COLD > WARM (vuot sai so — can dieu tra)"
-    print(f"    {'CHUAN HOA':<14} {'':>7} {std['n_samples']:>8,} "
-          f"{cs:>8.4f} {ws:>8.4f}   <- {verdict}")
-    print("    (chuan hoa chi dung tang co n>=30 CA HAI ben; cold hau nhu khong ton tai "
-          "o n_u>50 nen hai nhom chi chong nhau o vung n_u nho)")
+        verdict = f"{lo_n.upper()} > {hi_n.upper()} (NGUOC ky vong — vuot sai so, can dieu tra)"
+    print(f"    {'CHUAN HOA':<14} {'':>9} {std['n_samples']:>9,} "
+          f"{av:>9.4f} {bv:>9.4f}   <- {verdict}")
+    print(f"    (chuan hoa chi dung tang co n>=30 CA HAI ben, trong so theo n cua {nb_})")
 
 
 def _ci95(p: float, n: int) -> float:
