@@ -30,7 +30,7 @@ class GenRecsysDataset(Dataset):
     """split = "train" | "val" | "test" — đọc {split}.npy (Pass 5) làm danh sách sample,"""
 
     def __init__(self, output_dir: str | Path, split: str, max_seq_len: int = MAX_SEQ_LEN,
-                 random_window: bool = False, seed: int = 0):
+                 random_window: bool = False, seed: int = 0, use_caption: bool = True):
         self.output_dir = Path(output_dir)
         self.max_seq_len = max_seq_len
         # CUA SO TRUOT (chi train): xem docstring _window_start.
@@ -48,8 +48,24 @@ class GenRecsysDataset(Dataset):
         self.history_action = np.load(self.output_dir / "history_action_vectors.npy", mmap_mode="r")
 
         self.item_static = np.load(self.output_dir / "item_static.npy", mmap_mode="r")
-        self.caption_embeddings = np.load(self.output_dir / "caption_embeddings.npy", mmap_mode="r")
-        self.caption_has_caption = np.load(self.output_dir / "caption_has_caption.npy", mmap_mode="r")
+        # [SUA 2026-10-08] Caption la OPTIONAL. Tat bang `use_caption=False` (co --no-caption)
+        # HOAC tu dong tat khi thieu file — tren 27K `caption_embeddings.npy` nang 22.9 GB
+        # fp16 (32,038,725 x 384) va phai encode ~15.4h, nen can chay thu model TRUOC khi
+        # cho encode xong. Truoc day thieu file la FileNotFoundError chet ngay o __init__.
+        cap_emb = self.output_dir / "caption_embeddings.npy"
+        cap_has = self.output_dir / "caption_has_caption.npy"
+        self.use_caption = use_caption and cap_emb.exists() and cap_has.exists()
+        if self.use_caption:
+            self.caption_embeddings = np.load(cap_emb, mmap_mode="r")
+            self.caption_has_caption = np.load(cap_has, mmap_mode="r")
+            self.caption_dim = int(self.caption_embeddings.shape[1])
+        else:
+            self.caption_embeddings = None
+            self.caption_has_caption = None
+            self.caption_dim = 0
+            if use_caption:
+                print(f"[dataset] KHONG thay caption_embeddings.npy trong {self.output_dir}"
+                      f" => nhanh caption TAT (GMU con 4 modality)")
 
         names = self.item_static.dtype.names
         self.has_category_levels = all(f in names for f in CATEGORY_LEVEL_FIELDS)
@@ -194,8 +210,15 @@ class GenRecsysDataset(Dataset):
         """Tra item_static cho 1 tensor video_id bất kỳ (dùng cho cả token lịch sử lẫn"""
         idx = video_ids.numpy()
         rows = self.item_static[idx]
-        caption_embedding = np.array(self.caption_embeddings[idx], dtype=np.float32)
-        caption_mask = np.array(self.caption_has_caption[idx], dtype=np.float32)
+        if self.use_caption:
+            caption_embedding = np.array(self.caption_embeddings[idx], dtype=np.float32)
+            caption_mask = np.array(self.caption_has_caption[idx], dtype=np.float32)
+        else:
+            # Caption TAT: tra tensor rong (B, 0) — ItemEmbedding khong dua key `caption` vao
+            # GMU nen hai field nay khong duoc doc; giu chung trong dict de collate_fn va
+            # chu ky forward() khong phai doi theo co.
+            caption_embedding = np.zeros((len(idx), 0), dtype=np.float32)
+            caption_mask = np.zeros(len(idx), dtype=np.float32)
         return {
             "category_ids": {
                 field: torch.from_numpy(rows[field].astype(np.int64)) for field in ITEM_CATEGORICAL_FIELDS

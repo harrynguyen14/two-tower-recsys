@@ -320,6 +320,10 @@ def train(
     max_seq_len: int = MAX_SEQ_LEN,
     random_window: bool = True,
     no_tag: bool = False,
+    # [THEM 2026-10-08] Bo nhanh caption khoi GMU. Dung de chay thu model KHI CHUA CO
+    # caption_embeddings.npy (tren 27K: 22.9 GB fp16, encode ~32h). Dataset cung TU DONG
+    # tat khi thieu file, nen co nay chi can khi muon tat DU DA co file (ablation that).
+    no_caption: bool = False,
     no_cat: bool = False,
     no_age: bool = False,
     num_workers: int = 4,
@@ -339,7 +343,8 @@ def train(
     # random_window CHI o train (xem dataset._window_start): eval phai dung cua so ngay
     # truoc diem du doan de khop serving.
     train_dataset = GenRecsysDataset(output_dir, split="train", max_seq_len=max_seq_len,
-                                     random_window=random_window)
+                                     random_window=random_window,
+                                     use_caption=not no_caption)
     train_sampler = (
         torch.utils.data.distributed.DistributedSampler(
             train_dataset, num_replicas=world_size, rank=rank, shuffle=True,
@@ -365,6 +370,10 @@ def train(
         num_items=num_items, num_authors=num_authors, num_music=num_music,
         num_categories=num_categories, num_category_levels=num_category_levels,
         num_tags=train_dataset.num_tags(), use_tag=not no_tag, dim=dim,
+        # `train_dataset.use_caption` da gop ca co --no-caption LAN viec file co ton tai
+        # khong (dataset tu tat khi thieu), nen lay tu day thay vi tu `no_caption`.
+        use_caption=train_dataset.use_caption,
+        caption_dim=train_dataset.caption_dim or 384,
     )
     item_embed = ItemEmbedding(item_config).to(device, non_blocking=True)
 
@@ -429,6 +438,9 @@ def train(
         "max_seq_len": max_seq_len, "eval_negatives": eval_negatives,
         "random_window": random_window,
         "no_tag": no_tag, "no_cat": no_cat, "no_age": no_age,
+        # Lay tu dataset (gop ca co --no-caption lan viec file co ton tai), de checkpoint
+        # ghi dung cau hinh THUC TE da train, khong phai y dinh tren CLI.
+        "use_caption": train_dataset.use_caption,
     }
     ckpt_path = Path(save_path) if save_path else output_dir / "ckpt.pt"
 
@@ -446,7 +458,8 @@ def train(
         evaluate(
             eval_split, output_dir, item_embed, seq_model, neg_sampler,
             retrieval_loss_fn, item_n_cache, category_n_cache, eval_negatives, batch_size, device,
-            pct_table, max_seq_len=max_seq_len, max_batches=max_steps_per_epoch,
+            pct_table, use_caption=train_dataset.use_caption,
+            max_seq_len=max_seq_len, max_batches=max_steps_per_epoch,
             num_workers=num_workers,
             full_ranking=full_ranking,
         )
@@ -556,7 +569,8 @@ def train(
         evaluate(
             eval_split, output_dir, item_embed, seq_model, neg_sampler, retrieval_loss_fn,
             item_n_cache, category_n_cache, eval_negatives, batch_size, device,
-            pct_table, max_seq_len=max_seq_len, max_batches=max_steps_per_epoch,
+            pct_table, use_caption=train_dataset.use_caption,
+            max_seq_len=max_seq_len, max_batches=max_steps_per_epoch,
             num_workers=num_workers, full_ranking=full_ranking,
         )
 
@@ -753,13 +767,15 @@ def evaluate(
     batch_size: int,
     device: torch.device,
     pct_table: tuple[np.ndarray, np.ndarray],
+    use_caption: bool = True,
     max_seq_len: int = MAX_SEQ_LEN,
     max_batches: int | None = None,
     num_workers: int = 4,
     full_ranking: bool = False,
 ) -> None:
     """Đánh giá Recall/NDCG@K trên split (val/test), tách theo 4 nhóm cold-start — xem"""
-    dataset = GenRecsysDataset(output_dir, split=split, max_seq_len=max_seq_len)
+    dataset = GenRecsysDataset(output_dir, split=split, max_seq_len=max_seq_len,
+                               use_caption=use_caption)
     loader = DataLoader(
         dataset, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, pin_memory=(device.type == "cuda"),
@@ -924,6 +940,14 @@ if __name__ == "__main__":
     parser.add_argument("--resume", default=None, help="Nạp checkpoint và train TIẾP từ đúng step đã dừng (gồm cả optimizer state)")
     parser.add_argument("--num-workers", type=int, default=4, help="Worker nạp dữ liệu (mặc định 4). Nghẽn là CPU chứ không phải GPU — đặt 0 để debug hoặc khi môi trường không cho fork")
     parser.add_argument("--eval-only", action="store_true", help="Không train, chỉ nạp checkpoint (--resume/--save-path) và chạy evaluate() — dùng để chạy lại chẩn đoán trên CÙNG model, ~8 phút thay vì train lại ~2 giờ")
+    parser.add_argument("--no-caption", action="store_true",
+                        help="ABLATION (formula.md §1): bo modality `caption` khoi GMU. "
+                             "Dataset TU DONG tat khi thieu caption_embeddings.npy, nen co "
+                             "nay chi can khi muon tat DU DA co file. Tren 27K file do nang "
+                             "22.9 GB fp16 (32,038,725 x 384) va phai encode ~32h, nen day la "
+                             "duong chay thu model truoc khi encode xong. GMU con 4 modality "
+                             "(video_type, music_type, author, music) + nhanh tag + nhanh "
+                             "category 4 cap.")
     parser.add_argument("--eval-split", choices=["val", "test"], default="val",
                         help="Split để eval. 'val' (mặc định) dùng để TUNE và chọn nhánh "
                              "ablation. 'test' chỉ chạy ĐÚNG MỘT LẦN sau khi đã chốt cấu "
@@ -945,6 +969,7 @@ if __name__ == "__main__":
         save_path=args.save_path,
         resume=args.resume,
         eval_only=args.eval_only,
+        no_caption=args.no_caption,
         eval_split=args.eval_split,
         eval_negatives=args.eval_negatives,
         max_seq_len=args.max_seq_len,

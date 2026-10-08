@@ -27,6 +27,7 @@ class ItemEmbeddingConfig:
         num_categories: dict[str, int],
         num_tags: int,
         use_tag: bool = True,
+        use_caption: bool = True,
         num_category_levels: dict[str, int] | None = None,
         dim: int = 64,
         cat_embed_dim: int = 16,
@@ -40,6 +41,13 @@ class ItemEmbeddingConfig:
         self.num_tags = num_tags
         # False = ablation --no-tag: bo nhanh 2, W^fuse bot 1 nhanh (formula.md muc 1)
         self.use_tag = use_tag
+        # [THEM 2026-10-08] False = ablation --no-caption: bo modality `caption` khoi GMU.
+        # Dung de chay duoc KHI CHUA CO caption_embeddings.npy — tren 27K file do nang
+        # 22.9 GB fp16 (32,038,725 x 384) va phai encode ~15.4h, nen can chay thu model
+        # truoc khi cho encode xong. GMU con 4 modality (video_type, music_type, author,
+        # music) + nhanh tag + nhanh category 4 cap, nen content token VAN phan biet duoc
+        # item; gate softmax tu chuan hoa lai tren 4 modality (xem gmu.py).
+        self.use_caption = use_caption
         # None = dataset KHÔNG có category 4 cấp (Pure) => nhánh 3 tắt, W^fuse về d x 2d
         self.num_category_levels = num_category_levels
         self.dim = dim
@@ -63,7 +71,8 @@ class ItemEmbedding(nn.Module):
         gmu_in_dims = {field: config.cat_embed_dim for field in CATEGORICAL_FIELDS}
         gmu_in_dims["author"] = config.id_embed_dim
         gmu_in_dims["music"] = config.id_embed_dim
-        gmu_in_dims["caption"] = config.caption_dim
+        if config.use_caption:
+            gmu_in_dims["caption"] = config.caption_dim
         self.content_gmu = GMU(gmu_in_dims, dim=config.dim)
 
         # tag KHÔNG vào GMU: gate GMU là softmax trên các modality (tổng = 1), nên caption
@@ -110,8 +119,14 @@ class ItemEmbedding(nn.Module):
         gmu_inputs = {field: self.category_embeddings[field](category_ids[field]) for field in CATEGORICAL_FIELDS}
         gmu_inputs["author"] = self.author_embedding(author_idx)
         gmu_inputs["music"] = self.music_embedding(music_idx)
-        gmu_inputs["caption"] = caption_embedding
-        e_item = self.content_gmu(gmu_inputs, masks={"caption": caption_mask})
+        # [SUA 2026-10-08] caption chi vao GMU khi use_caption — xem ItemEmbeddingConfig.
+        # Tat thi KHONG dua key `caption` vao gmu_inputs (GMU hard-code stack theo dung tap
+        # key da khai o __init__, them key la vo trong softmax sai truc).
+        if self.config.use_caption:
+            gmu_inputs["caption"] = caption_embedding
+            e_item = self.content_gmu(gmu_inputs, masks={"caption": caption_mask})
+        else:
+            e_item = self.content_gmu(gmu_inputs)
 
         # `tag` là MULTI-LABEL (75% item 1 tag, 23% có 2, 0.4% có 3) — mean trên các tag
         # THẬT. Item chung tag ⇒ chung một nửa đầu vào của fuse, nên chúng gần nhau ngay
