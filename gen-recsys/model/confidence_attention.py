@@ -76,7 +76,7 @@ class ConfidenceModulatedAttention(nn.Module):
 
     def __init__(
         self, dim: int, num_heads: int, dropout: float = 0.0, max_seq_len: int = 513,
-        use_qk: bool = True,
+        use_qk: bool = True, dynamic_ts: bool = False, static_delta: bool = False,
     ):
         super().__init__()
         assert dim % num_heads == 0, "dim phải chia hết cho num_heads"
@@ -95,13 +95,36 @@ class ConfidenceModulatedAttention(nn.Module):
 
         self.beta = nn.Parameter(torch.zeros(num_heads))
         self.delta = nn.Parameter(torch.zeros(num_heads))
-        self.ts_w = nn.Parameter(torch.zeros(num_heads, NUM_TS_BUCKETS + 1))
+        # W_ts DONG (nang cap 2): bang tra doi tu scalar sang VECTOR, roi dieu bien
+        # theo query. Tinh: ts_w[h, bucket] la mot so. Dong: ts_w[h, bucket] la vector
+        # d chieu, chieu voi g_h(x_q) => "query nay nen nhin o THANG NAO" (phut? gio?
+        # ngay?), khong chi "nhin gan hay xa" nhu delta_h(x_q). Xem formula.md §4.1.
+        self.dynamic_ts = dynamic_ts
+        if dynamic_ts:
+            self.ts_w = nn.Parameter(torch.zeros(num_heads, NUM_TS_BUCKETS + 1, self.head_dim))
+            # g_h(x_q): init zero => khoi dau logit ts = 0 Y HET ts_w=0 cua ban tinh,
+            # nen ban tinh van la nhom doi chung hop le (cung ly le nhu delta_proj).
+            self.ts_gate = nn.Linear(dim, num_heads * self.head_dim)
+            nn.init.zeros_(self.ts_gate.weight)
+            nn.init.zeros_(self.ts_gate.bias)
+        else:
+            self.ts_w = nn.Parameter(torch.zeros(num_heads, NUM_TS_BUCKETS + 1))
 
         # delta ĐỘNG: δ_h(x_q) = δ_h + w_h·x_q. Init zero ⇒ khởi đầu Y HỆT bản tĩnh,
         # nên bản tĩnh vẫn là nhóm đối chứng hợp lệ (formula.md §4.1).
         self.delta_proj = nn.Linear(dim, num_heads)
         nn.init.zeros_(self.delta_proj.weight)
         nn.init.zeros_(self.delta_proj.bias)
+
+        # delta TINH (`--static-delta`): o A1/A3 cua bang 2x2 (formula.md §4.4 nhom A).
+        # Cai lai 2026-10-08 — KHONG khoi phuc tu git (commit cu chua co 5 bug fix).
+        # delta_proj da init ZERO, nen chi can dong bang: weight=0 + khong gradient
+        # => delta_proj(x) luon tra 0 => delta_q = delta_h thuan = DUNG ban tinh.
+        # Khong can nhanh if trong forward.
+        self.static_delta = static_delta
+        if static_delta:
+            self.delta_proj.weight.requires_grad_(False)
+            self.delta_proj.bias.requires_grad_(False)
 
         pos = torch.arange(max_seq_len)
         rel = (pos.view(-1, 1) - pos.view(1, -1)).clamp(min=0).float()
@@ -136,7 +159,18 @@ class ConfidenceModulatedAttention(nn.Module):
         logit.add_(delta_q.unsqueeze(-1) * log_rel)
 
         if ts_bucket is not None:
-            logit = AddTsBias.apply(logit, self.ts_w, ts_bucket)
+            if self.dynamic_ts:
+                # (B,H,L,d): thang thoi gian ma query q muon doc
+                g = self.ts_gate(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+                idx = ts_bucket.reshape(-1).long()
+                for h in range(self.num_heads):
+                    # (B,L,L,d) cho rieng head h — ts_w[h] la (NB,d)
+                    vec = self.ts_w[h].index_select(0, idx).view(B, L, L, self.head_dim)
+                    logit[:, h] = logit[:, h] + torch.einsum(
+                        "bqd,bqpd->bqp", g[:, h].to(vec.dtype), vec
+                    ).to(logit.dtype)
+            else:
+                logit = AddTsBias.apply(logit, self.ts_w, ts_bucket)
 
         causal_mask = torch.triu(torch.ones(L, L, dtype=torch.bool, device=x.device), diagonal=1)
         invalid = causal_mask.view(1, 1, L, L)

@@ -304,6 +304,8 @@ def train(
     max_steps_per_epoch: int | None = None,
     amp: bool = True,
     use_qk: bool = True,
+    dynamic_ts: bool = False,
+    static_delta: bool = False,
     full_ranking: bool = False,
     use_checkpoint: bool = False,
     save_every: int | None = None,
@@ -380,7 +382,8 @@ def train(
     seq_model = SequenceModel(
         dim=dim, num_heads=num_heads, num_layers=num_layers, ffn_dim=ffn_dim,
         max_seq_len=2 * max_seq_len + 1,
-        use_checkpoint=use_checkpoint, use_qk=use_qk,
+        use_checkpoint=use_checkpoint, use_qk=use_qk, dynamic_ts=dynamic_ts,
+        static_delta=static_delta,
         use_age=(train_dataset.has_age and not no_age),
     ).to(device, non_blocking=True)
     retrieval_loss_fn = RetrievalLoss(dim=dim, t_base=t_base).to(device, non_blocking=True)
@@ -434,7 +437,8 @@ def train(
     }
     ckpt_config = {
         "dim": dim, "num_heads": num_heads, "num_layers": num_layers, "ffn_dim": ffn_dim,
-        "amp": amp, "use_qk": use_qk,
+        "amp": amp, "use_qk": use_qk, "dynamic_ts": dynamic_ts,
+        "static_delta": static_delta,
         "max_seq_len": max_seq_len, "eval_negatives": eval_negatives,
         "random_window": random_window,
         "no_tag": no_tag, "no_cat": no_cat, "no_age": no_age,
@@ -904,6 +908,12 @@ if __name__ == "__main__":
     parser.add_argument("--no-qk", action="store_true",
                         help="ABLATION FuXi-beta (arXiv 2508.10615): bo han q.k, attention chi "
                              "con bias. Ho bao bo q.k TOT HON tren MovieLens — kiem tren KuaiRand.")
+    parser.add_argument("--dynamic-ts", action="store_true",
+                        help="W_ts DONG: bang tra vector dieu bien theo query (formula.md §4.1). "
+                             "Mac dinh TINH (scalar moi bucket).")
+    parser.add_argument("--static-delta", action="store_true",
+                        help="delta TINH: dong bang delta_proj o zero => delta_h hang so qua moi "
+                             "query. O A1/A3 cua bang 2x2 (formula.md §4.4 nhom A).")
     parser.add_argument("--no-amp", action="store_true", help="Tắt fp16 autocast + GradScaler (mặc định BẬT trên CUDA). Dùng khi nghi ngờ vấn đề độ chính xác")
     parser.add_argument("--eval-negatives", type=int, default=1024,
                         help="So candidate luc EVAL = 1 positive + (N-1) negative. KHAC "
@@ -963,6 +973,8 @@ if __name__ == "__main__":
         max_steps_per_epoch=args.max_steps_per_epoch,
         amp=not args.no_amp,
         use_qk=not args.no_qk,
+        dynamic_ts=args.dynamic_ts,
+        static_delta=args.static_delta,
         full_ranking=args.full_ranking,
         use_checkpoint=args.checkpoint,
         save_every=args.save_every,

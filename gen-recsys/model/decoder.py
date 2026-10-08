@@ -13,11 +13,14 @@ class DecoderBlock(nn.Module):
     def __init__(
         self, dim: int, num_heads: int, ffn_dim: int, dropout: float = 0.0, max_seq_len: int = 513,
         use_qk: bool = True,
+        dynamic_ts: bool = False,
+        static_delta: bool = False,
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = ConfidenceModulatedAttention(
             dim, num_heads, dropout, max_seq_len=max_seq_len, use_qk=use_qk,
+            dynamic_ts=dynamic_ts, static_delta=static_delta,
         )
         self.norm2 = nn.LayerNorm(dim)
         self.ffn = nn.Sequential(
@@ -48,12 +51,15 @@ class SequenceDecoder(nn.Module):
         dropout: float = 0.0, max_seq_len: int = 513,
         use_checkpoint: bool = False,
         use_qk: bool = True,
+        dynamic_ts: bool = False,
+        static_delta: bool = False,
     ):
         super().__init__()
         self.use_checkpoint = use_checkpoint
         self.layers = nn.ModuleList([
             DecoderBlock(
                 dim, num_heads, ffn_dim, dropout, max_seq_len=max_seq_len, use_qk=use_qk,
+                dynamic_ts=dynamic_ts, static_delta=static_delta,
             )
             for _ in range(num_layers)
         ])
