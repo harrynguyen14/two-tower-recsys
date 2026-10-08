@@ -1,11 +1,16 @@
-"""Orchestrator — chạy toàn bộ 5 pass tiền xử lý KuaiRand-27K theo đúng thứ tự phụ thuộc.
+"""Orchestrator — chạy toàn bộ 4 pass tiền xử lý KuaiRand-27K theo đúng thứ tự phụ thuộc.
+
+[XOÁ 2026-10-06] Pass 4 cũ (`build_user_static` → user_static.npy +
+onehot_num_categories.npy) ĐÃ BỎ. Nó nuôi `static_branch` của `user_embedding.py`, mà file
+đó đã xoá cùng FiLM 2026-10-05 (formula.md §3bis). Sau đó `dataset.get_user_features` chỉ
+còn là hàm không ai gọi, và `user_static.npy` vẫn được load vào mọi Dataset mà không ai đọc.
+`build_user_static.py` xoá hẳn (git giữ lịch sử), cùng 2 hằng chỉ nó dùng ở `schema.py`.
 
 Thứ tự BẮT BUỘC (không đổi):
   Pass 1 (build_n_cumulative)  — N_i/N_u/N_category lũy kế, KHÔNG phụ thuộc pass nào khác
   Pass 2 (build_sequences)     — chuỗi user + label_timestamps, KHÔNG phụ thuộc Pass 1
   Pass 3 (build_item_static)   — item static features, độc lập
-  Pass 4 (build_user_static)   — user static features, độc lập
-  Pass 5 (build_interactions)  — CẦN Pass 1 (tra cứu N_i) VÀ Pass 2 (sequences/labels)
+  Pass 4 (build_interactions)  — CẦN Pass 1 (tra cứu N_i) VÀ Pass 2 (sequences/labels)
                                   đã chạy xong trước, nên luôn chạy CUỐI CÙNG.
 
 Xem D:\\ama-rs\\idea.md mục "TRẠNG THÁI DỰ ÁN" + mục 4.5 cho toàn bộ lý do thiết kế,
@@ -14,19 +19,13 @@ D:\\ama-rs\\gen-recsys (plan file lexical-hopping-lobster.md) cho đặc tả đ
 
 from build_interactions import build_interactions
 from build_item_static import build_item_static
-from build_n_cumulative import (
-    build_category_n_cumulative,
-    build_item_n_cumulative,
-    build_user_n_cumulative,
-)
+from build_n_cumulative import build_category_n_cumulative, build_item_n_cumulative
 from build_sequences import build_sequences
-from build_user_static import build_user_static
 
 
 def main() -> None:
-    print("=== Pass 1: N_i / N_u / N_category lũy kế ===")
+    print("=== Pass 1: N_i / N_category lũy kế ===")
     build_item_n_cumulative()
-    build_user_n_cumulative()  # [THÊM 2026-09-14] u_i per-position, xem build_n_cumulative.py
     build_category_n_cumulative()
 
     print("=== Pass 2: chuỗi hành vi user ===")
@@ -35,10 +34,7 @@ def main() -> None:
     print("=== Pass 3: item static features ===")
     build_item_static()
 
-    print("=== Pass 4: user static features ===")
-    build_user_static()
-
-    print("=== Pass 5: split train/val/test + cờ cold/warm ===")
+    print("=== Pass 4: split train/val/test + cờ cold/warm ===")
     build_interactions()
 
     print("Hoàn tất — xem output/ cho toàn bộ .npy/.npz đã build.")

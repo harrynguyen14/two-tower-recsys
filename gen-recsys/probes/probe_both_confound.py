@@ -1,4 +1,8 @@
-"""Nhom `both` ket (0.0491) — la NGHEN OUTPUT, hay chi la CONFOUND vi tri chuoi + do kho item?
+"""[HO SO 2026-10-05] Probe NAY da tra loi xong: CONFOUND, khong phai nghen output.
+Nhan short/long da BO han (eval.py xoa classify_signal_position) — giu file lam bang chung
+cho ket luan do, khong con chay trong pipeline.
+
+Nhom `both` ket (0.0491) — la NGHEN OUTPUT, hay chi la CONFOUND vi tri chuoi + do kho item?
 
 Nghi phan: `both = near & far` doi hoi tag trung o CA HAI vung. `far` chi ton tai khi chuoi
 dai hon SHORT_WINDOW=10, va cang nhieu item thi cang de trung => `both` THIEN VE user chuoi
@@ -13,7 +17,7 @@ Chay tu gen-recsys/: python probes/probe_both_confound.py
 import sys; sys.path.insert(0, ".")
 import numpy as np, analyze as A
 
-SHORT_WINDOW = 10          # khop eval.py:15
+SHORT_WINDOW = 10          # eval.py da XOA hang so nay 2026-10-05; giu tai cho de probe
 d = A.data()
 sp, su, off, ts, vid = d["sp"], d["su"], d["off"], d["ts"], d["vid"]
 has_tag = d["has_tag"]
@@ -22,7 +26,7 @@ pos, u = sp[idx], su[idx]
 start = off[u]
 n_u = pos - start                                  # so tuong tac TAI thoi diem du doan
 
-# --- phan nhom Y HET eval.classify_signal_position, nhung tren toan bo test ---
+# --- phan nhom Y HET eval.classify_signal_position (DA XOA 2026-10-05), tren toan bo test ---
 # eval.py cat lich su thanh K item cuoi; o day dung toan bo tien su de khong them confound moi.
 near = np.zeros(len(idx), dtype=bool)
 far = np.zeros(len(idx), dtype=bool)

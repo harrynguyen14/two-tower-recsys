@@ -3,7 +3,23 @@
 KHÔNG phải softmax attention cộng bias. Hai tầng cùng phục vụ câu hỏi ở formula.md §−1:
   - kích hoạt sigmoid (thay softmax)  -> ngắn/dài hạn không còn tranh ngân sách
   - delta ĐỘNG theo query             -> mỗi bước tự chọn phạm vi nhìn
-Cờ `use_softmax` / `static_delta` giữ lại để chạy ablation 4 ô (formula.md §4.4).
+[XOÁ 2026-10-06] Cờ `use_softmax` / `static_delta` / `use_beta` ĐÃ BỎ — bảng 2x3 ở
+formula.md §4.4 đã chạy xong nên các nhánh đối chứng hết việc. Chỉ còn `use_qk` (§4 ghi
+cấu hình tốt nhất là BỎ q.k, nên cờ này còn phải chạy được cả hai chiều).
+
+[XOÁ 2026-10-05] Số hạng `mu_h * PPMI(i,j)` ĐÃ BỎ HẲN. Hai lý do:
+
+1. **Model không học nó.** Trong checkpoint đã train đủ (`all-ckp-result.md`), `mu` ở cấu
+   hình đề xuất = **0.521** — kẹt ở init 0.5. Cấu hình softmax thì mu chủ động giảm về
+   0.14. Dưới sigmoid, các bias bớt quan trọng và model dựa vào q.k nhiều hơn.
+2. **Không scale.** Bảng dense N^2 fp16: Pure 115 MB, 27K (N=32,038,693) = **2.05
+   exabyte**. Đã đo cả 3 phương án thay thế, loại cả 3 (formula.md §9b.1): sparse top-128
+   giữ 16% khối lượng mà tốn 24.6 GB; PMI cấp category-2 có R^2 = 0.025 với PMI item.
+
+CẢNH BÁO khi đọc lại: `--no-pmi` CHƯA ai chạy, nên không có phép đo TRỰC TIẾP về việc bỏ
+PMI mất gì. Bằng chứng là mu kẹt ở init — mạnh nhưng GIÁN TIẾP. Căn cứ thêm PMI ban đầu
+(analyze.py:m6_pmi, giữ làm hồ sơ): PMI một mình THUA pop (median rank .284 vs .334) nhưng
+pop+PMI = .557 (+66%) — hai tín hiệu trực giao. Muốn khôi phục thì đọc hai chỗ đó.
 """
 
 from __future__ import annotations
@@ -60,10 +76,6 @@ class ConfidenceModulatedAttention(nn.Module):
 
     def __init__(
         self, dim: int, num_heads: int, dropout: float = 0.0, max_seq_len: int = 513,
-        use_beta: bool = True,
-        use_softmax: bool = False,
-        static_delta: bool = False,
-        use_pmi: bool = True,
         use_qk: bool = True,
     ):
         super().__init__()
@@ -71,12 +83,8 @@ class ConfidenceModulatedAttention(nn.Module):
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.use_beta = use_beta
-        self.use_softmax = use_softmax
-        self.static_delta = static_delta
-        self.use_pmi = use_pmi
         # ABLATION FuXi-beta (arXiv 2508.10615): ho bao BO q.k lai TOT HON tren MovieLens.
-        # Tat q.k => attention chi con cac bias (rab tinh/dong + PMI + maturity + time).
+        # Tat q.k => attention chi con cac bias (rab tinh/dong + maturity + time).
         self.use_qk = use_qk
 
         self.q_proj = nn.Linear(dim, dim)
@@ -95,9 +103,6 @@ class ConfidenceModulatedAttention(nn.Module):
         nn.init.zeros_(self.delta_proj.weight)
         nn.init.zeros_(self.delta_proj.bias)
 
-        # PMI: đo được đỉnh quanh w≈0.5 khi cộng với popularity (formula.md §4.1).
-        self.mu = nn.Parameter(torch.full((num_heads,), 0.5))
-
         pos = torch.arange(max_seq_len)
         rel = (pos.view(-1, 1) - pos.view(1, -1)).clamp(min=0).float()
         self.register_buffer("log_rel_distance", torch.log1p(rel), persistent=False)
@@ -106,10 +111,8 @@ class ConfidenceModulatedAttention(nn.Module):
         self,
         x: torch.Tensor,
         key_padding_mask: torch.Tensor | None = None,
-        log_u: torch.Tensor | None = None,
         log_m: torch.Tensor | None = None,
         ts_bucket: torch.Tensor | None = None,
-        pmi_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, L, _ = x.shape
 
@@ -124,38 +127,28 @@ class ConfidenceModulatedAttention(nn.Module):
             # khong co q.k: logit khoi dau = 0, moi tin hieu den TU BIAS.
             logit = torch.zeros(B, self.num_heads, L, L, dtype=q.dtype, device=q.device)
 
-        if log_m is not None and self.use_beta:
+        if log_m is not None:
             logit.add_(self.beta.view(1, -1, 1, 1) * log_m.view(B, 1, 1, L))
 
         log_rel = self.log_rel_distance[:L, :L].view(1, 1, L, L)
-        if self.static_delta:
-            logit.add_(self.delta.view(1, -1, 1, 1) * log_rel)
-        else:
-            # δ_h(x_q): (B,H,L) broadcast với (L,L) — không materialize thêm (B,H,L,L).
-            delta_q = self.delta.view(1, -1, 1) + self.delta_proj(x).transpose(1, 2)
-            logit.add_(delta_q.unsqueeze(-1) * log_rel)
+        # δ_h(x_q): (B,H,L) broadcast với (L,L) — không materialize thêm (B,H,L,L).
+        delta_q = self.delta.view(1, -1, 1) + self.delta_proj(x).transpose(1, 2)
+        logit.add_(delta_q.unsqueeze(-1) * log_rel)
 
         if ts_bucket is not None:
             logit = AddTsBias.apply(logit, self.ts_w, ts_bucket)
-
-        if pmi_bias is not None and self.use_pmi:
-            logit.add_(self.mu.view(1, -1, 1, 1) * pmi_bias.unsqueeze(1))
 
         causal_mask = torch.triu(torch.ones(L, L, dtype=torch.bool, device=x.device), diagonal=1)
         invalid = causal_mask.view(1, 1, L, L)
         if key_padding_mask is not None:
             invalid = invalid | key_padding_mask.view(B, 1, 1, L)
 
-        if self.use_softmax:
-            logit = logit.masked_fill(invalid, float("-inf"))
-            attn_weight = torch.nan_to_num(torch.softmax(logit, dim=-1), nan=0.0)
-        else:
-            # Sigmoid KHÔNG chuẩn hoá theo hàng ⇒ tổng attention tăng theo độ dài chuỗi
-            # ("large initial attention norms"). Trừ log(n_q) để chặn — BẮT BUỘC, xem
-            # formula.md §4.2. n_q = số token hợp lệ trong tầm nhìn causal của q.
-            n_q = (~invalid).sum(dim=-1, keepdim=True).clamp(min=1).to(logit.dtype)
-            attn_weight = torch.sigmoid(logit - torch.log(n_q))
-            attn_weight = attn_weight.masked_fill(invalid, 0.0)
+        # Sigmoid KHÔNG chuẩn hoá theo hàng ⇒ tổng attention tăng theo độ dài chuỗi
+        # ("large initial attention norms"). Trừ log(n_q) để chặn — BẮT BUỘC, xem
+        # formula.md §4.2. n_q = số token hợp lệ trong tầm nhìn causal của q.
+        n_q = (~invalid).sum(dim=-1, keepdim=True).clamp(min=1).to(logit.dtype)
+        attn_weight = torch.sigmoid(logit - torch.log(n_q))
+        attn_weight = attn_weight.masked_fill(invalid, 0.0)
 
         attn_weight = self.dropout(attn_weight)
 

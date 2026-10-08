@@ -1,5 +1,8 @@
 """Pass 1 — tính N_i và N_category lũy kế THEO THỜI GIAN (không leak tương lai).
 
+[XOÁ 2026-10-06] N_u cũng từng tính ở đây (`build_user_n_cumulative`) nhưng đã bỏ — xem
+ghi chú tại chỗ hàm cũ, phía dưới `build_item_n_cumulative`.
+
 Vì sao pass riêng: N_i (số tương tác 1 item đã nhận) và N_category (số item RIÊNG
 BIỆT cùng tag đã có >=1 tương tác) đều thay đổi theo thời gian và cần tra cứu được
 TẠI BẤT KỲ thời điểm t nào khi build sequence/interactions (Pass 2, Pass 5) — nên phải
@@ -27,14 +30,12 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
-from schema import LOG_SCHEMA, VIDEO_BASIC_CATEGORY_FIELD
-
-LOG_DIR = Path(r"D:\amazon-datasets\KuaiRand-Pure-extracted\KuaiRand-Pure\data")
-LOG_STANDARD_FILES = [
-    LOG_DIR / "log_standard_4_08_to_4_21_pure.csv",
-    LOG_DIR / "log_standard_4_22_to_5_08_pure.csv",
-]
-VIDEO_BASIC_FILE = LOG_DIR / "video_features_basic_pure.csv"
+from schema import (  # [SỬA 2026-10-07] đường dẫn gom về schema.py (env GEN_RECSYS_DATASET)
+    LOG_SCHEMA,
+    LOG_STANDARD_FILES,
+    VIDEO_BASIC_CATEGORY_FIELD,
+    VIDEO_BASIC_FILE,
+)
 # [SỬA 2026-09-15] Cho phép ghi đè qua biến môi trường GEN_RECSYS_OUT_DIR.
 #
 # Vì sao cần: trước đây OUT_DIR hard-code = thư mục cạnh FILE CODE. Lúc BUILD dữ liệu điều
@@ -106,28 +107,16 @@ def build_item_n_cumulative() -> None:
     _save_csr("item_N", df["video_id"], df["time_ms"], df["cum_count"])
 
 
-def build_user_n_cumulative() -> None:
-    """N_u(user, t) = số dòng log có user_id=user và time_ms < t, lũy kế theo thời gian.
-
-    [THÊM 2026-09-14] Đối xứng hoàn toàn với build_item_n_cumulative, nhưng dùng cho
-    user_weight THEO TỪNG VỊ TRÍ trong chuỗi (u_i), KHÔNG phải 1 scalar/chuỗi như trước.
-
-    Vì sao cần: `user_weight` cũ tra 1 lần tại thời điểm dự đoán -> hằng theo i. Khi đưa
-    vào attention dạng cặp (u_i, m_j), log(u_i) hằng theo hàng i sẽ GỘP THẲNG vào hệ số
-    β — tức thoái hóa về đúng cơ chế λ·log(mat_j) đã bỏ 2026-09-13 (gradient đo được
-    ~1e-17). u_i per-position mới tạo được biến thiên thật: mọi user đều cold ở token đầu
-    chuỗi của mình và warm dần về cuối — đây đồng thời là trục ngắn/dài hạn.
-    """
-    scans = [
-        pl.scan_csv(f, schema_overrides={"user_id": pl.Int64, "time_ms": pl.Int64})
-        for f in LOG_STANDARD_FILES
-    ]
-    lazy = pl.concat(scans).select(["user_id", "time_ms"]).sort(["user_id", "time_ms"])
-    df = lazy.collect(streaming=True)
-
-    df = df.with_columns(pl.int_range(1, pl.len() + 1).over("user_id").alias("cum_count"))
-
-    _save_csr("user_N", df["user_id"], df["time_ms"], df["cum_count"])
+# [XOA 2026-10-06] `build_user_n_cumulative()` (N_u(user,t) luy ke, ghi user_N_*.npy) DA BO.
+#
+# Ly do: KHONG AI DOC file no ghi ra. `dataset.py` lay hist_n_u bang phep tru
+# `(window_start - user_start) + arange(window_len)` — dung cung so, re hon han, khong can
+# searchsorted. Pass nay sinh ra 2026-09-14 cho `user_weight` per-position; `user_weight` da
+# bo 2026-10-06 cung tau_u (formula.md §0: 27K khong co cold user, VA attention khong doc
+# log_u o bat ky so hang nao cua §4.1). Tren 27K no quet 322M dong de ghi file khong ai mo.
+#
+# `hist_n_u` VAN SONG nhung chi dung 1 gia tri cuoi (`n_u_at_pred`) cho chan doan
+# `matched_by_n_u` o eval — khop confound, khong vao model.
 
 
 def build_category_n_cumulative() -> None:
@@ -149,30 +138,9 @@ def build_category_n_cumulative() -> None:
     np.save(OUT_DIR / "category_N_tag_names.npy", np.array(tag_uniques, dtype=object), allow_pickle=True)
 
 
-def lookup_n_at_t(name: str, entity_id: int, t: int) -> int:
-    """Tra cứu N tại thời điểm t — 2 lần searchsorted, KHÔNG vòng lặp Python.
-
-    `name` = "item_N" hoặc "category_N" (tag_code, không phải tag string — dùng
-    category_N_tag_names.npy để map ngược nếu cần).
-    """
-    ids = np.load(OUT_DIR / f"{name}_ids.npy")
-    offsets = np.load(OUT_DIR / f"{name}_offsets.npy")
-    events = np.load(OUT_DIR / f"{name}_events.npy")
-
-    id_pos = np.searchsorted(ids, entity_id)
-    if id_pos >= len(ids) or ids[id_pos] != entity_id:
-        return 0  # entity chưa từng xuất hiện trước thời điểm t (hoặc không tồn tại) -> N=0
-
-    start, end = offsets[id_pos], offsets[id_pos + 1]
-    seg = events[start:end]
-    # [SỬA 2026-09-11] side="left" — vị trí = số phần tử có t < query_t, tức N TRƯỚC thời
-    # điểm t, KHÔNG tính chính sự kiện tại t. Bug đã xác nhận: side="right" - 1 trỏ đúng vào
-    # chính sự kiện có event_t == query_t (khi trùng), đếm LUÔN sự kiện đó -> leak 1 đơn vị
-    # thông tin tương lai (biết trước label/candidate này sẽ xảy ra tại t). count[j] (0-indexed)
-    # = j+1 (cộng dồn từ đầu, xem build_item_n_cumulative) nên count TRƯỚC t = count tại vị
-    # trí (side="left" - 1).
-    idx = np.searchsorted(seg["t"], t, side="left")
-    return int(seg["count"][idx - 1]) if idx > 0 else 0
+# [XOA 2026-10-06] `lookup_n_at_t(name, entity_id, t)` — ban SCALAR — DA BO. No load lai CA
+# BA file .npy MOI LAN GOI, va khong con caller nao: ban vector hoa `lookup_n_at_t_batch`
+# (duoi day) la thu dang dung o build_interactions.py va train.py.
 
 
 def build_n_cache(name: str) -> dict:
@@ -278,5 +246,4 @@ def lookup_n_at_t_batch(name: str, entity_ids: np.ndarray, ts: np.ndarray, batch
 
 if __name__ == "__main__":
     build_item_n_cumulative()
-    build_user_n_cumulative()
     build_category_n_cumulative()

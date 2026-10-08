@@ -29,23 +29,37 @@ log — cả 2 được ghi bởi cùng 1 vòng lặp, cùng write_pos, không c
 KHÔNG lọc token nào khi build lịch sử (giữ cả hate/skip).
 """
 
+import os
 from pathlib import Path
 
 import numpy as np
 import polars as pl
 
-from schema import ACTION_VECTOR_FIELDS, MAX_SEQ_LEN
+from schema import (  # [SỬA 2026-10-07] đường dẫn gom về schema.py (env GEN_RECSYS_DATASET)
+    ACTION_VECTOR_FIELDS,
+    DATASET,
+    LOG_STANDARD_FILES,
+)
+# [SỬA 2026-10-07] Bỏ import `MAX_SEQ_LEN` — KHÔNG dùng ở đâu trong file này. Preprocess ghi
+# lịch sử ĐẦY ĐỦ (CSR qua user_offsets); việc cắt cửa sổ K là của `dataset.py` lúc train
+# (`--max-seq-len`). Nghĩa là output .npy KHÔNG phụ thuộc K: đổi K không cần build lại.
 
-LOG_DIR = Path(r"D:\amazon-datasets\KuaiRand-Pure-extracted\KuaiRand-Pure\data")
-LOG_STANDARD_FILES = [
-    LOG_DIR / "log_standard_4_08_to_4_21_pure.csv",
-    LOG_DIR / "log_standard_4_22_to_5_08_pure.csv",
-]
-OUT_DIR = Path(__file__).parent / "output"
+# [SỬA 2026-10-07] Theo env `GEN_RECSYS_OUT_DIR` như build_n_cumulative.py đã làm. Trước đây
+# hard-code cạnh file code, nên build 27K sẽ GHI ĐÈ output Pure (cùng tên file .npy) — mất
+# dữ liệu Pure mà không có cảnh báo nào.
+OUT_DIR = Path(os.environ.get("GEN_RECSYS_OUT_DIR") or (Path(__file__).parent / "output"))
 # [SỬA 2026-09-13] Pure chỉ ~1.4M dòng (so với 322M của 27K) — 100 bucket không cần thiết
 # nữa (mỗi bucket chỉ ~14K dòng, overhead chia bucket > lợi ích tránh OOM). Giảm xuống 10
 # để giảm số lần quét lại CSV (mỗi bucket phải scan lại toàn bộ LOG_STANDARD_FILES).
-NUM_BUCKETS = 10
+#
+# [SỬA 2026-10-07] Theo dataset: 27K có ~322M dòng / 23 GB CSV, 10 bucket nghĩa là ~32M
+# dòng/bucket phải sort trong RAM cùng lúc => OOM trên máy 31.7 GB. 100 bucket đưa về
+# ~3.2M dòng/bucket, đổi lại quét CSV 100 lần thay vì 10. Đây là đánh đổi RAM/IO, và với
+# 27K thì RAM là thứ hết trước.
+#
+# LƯU Ý: đổi NUM_BUCKETS làm đổi play_ratio của MỌI dòng nếu rank được tính trong bucket —
+# xem _compute_duration_edges_and_rank_table, nó tính TOÀN CỤC đúng vì lý do này.
+NUM_BUCKETS = 100 if DATASET == "27k" else 10
 
 
 def _compute_global_log1p_max() -> tuple[float, float]:
@@ -69,6 +83,30 @@ def _compute_global_log1p_max() -> tuple[float, float]:
 
 
 NUM_DURATION_GROUPS = 10  # số nhóm duration cho D2Q; đo được 35x giữa p10 và p90, xem dưới
+
+# Số chữ số thập phân làm tròn `play_raw` TRƯỚC khi dựng bảng mid-rank (xem
+# _compute_duration_edges_and_rank_table). Đây là thứ làm cho bảng tra scale được.
+#
+# Đo trên Pure thật (1,436,609 dòng). spread = max/min của trung bình theo decile duration;
+# corr = tương quan decile vs trung bình. spread KHÔNG thấy CHIỀU nên phải xem cả hai:
+#
+#   làm tròn        spread    corr     số khoá
+#   thô             4.551x   -0.982        —      <- bias gốc
+#   round(3)        1.000x   -0.056     10,010    <- CHỌN: tốt nhất CẢ HAI trục
+#   round(4)        1.000x   +0.632     96,293
+#   round(5)        1.000x   +0.054    421,189
+#   không làm tròn  1.000x   +0.506    944,664    <- dict cũ
+#
+# round(3) khử bias tốt NHẤT (corr -0.056, gần 0 nhất) với ít khoá nhất. Nghịch lý biểu kiến
+# "làm tròn thô hơn lại chính xác hơn" có lý do thật: play_raw là thương hai số nguyên nên
+# gần như LIÊN TỤC (94.6% giá trị duy nhất ở Pure, 88.3% ở 27K). Không làm tròn thì mỗi giá
+# trị thành một khoá riêng, mid-rank không còn ties để lấy trung bình, và thứ hạng biến thành
+# chỉ số thứ tự thuần — đó là lý do dict cũ ĐẢO DẤU (+0.506). Làm tròn gộp ties lại cho
+# mid-rank làm đúng việc của nó.
+#
+# Scale: 10 nhóm x tối đa 1,001 giá trị = <= 10,010 khoá, BẤT KỂ dataset lớn cỡ nào — thay cho
+# ~284M khoá (~28 GB) mà 27K sẽ cần nếu không làm tròn.
+PLAY_RAW_DECIMALS = 3
 
 
 def _compute_duration_edges_and_rank_table() -> tuple[list[float], list[dict[float, float]]]:
@@ -100,11 +138,15 @@ def _compute_duration_edges_and_rank_table() -> tuple[list[float], list[dict[flo
 
     Trả về:
       duration_edges — NUM_DURATION_GROUPS-1 biên chia duration_ms thành decile
-      rank_tables[g] — dict {play_raw -> percentile} cho nhóm duration g
+      rank_tables[g] — dict {play_raw đã làm tròn -> percentile mid-rank} cho nhóm duration g
 
-    Bảng tra là dict thay vì biên + cut: play_raw chỉ có hữu hạn giá trị phân biệt (nó là
-    thương của hai số nguyên rồi clip), nên tra trực tiếp vừa chính xác tuyệt đối vừa không
-    cần biên nào. Đo trên KuaiRand-Pure: tổng ~140K khóa, không đáng kể về RAM.
+    [SỬA 2026-10-05 — CHẶN trên 27K] Bảng vẫn là dict tra trực tiếp (chính xác tuyệt đối trên
+    thang đã làm tròn), nhưng `play_raw` được **làm tròn PLAY_RAW_DECIMALS=3 chữ số** trước khi
+    dựng. Không làm tròn thì nó không scale: `play_raw` là thương hai số nguyên nên gần như
+    liên tục — 27K cho 88.3% giá trị duy nhất (đo: 1,047,291 trên 1,186,059 dòng), ngoại suy
+    322M dòng là ~284M khoá, dict Python ~**28 GB**.
+
+    Làm tròn còn khử bias TỐT HƠN, không chỉ rẻ hơn — xem bảng đo ở PLAY_RAW_DECIMALS.
     """
     scans = [pl.scan_csv(f).select(["duration_ms", "play_time_ms"]) for f in LOG_STANDARD_FILES]
     qs = [i / NUM_DURATION_GROUPS for i in range(1, NUM_DURATION_GROUPS)]
@@ -126,15 +168,26 @@ def _compute_duration_edges_and_rank_table() -> tuple[list[float], list[dict[flo
 
     rank_tables = []
     for g in range(len(duration_edges) + 1):
-        sub = df.filter(pl.col("_g") == str(g))
-        # mid-rank: các giá trị bằng nhau nhận cùng thứ hạng trung bình. Chia cho len để ra
-        # percentile trong [0,1]. Lấy 1 dòng đại diện mỗi play_raw -> dict tra cứu.
-        pct = sub.select(
-            pl.col("play_raw"),
-            (pl.col("play_raw").rank(method="average") / pl.len()).alias("pct"),
-        ).unique(subset=["play_raw"])
-        rank_tables.append(dict(zip(pct["play_raw"].to_list(), pct["pct"].to_list())))
+        sub = df.filter(pl.col("_g") == str(g))["play_raw"].to_numpy()
+        if len(sub) == 0:
+            rank_tables.append({})      # nhom rong -> _to_percentile de nguyen NaN
+            continue
+        rank_tables.append(_mid_rank_table(np.round(sub, PLAY_RAW_DECIMALS)))
     return duration_edges, rank_tables
+
+
+def _mid_rank_table(values: np.ndarray) -> dict[float, float]:
+    """{gia tri -> percentile mid-rank} cho MOT nhom duration.
+
+    MID-rank chu khong phai rank thuong: cac gia tri BANG NHAU nhan CUNG thu hang trung binh.
+    Day la yeu cau cua D2Q, va la ly do phai lam tron truoc — khong lam tron thi moi gia tri
+    thanh mot khoa rieng, khong con ties de lay trung binh (xem PLAY_RAW_DECIMALS).
+    """
+    uniq, counts = np.unique(values, return_counts=True)
+    csum = np.concatenate([[0], np.cumsum(counts)])
+    mid = (csum[:-1] + csum[1:] - 1) / 2.0
+    pct = mid / max(len(values) - 1, 1)
+    return dict(zip(uniq.tolist(), pct.tolist()))
 
 
 def _compute_derived_action_fields(
@@ -186,22 +239,30 @@ def _compute_derived_action_fields(
     )
     tagged = df.with_columns(play_raw.alias("_play_raw"), group_expr.alias("_g"))
 
-    # replace_strict cho từng nhóm rồi chọn theo _g. default=None để giá trị KHÔNG có trong
-    # bảng lộ ra thành null và bị assert bên dưới bắt, thay vì âm thầm thành 0.0 -- một
-    # play_ratio=0 giả sẽ tắt hẳn nhánh click của token đó mà không báo gì.
-    play_expr = pl.when(pl.col("_g") == "0").then(
-        pl.col("_play_raw").replace_strict(rank_tables[0], default=None, return_dtype=pl.Float64)
-    )
-    for g in range(1, len(rank_tables)):
-        play_expr = play_expr.when(pl.col("_g") == str(g)).then(
-            pl.col("_play_raw").replace_strict(rank_tables[g], default=None, return_dtype=pl.Float64)
-        )
+    # [SỬA 2026-10-05] Tra dict trên play_raw ĐÃ LÀM TRÒN, thay cho replace_strict trên
+    # play_raw thô (không scale: 27K cần ~284M khoá ~28 GB, xem PLAY_RAW_DECIMALS).
+    #
+    # map_batches giữ được LAZY (hàm này nhận cả LazyFrame của pipeline lẫn DataFrame của
+    # test) và chạy một lần trên cả cột thay vì NUM_DURATION_GROUPS lần when/then.
+    def _to_percentile(cols: pl.Series) -> pl.Series:
+        st = cols.struct.unnest()
+        raw = np.round(st["_play_raw"].to_numpy(), PLAY_RAW_DECIMALS)
+        grp = st["_g"].cast(pl.Int32).to_numpy()
+        # NaN mac dinh: gia tri KHONG co trong bang phai LO RA, khong duoc thanh 0.0 — mot
+        # play_ratio=0 gia se tat han nhanh click cua token do ma khong bao gi. Cho ghi
+        # history_action_mm bat NaN thanh ValueError.
+        out = np.full(len(raw), np.nan, dtype=np.float64)
+        for g, table in enumerate(rank_tables):
+            m = grp == g
+            if not m.any() or not table:
+                continue
+            out[m] = [table.get(v, np.nan) for v in raw[m]]
+        return pl.Series("play_ratio", out, dtype=pl.Float64)
 
-    # default=None -> giá trị không có trong bảng thành null. KHÔNG dùng 0.0 làm default: một
-    # play_ratio=0 giả sẽ tắt hẳn nhánh click của token đó mà không báo gì. Null thì
-    # build_sequences bắt được khi ghi (NaN -> ValueError, xem chỗ ghi history_action_mm).
-    # Hàm này nhận cả LazyFrame (đường pipeline) lẫn DataFrame (test), nên KHÔNG được
-    # subscript ở đây -- phải giữ lazy.
+    play_expr = pl.struct(["_play_raw", "_g"]).map_batches(
+        _to_percentile, return_dtype=pl.Float64
+    )
+
     return tagged.with_columns(play_expr.alias("play_ratio")).with_columns(
         (pl.col("profile_stay_time").log1p() / profile_max)
         .fill_nan(0.0)

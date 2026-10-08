@@ -1,20 +1,17 @@
 """Đánh giá model — HR@K, Recall@K, NDCG@K.
 
-TÁCH THEO VỊ TRÍ TÍN HIỆU (formula.md §−1) là trục CHÍNH: tag của item đích nằm ở lịch
-sử gần, xa, cả hai, hay không đâu. Đây là thứ trả lời câu hỏi nghiên cứu — chưa benchmark
-nào báo cáo. Cold user giữ lại làm lát cắt phụ.
+[XOÁ 2026-10-05] `classify_signal_position` / `SIGNAL_GROUPS` / `SHORT_WINDOW` đã BỎ:
+nhãn short/long dựa trên cửa sổ 10-item CỐ ĐỊNH, đo lại trên 27K cho thấy cửa sổ đó trải
+199.8h và 68.6% nhãn SAI (formula.md §10). Trục chính giờ là bảng 2x3 ablation, không phải
+lát cắt vị trí tín hiệu. `matched_by_n_u` giữ lại — nó là công cụ khớp confound, dùng cho
+cold/warm và bất kỳ hai nhóm nào chạm ở vị trí chuỗi khác nhau.
 
-Bảng 4 ô cold-start (user×item) ĐÃ BỎ: định vị cold-start không còn theo đuổi
-(formula.md §−1 "Hướng đã bỏ").
+Bảng 4 ô cold-start (user×item) ĐÃ BỎ: định vị cold-start không còn theo đuổi.
 """
 
 from __future__ import annotations
 
 import torch
-
-SHORT_WINDOW = 10   # "gần" = 10 item cuối, khớp mọi phép đo ở formula.md §−1
-
-SIGNAL_GROUPS = ("only_long", "only_short", "both", "neither")
 
 
 @torch.no_grad()
@@ -38,37 +35,6 @@ def compute_metrics_at_k(
         metrics[f"ndcg@{k}"] = hit * (1.0 / torch.log2(positive_rank.float() + 2.0))
     metrics["mrr"] = 1.0 / (positive_rank.float() + 1.0)
     return metrics
-
-
-@torch.no_grad()
-def classify_signal_position(
-    hist_video_ids: torch.Tensor,
-    label_video_id: torch.Tensor,
-    hist_valid_mask: torch.Tensor,
-    item_tag_table: torch.Tensor,
-) -> dict[str, torch.Tensor]:
-    """Tag của item đích xuất hiện ở vùng nào của lịch sử — trục chính của câu hỏi.
-
-    `item_tag_table`: (num_items, num_tags) bool, True nếu item mang tag đó.
-    Trả về 4 mask loại trừ nhau, cộng lại đúng B.
-    """
-    B, K = hist_video_ids.shape
-    target_tags = item_tag_table[label_video_id]                 # (B, T)
-    hist_tags = item_tag_table[hist_video_ids]                   # (B, K, T)
-
-    shares = (hist_tags & target_tags.unsqueeze(1)).any(dim=-1) & hist_valid_mask  # (B, K)
-
-    pos = torch.arange(K, device=hist_video_ids.device).expand(B, K)
-    near_zone = pos >= (K - SHORT_WINDOW)                        # SHORT_WINDOW item cuối
-    near = (shares & near_zone).any(dim=1)
-    far = (shares & ~near_zone).any(dim=1)
-
-    return {
-        "only_long": far & ~near,     # ngắn hạn MÙ — 37.9% ở ngưỡng lịch sử >=200
-        "only_short": near & ~far,
-        "both": near & far,
-        "neither": ~near & ~far,
-    }
 
 
 def aggregate_by_group(
@@ -206,17 +172,10 @@ def _print_table(title: str, result: dict[str, dict[str, float]]) -> None:
 
 def print_eval_report(
     result_overall: dict[str, dict[str, float]],
-    tau_snapshot: dict[str, float],
-    result_signal: dict[str, dict[str, float]] | None = None,
     result_cold: dict[str, dict[str, float]] | None = None,
 ) -> None:
-    print("\n=== EVAL REPORT ===")
-    print(f"τ_u={tau_snapshot['tau_u']:.2f} τ_i={tau_snapshot['tau_i']:.2f}")
+    print()
+    print("=== EVAL REPORT ===")
     _print_table("TONG THE", result_overall)
-    if result_signal is not None:
-        _print_table(
-            "VI TRI TIN HIEU (truc chinh — formula.md §−1): only_long = ngan han MU",
-            result_signal,
-        )
     if result_cold is not None:
         _print_table("COLD USER (lat cat phu)", result_cold)

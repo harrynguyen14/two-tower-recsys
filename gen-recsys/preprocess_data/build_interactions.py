@@ -27,10 +27,9 @@ nào có ý nghĩa. Đây là ĐẶC ĐIỂM CỦA CHÍNH DATASET (Pure là cata
 (true zero-shot cold-start). Kết luận về cold-ITEM rút ra từ is_item_cold cần diễn giải
 đúng phạm vi này — khác is_user_cold (giờ ĐÃ là true zero-shot, strict holdout thật).
 
-Khởi tạo τ (xem learnable_thresholds.py, đo lại cho Pure — không đổi so với 2026-09-13):
+Ngưỡng cold (đo trên Pure 2026-09-13):
   COLD_THRESHOLD_N = 10 (từ schema.py, chỉ còn dùng cho is_item_cold)
-  TAU_U_INIT = 35.0    — median N_u tại thời điểm sample
-  TAU_I_INIT = 599.3   — mean N_i tại thời điểm sample
+  Số cũ để khỏi đo lại: median N_u = 35.0, mean N_i = 599.3 (hai τ đã bỏ khỏi model)
 
 Input: history_meta.npy/user_offsets.npy/sample_user_idx.npy/sample_position.npy (từ Pass
 2), item_N_ids.npy... (từ Pass 1), user_ids_sorted.npy (để tra first_seen theo user_id).
@@ -49,17 +48,20 @@ tương lai", không leak.
 CHÍNH LÀ mốc p80 — token đầu tiên của user này đã sau p80, nên MỌI token/sample của user
 đó (kể cả các vị trí sau) cũng sau p80, tự động rơi vào val/test.
 
-τ_u, τ_i CHỈ dùng để gán is_item_cold + user_weight/item_weight tham khảo — KHÔNG phải
-giá trị model thực sự dùng (model học τ riêng qua nn.Parameter — xem learnable_thresholds.py).
+τ_i CHỈ dùng để gán is_item_cold — KHÔNG phải giá trị nào model dùng.
+
+[XOÁ 2026-10-06] Hai field `user_weight`/`item_weight` đã bỏ khỏi output. Chúng là bản
+`tanh(N/τ)` "để tham khảo" mà `dataset.py` **chưa bao giờ đọc**: model tự tra N_i tại đúng
+timestamp rồi đổi sang percentile (formula.md §0), và `tanh` đã bị bác ở chính §0. Giữ lại
+là mời người đọc sau nầm lẫn hai thang đo khác nhau.
 
 Output: {split}.npy (split = train/val/test) — structured array:
   index         int64    — vị trí gốc trong sample_user_idx/sample_position (mảng đầy đủ)
-  user_weight   float32  — tanh(N_u / τ_u) — CHỈ để tham khảo, KHÔNG dùng trong model
-  item_weight   float32  — tanh(N_i / τ_i) — tương tự
   is_user_cold  bool     — STRICT HOLDOUT: user có first_seen_ms > boundary train/test
   is_item_cold  bool     — THRESHOLD-BASED (giới hạn, xem cảnh báo trên): N_i < COLD_THRESHOLD_N
 """
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -67,13 +69,9 @@ import numpy as np
 from build_n_cumulative import lookup_n_at_t_batch
 from schema import COLD_THRESHOLD_N, LOW_HISTORY_N
 
-OUT_DIR = Path(__file__).parent / "output"
-TAU_U_INIT = 35.0    # median N_u tại thời điểm sample, đo trên KuaiRand-Pure 2026-09-13
-TAU_I_INIT = 599.3   # mean N_i tại thời điểm sample, đo trên KuaiRand-Pure 2026-09-13
-
-
-def _mat(n: np.ndarray, tau: float) -> np.ndarray:
-    return np.tanh(n / tau)
+# [SỬA 2026-10-07] Theo env `GEN_RECSYS_OUT_DIR` như build_n_cumulative.py đã làm — nếu
+# không, build 27K sẽ ghi train/val/test.npy ĐÈ lên output Pure mà không cảnh báo gì.
+OUT_DIR = Path(os.environ.get("GEN_RECSYS_OUT_DIR") or (Path(__file__).parent / "output"))
 
 
 def build_interactions() -> None:
@@ -97,7 +95,6 @@ def build_interactions() -> None:
     # (sample_position - user_offsets[user] = số token đã đi qua, KHÔNG tính chính label
     # vì label nằm TẠI sample_position, token lịch sử là [user_start, sample_position)).
     n_u = (sample_position - user_offsets[sample_user_idx]).astype(np.float64)
-    user_weight = _mat(n_u, TAU_U_INIT)
 
     # [SỬA 2026-09-14] STRICT HOLDOUT cho user — first_seen_ms của MỖI user (token đầu
     # tiên trong lịch sử của họ, tại user_offsets[u]) so với boundary p80. User có
@@ -128,7 +125,6 @@ def build_interactions() -> None:
     is_user_lowhistory = n_u < LOW_HISTORY_N
 
     n_i = lookup_n_at_t_batch("item_N", labels, label_timestamps).astype(np.float64)
-    item_weight = _mat(n_i, TAU_I_INIT)
     is_item_cold = n_i < COLD_THRESHOLD_N  # threshold-based — xem giới hạn ở docstring module
 
     # Kiểm tra ràng buộc: KHÔNG sample nào của user cold-holdout được lọt vào train
@@ -142,8 +138,6 @@ def build_interactions() -> None:
 
     split_dtype = np.dtype([
         ("index", np.int64),
-        ("user_weight", np.float32),
-        ("item_weight", np.float32),
         ("is_user_cold", np.bool_),
         ("is_item_cold", np.bool_),
         ("is_user_lowhistory", np.bool_),  # [THÊM 2026-09-15] few-shot, song song strict holdout
@@ -153,8 +147,6 @@ def build_interactions() -> None:
         idx = np.where(mask)[0]
         split_arr = np.empty(len(idx), dtype=split_dtype)
         split_arr["index"] = idx
-        split_arr["user_weight"] = user_weight[idx].astype(np.float32)
-        split_arr["item_weight"] = item_weight[idx].astype(np.float32)
         split_arr["is_user_cold"] = is_user_cold[idx]
         split_arr["is_item_cold"] = is_item_cold[idx]
         split_arr["is_user_lowhistory"] = is_user_lowhistory[idx]

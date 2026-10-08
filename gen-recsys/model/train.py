@@ -31,15 +31,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "preprocess_data"))
 from build_n_cumulative import build_n_cache, lookup_n_at_t_batch_cached
 
 from dataset import ACTION_VECTOR_FIELDS, GenRecsysDataset, ITEM_CATEGORICAL_FIELDS, MAX_SEQ_LEN
-from eval import (aggregate_by_group, classify_signal_position, matched_by_n_u,
-                  compute_metrics_at_k, print_matched, print_eval_report)
+from eval import (aggregate_by_group, matched_by_n_u, compute_metrics_at_k,
+                  print_matched, print_eval_report)
 from item_embedding import ItemEmbedding, ItemEmbeddingConfig
-from learnable_thresholds import LearnableThresholds
+from learnable_thresholds import (item_percentile_table,
+                                  lookup_percentile)
 from negative_sampler import NegativeSampler
 from ranking_loss import BINARY_ACTION_FIELDS, RankingLoss
 from retrieval import RetrievalLoss
 from sequence_model import SequenceModel
-from user_embedding import UserProfileConfig, UserProfileEmbedding
 
 BINARY_ACTION_INDICES = [ACTION_VECTOR_FIELDS.index(f) for f in BINARY_ACTION_FIELDS]
 
@@ -57,6 +57,11 @@ def item_features_to_device(features: dict, device: torch.device) -> dict:
         "music_idx": features["music_idx"].to(device, non_blocking=True),
         "caption_embedding": features["caption_embedding"].to(device, non_blocking=True),
         "caption_mask": features["caption_mask"].to(device, non_blocking=True),
+        "category_level_ids": (
+            {k: v.to(device, non_blocking=True)
+             for k, v in features["category_level_ids"].items()}
+            if features["category_level_ids"] is not None else None
+        ),
     }
 
 
@@ -83,21 +88,67 @@ def embed_items(
     timestamps_cpu: torch.Tensor,
     dataset: GenRecsysDataset,
     item_embed: ItemEmbedding,
-    thresholds: LearnableThresholds,
     item_n_cache: dict,
     category_n_cache: dict,
     device: torch.device,
+    pct_table: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Tra N_i theo đúng timestamp, tính item_weight runtime (gradient chảy về τ_i), rồi"""
-    n_i, _ = compute_n_i_n_category(dataset, item_n_cache, category_n_cache, video_ids_cpu, timestamps_cpu)
-    item_weight = thresholds.item_weight(n_i.to(device, non_blocking=True))
+    """Tra N_i theo đúng timestamp, ĐỔI SANG PERCENTILE, rồi embed item.
 
-    features = item_features_to_device(dataset.get_item_features(video_ids_cpu), device)
+    [SỬA 2026-10-05] Trước đây truyền N_i THÔ vào `item_weight` — đúng khi nó còn là
+    `tanh(N_i/τ_i)`, nhưng formula.md §0 đã đổi sang percentile, nên truyền N_i thô là
+    nhét SỐ ĐẾM (0..10,424) thẳng vào attention qua `β_h log m_p`. Phải tra
+    `lookup_percentile` TRƯỚC.
+
+    `pct_table` dựng 1 lần trên train (xem build_percentile_table); None thì bỏ hẳn số
+    hạng maturity thay vì âm thầm dùng thang sai.
+    """
+    n_i, _ = compute_n_i_n_category(dataset, item_n_cache, category_n_cache, video_ids_cpu, timestamps_cpu)
+    if pct_table is None:
+        raise ValueError(
+            "embed_items cần pct_table: `log m_p` nhận PERCENTILE, truyền N_i thô sẽ "
+            "đưa số đếm vào attention (xem learnable_thresholds.lookup_percentile)."
+        )
+    uniq, pct = pct_table
+    n_i_pct = torch.from_numpy(lookup_percentile(uniq, pct, n_i.numpy()))
+    item_weight = n_i_pct.to(device, non_blocking=True)
+
+    feats = dataset.get_item_features(video_ids_cpu)
+    features = item_features_to_device(feats, device)
     e_i_final = item_embed(
-        video_ids_cpu.to(device, non_blocking=True), features["category_ids"], features["author_idx"], features["music_idx"],
+        video_ids_cpu.to(device, non_blocking=True), features["category_ids"],
+        features["author_idx"], features["music_idx"],
         features["caption_embedding"], features["caption_mask"], features["tag_ids"],
+        category_level_ids=features["category_level_ids"],
     )
     return e_i_final, item_weight
+
+
+def build_percentile_table(
+    dataset: GenRecsysDataset, item_n_cache: dict,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Bảng N_i -> percentile, dựng 1 LẦN trên TRAIN (formula.md §0).
+
+    Dựng trên N_i tại BIÊN TRAIN (p80) thay vì N_i tại từng timestamp: bảng chỉ định nghĩa
+    THANG ĐO (item này phổ biến tới đâu so với các item khác), không phải giá trị dùng ở
+    runtime. Dùng N_i theo timestamp sẽ cho mỗi (item, t) một thang riêng — không còn so
+    sánh được giữa các vị trí trong cùng chuỗi.
+
+    [SỬA 2026-10-07] `t = int64.max` -> `t = p80`. Trước đây bảng fit trên N_i CUỐI KỲ của
+    TOÀN BỘ dataset, tức gồm cả val và test — bảng này đi thẳng vào attention qua
+    `β_h log m_p`, nên đó là leak (cùng loại với chuẩn hoá feature bằng mean/std của cả
+    train+test: giá trị runtime point-in-time nhưng PHÉP BIẾN ĐỔI fit trên tương lai).
+    Đo được mức độ: spearman(N_i cuối kỳ, N_i tại p80) = 0.9883 — băng thông hẹp, nhưng
+    15.5% item lệch percentile > 0.05 (max 0.745), đủ để reviewer bắt. Sửa rẻ nên sửa.
+    p80 tính lại đúng công thức của build_interactions.py:86 (percentile 80 của timestamp
+    LABEL), không đọc từ file vì pipeline không lưu mốc này ra đâu.
+    """
+    label_t = dataset.history_meta["t"][dataset.sample_position].astype(np.int64)
+    p80 = np.int64(np.percentile(label_t, 80))
+    ids = np.arange(dataset.item_static.shape[0], dtype=np.int64)
+    t_train_end = np.full(ids.shape[0], p80, dtype=np.int64)
+    n_i_all = lookup_n_at_t_batch_cached(item_n_cache, ids, t_train_end)
+    return item_percentile_table(n_i_all)
 
 
 def setup_ddp() -> tuple[bool, int, int, int]:
@@ -120,17 +171,12 @@ def run_batch_forward(
     dataset: GenRecsysDataset,
     item_embed: ItemEmbedding,
     seq_model: SequenceModel,
-    profile_embed: UserProfileEmbedding,
-    thresholds: LearnableThresholds,
     neg_sampler: NegativeSampler,
     item_n_cache: dict,
     category_n_cache: dict,
     num_negatives: int,
     device: torch.device,
-    static_user_weight: bool = False,
-    uniform_negatives: bool = False,
-    log_user_maturity: bool = False,
-    pmi_table: torch.Tensor | None = None,
+    pct_table: tuple[np.ndarray, np.ndarray],
 ) -> dict[str, torch.Tensor]:
     """1 forward pass đầy đủ cho 1 batch — dùng CHUNG bởi train() và evaluate()."""
     hist_video_ids_cpu = batch["hist_video_ids"]
@@ -146,50 +192,62 @@ def run_batch_forward(
 
     hist_e_i, hist_item_weight = embed_items(
         hist_video_ids_cpu.reshape(-1), hist_timestamps_cpu.reshape(-1),
-        dataset, item_embed, thresholds, item_n_cache, category_n_cache, device,
+        dataset, item_embed, item_n_cache, category_n_cache, device,
+        pct_table=pct_table,
     )
     hist_e_i = hist_e_i.view(B, K, -1)
     hist_item_weight = hist_item_weight.view(B, K)
 
     hist_n_u = batch["hist_n_u"].to(device, non_blocking=True)
-    if static_user_weight:
-        hist_n_u = hist_n_u[:, -1:].expand_as(hist_n_u)
-    hist_user_weight = thresholds.user_weight(hist_n_u)
-    hist_log_u = thresholds.log_user_maturity(hist_n_u) if log_user_maturity else None
+
+    # age_t (formula.md §2) — None nếu dataset không có upload_dt dùng được (Pure);
+    # ActionEncoder bỏ hẳn số hạng khi nhận None.
+    hist_age = (
+        dataset.get_age_days(hist_video_ids_cpu.reshape(-1), hist_timestamps_cpu.reshape(-1))
+        .view(B, K).to(device, non_blocking=True)
+        if dataset.has_age else None
+    )
 
     label_e_i, _ = embed_items(
-        label_video_id_cpu, label_timestamp_cpu, dataset, item_embed, thresholds,
-        item_n_cache, category_n_cache, device,
+        label_video_id_cpu, label_timestamp_cpu, dataset, item_embed,
+        item_n_cache, category_n_cache, device, pct_table=pct_table,
     )
     _ie = getattr(item_embed, "module", item_embed)
     label_embed_stats = {k: v.clone() for k, v in _ie._last_stats.items()}
 
-    user_features = dataset.get_user_features(batch["user_id"])
-    e_profile = profile_embed(
-        user_features["onehot"].to(device, non_blocking=True), user_features["register_days"].to(device, non_blocking=True)
-    )
-
     hidden = seq_model(
-        hist_e_i, hist_action, key_padding_mask, profile_embedding=e_profile,
-        user_weight=hist_user_weight, item_weight=hist_item_weight,
-        log_user_maturity=hist_log_u,
+        hist_e_i, hist_action, key_padding_mask, hist_age_days=hist_age,
+        item_weight=hist_item_weight,
         hist_timestamps=hist_timestamps_cpu.to(device, non_blocking=True),
         hist_video_ids=hist_video_ids_cpu.to(device, non_blocking=True),
-        pmi_table=pmi_table,
     )
 
-    target_e_i = torch.cat([hist_e_i[:, 1:, :], label_e_i.unsqueeze(1)], dim=1)
+    # [SUA 2026-10-07] .detach() o NHANH TARGET — bat buoc, khong phai toi uu.
+    # hist_e_i la CUNG tensor da dua vao seq_model, nen khong detach thi gradient chay vao
+    # Phi_i qua HAI duong: (1) input, (2) target. Duong (2) la shortcut: model giam loss bang
+    # cach CO Phi_i ve phia pred thay vi hoc pred du doan Phi_i — dung co che representation
+    # collapse ma SimSiam/BYOL phai chan bang stop-gradient. Do duoc: |grad| duong target
+    # = 22.8 (khac 0 ro rang). NGHI VAN: ket luan "multi-vector that bai" (cosine->0.98) co
+    # the la HE QUA cua shortcut nay chu khong phai cua multi-vector — chay lai truoc khi chot.
+    target_e_i = torch.cat([hist_e_i[:, 1:, :], label_e_i.unsqueeze(1)], dim=1).detach()
     target_ids_cpu = torch.cat([hist_video_ids_cpu[:, 1:], label_video_id_cpu.unsqueeze(1)], dim=1)
     pair_valid = hist_valid_mask.clone()
     pair_valid[:, :-1] &= hist_valid_mask[:, 1:]
 
+    # [SUA 2026-10-07] exclude TOAN BO target_ids, khong chi label.
+    # Loss tinh tren MOI vi tri t voi target = [hist[1:], label], nhung negative dung CHUNG
+    # cho ca chuoi va truoc day chi loai trung voi label (vi tri K-1). Do tren phan bo thuc
+    # cua Pure (C=512): P(mot positive lot vao tap negative) = 0.270 theo phan bo positive
+    # (positive thien ve popular, negative cung sample theo popularity) => ~69/255 vi tri moi
+    # batch bi day "item dung ra xa". Khi positive trung negative, CE KHONG the xuong 0 — san
+    # log(2)=0.693 (do duoc: loss 0.0047 -> 0.6954). Nhieu label CO HE THONG, khong ngau nhien.
     neg_ids, neg_log_q = neg_sampler.sample(
-        B, num_negatives, device, exclude=label_video_id_cpu, uniform=uniform_negatives,
+        B, num_negatives, device, exclude=target_ids_cpu,
     )
     neg_ts_cpu = label_timestamp_cpu.unsqueeze(1).expand(-1, num_negatives).reshape(-1)
     neg_e_i, _ = embed_items(
-        neg_ids.cpu().reshape(-1), neg_ts_cpu, dataset, item_embed, thresholds,
-        item_n_cache, category_n_cache, device,
+        neg_ids.cpu().reshape(-1), neg_ts_cpu, dataset, item_embed,
+        item_n_cache, category_n_cache, device, pct_table=pct_table,
     )
     neg_e_i = neg_e_i.view(B, num_negatives, -1)
     target_log_q = neg_sampler.log_q_for(target_ids_cpu.reshape(-1).to(device, non_blocking=True)).view(B, K)
@@ -236,30 +294,34 @@ def train(
     ffn_dim: int = 256,
     batch_size: int = 64,
     num_negatives: int = 512,
-    t_base: float = 0.1,
+    eval_negatives: int = 1024,
+    # [SUA 2026-10-07] 0.1 -> 0.8. `_score` khong con chia sqrt(d) nen t_base gio la nhiet do
+    # THAT; 0.8 = sqrt(64)*0.1 = dung nhiet do hieu dung cu => so cu van so sanh duoc.
+    t_base: float = 0.8,
     lr: float = 1e-3,
     ranking_loss_weight: float = 0.5,
     num_epochs: int = 1,
     max_steps_per_epoch: int | None = None,
     amp: bool = True,
-    use_softmax: bool = False,
-    static_delta: bool = False,
-    use_pmi: bool = True,
     use_qk: bool = True,
-    num_user_vectors: int = 1,
-    routing_reg_weight: float = 0.0,
     full_ranking: bool = False,
-    use_profile_token: bool = True,
-    interleave: bool = True,
-    static_user_weight: bool = False,
-    use_beta: bool = True,
     use_checkpoint: bool = False,
     save_every: int | None = None,
     save_path: str | None = None,
     resume: str | None = None,
     eval_only: bool = False,
-    uniform_negatives: bool = False,
-    log_user_maturity: bool = False,
+    # [THEM 2026-10-07] Split de eval. Mac dinh "val" — dung de TUNE/chon nhanh ablation.
+    # Truoc day ca hai cho goi evaluate() deu hardcode "val", nen `test.npy` (140,954 sample,
+    # da build tu 2026-09-17) CHUA BAO GIO duoc cham. Hau qua: ~11 nhanh ablation chon tren
+    # val roi BAO CAO cung bang val => moi so da cong bo (0.0376/0.0433/0.0465/0.0469, bang
+    # 2x3) bi bias boi model selection. Quy trinh dung: tune tren val, chot cau hinh, roi
+    # chay DUNG MOT LAN `--eval-split test` va bao so do.
+    eval_split: str = "val",
+    max_seq_len: int = MAX_SEQ_LEN,
+    random_window: bool = True,
+    no_tag: bool = False,
+    no_cat: bool = False,
+    no_age: bool = False,
     num_workers: int = 4,
     device_str: str = "cuda" if torch.cuda.is_available() else "cpu",
 ):
@@ -274,7 +336,10 @@ def train(
         if is_main:
             print(*a, **kw)
 
-    train_dataset = GenRecsysDataset(output_dir, split="train")
+    # random_window CHI o train (xem dataset._window_start): eval phai dung cua so ngay
+    # truoc diem du doan de khop serving.
+    train_dataset = GenRecsysDataset(output_dir, split="train", max_seq_len=max_seq_len,
+                                     random_window=random_window)
     train_sampler = (
         torch.utils.data.distributed.DistributedSampler(
             train_dataset, num_replicas=world_size, rank=rank, shuffle=True,
@@ -294,45 +359,28 @@ def train(
     num_music = int(train_dataset.item_static["music_idx"].max()) + 1
     num_categories = build_category_counts(output_dir / "item_static.npy")
 
+    # Nhanh 3 (category 4 cap) chi bat khi dataset CO du 4 field VA khong bi --no-cat.
+    num_category_levels = None if no_cat else train_dataset.num_category_levels()
     item_config = ItemEmbeddingConfig(
         num_items=num_items, num_authors=num_authors, num_music=num_music,
-        num_categories=num_categories, dim=dim,
+        num_categories=num_categories, num_category_levels=num_category_levels,
+        num_tags=train_dataset.num_tags(), use_tag=not no_tag, dim=dim,
     )
     item_embed = ItemEmbedding(item_config).to(device, non_blocking=True)
 
-    # Bảng PPMI (formula.md §4.1) — hằng số, KHÔNG có gradient, chỉ mu_h học được.
-    # 115 MB fp16 nên nạp thẳng lên device. Chạy build_pmi.py nếu chưa có.
-    pmi_table = None
-    if use_pmi:
-        pmi_path = Path(output_dir) / "pmi_table.npy"
-        if pmi_path.exists():
-            pmi_table = torch.from_numpy(np.load(pmi_path)).to(device)
-            print(f"[train] nạp pmi_table {tuple(pmi_table.shape)} ({pmi_table.element_size() * pmi_table.nelement() / 1e6:.0f} MB)")
-        else:
-            print(f"[train] KHÔNG thấy {pmi_path} — chạy preprocess_data/build_pmi.py. Tắt PMI bias.")
-
     seq_model = SequenceModel(
         dim=dim, num_heads=num_heads, num_layers=num_layers, ffn_dim=ffn_dim,
-        max_seq_len=(2 * MAX_SEQ_LEN if interleave else MAX_SEQ_LEN) + 1, interleave=interleave,
-        use_beta=use_beta, use_checkpoint=use_checkpoint,
-        use_softmax=use_softmax, static_delta=static_delta, use_pmi=use_pmi, use_qk=use_qk,
+        max_seq_len=2 * max_seq_len + 1,
+        use_checkpoint=use_checkpoint, use_qk=use_qk,
+        use_age=(train_dataset.has_age and not no_age),
     ).to(device, non_blocking=True)
-    profile_config = UserProfileConfig(
-        onehot_num_categories=train_dataset.onehot_num_categories, dim=dim,
-        use_profile_token=use_profile_token,
-    )
-    profile_embed = UserProfileEmbedding(profile_config).to(device, non_blocking=True)
-    thresholds = LearnableThresholds().to(device, non_blocking=True)
-    retrieval_loss_fn = RetrievalLoss(dim=dim, t_base=t_base,
-                                      num_user_vectors=num_user_vectors).to(device, non_blocking=True)
+    retrieval_loss_fn = RetrievalLoss(dim=dim, t_base=t_base).to(device, non_blocking=True)
     ranking_loss_fn = RankingLoss(dim=dim).to(device, non_blocking=True)
     neg_sampler = NegativeSampler(output_dir, num_items=num_items)
 
     dense_params = (
         item_embed.dense_parameters()
         + list(seq_model.parameters())
-        + list(profile_embed.parameters())
-        + list(thresholds.parameters())
         + list(retrieval_loss_fn.parameters())
         + list(ranking_loss_fn.parameters())
     )
@@ -345,31 +393,42 @@ def train(
 
         item_embed_ddp = DDP(item_embed, device_ids=[local_rank], find_unused_parameters=True)
         seq_model_ddp = DDP(seq_model, device_ids=[local_rank], find_unused_parameters=True)
-        profile_embed_ddp = DDP(profile_embed, device_ids=[local_rank], find_unused_parameters=True)
     else:
-        item_embed_ddp, seq_model_ddp, profile_embed_ddp = item_embed, seq_model, profile_embed
+        item_embed_ddp, seq_model_ddp = item_embed, seq_model
 
     log("[train] building N_i/N_category cache (1 lần, dùng xuyên suốt training)...")
 
     item_n_cache = build_n_cache("item_N")
     category_n_cache = build_n_cache("category_N")
 
+    # Bang N_i -> percentile, dung 1 LAN tren train (formula.md §0). Truoc 2026-10-05 cho
+    # nay truyen N_i THO vao item_weight — xem embed_items.
+    pct_table = build_percentile_table(train_dataset, item_n_cache)
+    log(f"[train] bang percentile N_i: {len(pct_table[0]):,} gia tri N_i duy nhat")
+
+    if no_tag and num_category_levels is None:
+        raise ValueError(
+            "--no-tag tren dataset khong co category 4 cap: content token chi con GMU va "
+            "`fuse` thanh phep chieu d->d. Gan nhu chac la nham co."
+        )
+
+    log(f"[train] nhanh tag: {'TAT' if no_tag else 'BAT'}"
+        f" | nhanh category 4 cap: "
+        f"{'BAT' if num_category_levels is not None else 'TAT'} | age: "
+        f"{'BAT' if (train_dataset.has_age and not no_age) else 'TAT'}")
+
     steps_per_epoch = min(len(train_loader), max_steps_per_epoch) if max_steps_per_epoch else len(train_loader)
 
     ckpt_modules = {
-        "item_embed": item_embed, "seq_model": seq_model, "profile_embed": profile_embed,
-        "thresholds": thresholds, "retrieval_loss_fn": retrieval_loss_fn,
-        "ranking_loss_fn": ranking_loss_fn,
+        "item_embed": item_embed, "seq_model": seq_model,
+        "retrieval_loss_fn": retrieval_loss_fn, "ranking_loss_fn": ranking_loss_fn,
     }
     ckpt_config = {
         "dim": dim, "num_heads": num_heads, "num_layers": num_layers, "ffn_dim": ffn_dim,
-        "amp": amp, "use_softmax": use_softmax, "static_delta": static_delta,
-        "use_pmi": use_pmi, "use_qk": use_qk, "num_user_vectors": num_user_vectors,
-        "routing_reg_weight": routing_reg_weight,
-        "use_profile_token": use_profile_token,
-        "interleave": interleave, "static_user_weight": static_user_weight,
-        "log_user_maturity": log_user_maturity,
-        "use_beta": use_beta,
+        "amp": amp, "use_qk": use_qk,
+        "max_seq_len": max_seq_len, "eval_negatives": eval_negatives,
+        "random_window": random_window,
+        "no_tag": no_tag, "no_cat": no_cat, "no_age": no_age,
     }
     ckpt_path = Path(save_path) if save_path else output_dir / "ckpt.pt"
 
@@ -385,10 +444,10 @@ def train(
 
     if eval_only:
         evaluate(
-            "val", output_dir, item_embed, seq_model, profile_embed, thresholds, neg_sampler,
-            retrieval_loss_fn, item_n_cache, category_n_cache, num_negatives, batch_size, device,
-            max_batches=max_steps_per_epoch, static_user_weight=static_user_weight,
-            num_workers=num_workers, uniform_negatives=uniform_negatives, pmi_table=pmi_table,
+            eval_split, output_dir, item_embed, seq_model, neg_sampler,
+            retrieval_loss_fn, item_n_cache, category_n_cache, eval_negatives, batch_size, device,
+            pct_table, max_seq_len=max_seq_len, max_batches=max_steps_per_epoch,
+            num_workers=num_workers,
             full_ranking=full_ranking,
         )
         return
@@ -399,6 +458,9 @@ def train(
     for epoch in range(start_epoch, num_epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
+        # Cua so truot phai DOI moi epoch, neu khong moi epoch cho cung cua so va tac dung
+        # "qua nhieu epoch thay het chuoi" mat han (dataset._window_start).
+        train_dataset.set_epoch(epoch)
         progress = tqdm(
             enumerate(train_loader), total=steps_per_epoch, desc=f"epoch {epoch}", unit="step",
             disable=not is_main,
@@ -413,11 +475,8 @@ def train(
             B = batch["hist_video_ids"].shape[0]
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
                 fwd = run_batch_forward(
-                    batch, train_dataset, item_embed_ddp, seq_model_ddp, profile_embed_ddp,
-                    thresholds, neg_sampler,
-                    item_n_cache, category_n_cache, num_negatives, device,
-                    static_user_weight=static_user_weight,
-                    log_user_maturity=log_user_maturity, pmi_table=pmi_table,
+                    batch, train_dataset, item_embed_ddp, seq_model_ddp, neg_sampler,
+                    item_n_cache, category_n_cache, num_negatives, device, pct_table,
                 )
                 forward_time_acc += time.perf_counter() - step_start
 
@@ -425,29 +484,6 @@ def train(
                     fwd["pred"], fwd["target_e_i"], fwd["neg_e_i"],
                     fwd["target_log_q"], fwd["neg_log_q"], fwd["pair_valid"],
                 )
-
-                if retrieval_loss_fn.num_user_vectors > 1:
-                    # forward_sequence cham MOI vi tri nen KHONG dung den cac `codes`.
-                    # Khong co loss nay thi codes khong nhan gradient nao. Loss o vi tri
-                    # CUOI chuoi — dung cho ham cham diem ma eval dung.
-                    e_u, routing = retrieval_loss_fn.user_vectors(
-                        fwd["pred"], fwd["key_padding_mask"])
-                    r_loss = r_loss + retrieval_loss_fn(
-                        e_u, fwd["cand_e_i"], fwd["log_q"],
-                        torch.zeros(e_u.shape[0], dtype=torch.long, device=e_u.device),
-                    )
-                    # CANH BAO (2026-09-30): loss CHINH (forward_sequence) van la
-                    # dot-product THUAN o moi vi tri => no huan luyen `hidden` de
-                    # dot-product thuan la tot, tuc TRUC TIEP thuong cho collapse.
-                    # Nhanh multi-vector nay chi la PHU, o 1 vi tri. Chua sua duoc vi
-                    # pool toan chuoi chi dinh nghia duoc o vi tri cuoi (ap moi vi tri
-                    # se RO RI tuong lai). Xem memory gen-recsys-multi-interest-literature.
-                    if routing_reg_weight > 0.0:
-                        # RR cua REMI: phat phuong sai routing. Repo goc lambda=100 cho
-                        # ca 3 dataset, nhung ho SUM theo batch con ta MEAN => thang do
-                        # KHAC, phai quet lai chu khong be nguyen 100.
-                        r_loss = r_loss + routing_reg_weight * (
-                            retrieval_loss_fn.routing_regularization(routing))
 
                 binary_labels = fwd["hist_action"][..., BINARY_ACTION_INDICES]
                 k_loss, _ = ranking_loss_fn.forward_sequence(
@@ -485,7 +521,6 @@ def train(
                 tqdm.write(f"[ckpt] đã lưu {ckpt_path} (epoch={epoch} step={step + 1})")
 
             if step % 50 == 0:
-                snap = thresholds.get_tau_snapshot()
                 forward_pct = 100.0 * forward_time_acc / step_time_acc if step_time_acc > 0 else 0.0
                 fwd_msg = f" | fwd%={forward_pct:.0f}"
                 forward_time_acc = 0.0
@@ -497,8 +532,7 @@ def train(
                         vals[pname] = sum(ps) / len(ps)
                 tqdm.write(
                     f"epoch={epoch} step={step} loss={loss.item():.4f} "
-                    f"retrieval={r_loss.item():.4f} ranking={k_loss.item():.4f} "
-                    f"tau_u={snap['tau_u']:.2f} tau_i={snap['tau_i']:.2f}"
+                    f"retrieval={r_loss.item():.4f} ranking={k_loss.item():.4f}"
                     f" | |b|={vals['beta']:.2e} |d|={vals['delta']:.2e}"
                     f" |ts|={vals['ts_w']:.2e}"
                     f" gb={grad_norms['beta']:.2e} gd={grad_norms['delta']:.2e}"
@@ -520,18 +554,16 @@ def train(
         if not is_main:
             continue
         evaluate(
-            "val", output_dir, item_embed, seq_model, profile_embed, thresholds, neg_sampler, retrieval_loss_fn,
-            item_n_cache, category_n_cache, num_negatives, batch_size, device,
-            max_batches=max_steps_per_epoch, static_user_weight=static_user_weight,
-            num_workers=num_workers, log_user_maturity=log_user_maturity,
-            pmi_table=pmi_table, full_ranking=full_ranking,
+            eval_split, output_dir, item_embed, seq_model, neg_sampler, retrieval_loss_fn,
+            item_n_cache, category_n_cache, eval_negatives, batch_size, device,
+            pct_table, max_seq_len=max_seq_len, max_batches=max_steps_per_epoch,
+            num_workers=num_workers, full_ranking=full_ranking,
         )
 
     cleanup_ddp(ddp)
 
 
-_CKPT_MODULES = ("item_embed", "seq_model", "profile_embed", "thresholds",
-                 "retrieval_loss_fn", "ranking_loss_fn")
+_CKPT_MODULES = ("item_embed", "seq_model", "retrieval_loss_fn", "ranking_loss_fn")
 
 
 def cleanup_ddp(ddp: bool) -> None:
@@ -713,8 +745,6 @@ def evaluate(
     output_dir: Path,
     item_embed: ItemEmbedding,
     seq_model: SequenceModel,
-    profile_embed: UserProfileEmbedding,
-    thresholds: LearnableThresholds,
     neg_sampler: NegativeSampler,
     retrieval_loss_fn: RetrievalLoss,
     item_n_cache: dict,
@@ -722,16 +752,14 @@ def evaluate(
     num_negatives: int,
     batch_size: int,
     device: torch.device,
+    pct_table: tuple[np.ndarray, np.ndarray],
+    max_seq_len: int = MAX_SEQ_LEN,
     max_batches: int | None = None,
-    static_user_weight: bool = False,
     num_workers: int = 4,
-    uniform_negatives: bool = False,
-    log_user_maturity: bool = False,
-    pmi_table: torch.Tensor | None = None,
     full_ranking: bool = False,
 ) -> None:
     """Đánh giá Recall/NDCG@K trên split (val/test), tách theo 4 nhóm cold-start — xem"""
-    dataset = GenRecsysDataset(output_dir, split=split)
+    dataset = GenRecsysDataset(output_dir, split=split, max_seq_len=max_seq_len)
     loader = DataLoader(
         dataset, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, pin_memory=(device.type == "cuda"),
@@ -739,25 +767,21 @@ def evaluate(
 
     item_embed.eval()
     seq_model.eval()
-    profile_embed.eval()
 
     all_metrics: dict[str, list[torch.Tensor]] = {}
     all_user_cold, all_item_cold, all_user_lowhist = [], [], []
-    all_hist_ids, all_label_id, all_valid = [], [], []
-
-    # (num_items, num_tags) bool — dùng phân loại vị trí tín hiệu. Dựng 1 lần mỗi eval.
-    tag_ids = torch.from_numpy(dataset.item_static["tag_ids"].astype("int64"))
-    item_tag_table = torch.zeros(tag_ids.shape[0], int(tag_ids.max()) + 1, dtype=torch.bool)
-    item_tag_table.scatter_(1, tag_ids, True)
-    item_tag_table[:, 0] = False          # index 0 là padding, không phải tag thật
     all_n_u = []
     all_m_sat = []
-    all_uv_cos: list[float] = []
     all_rank, all_norm_user, all_norm_pos, all_n_cand = [], [], [], []
 
-    # FULL RANKING (Krichene & Rendle KDD 2020): sampled metric KHONG bao toan phat bieu
-    # so sanh ("A tot hon B" co the lat khi do full), nen bang 2x3 do bang 512 negative
-    # CHUA chac giu thu tu. 7583 item du nho de xep hang TOAN BO.
+    # FULL RANKING -- CHI dung duoc tren catalog NHO (Pure: 7,583 item).
+    #
+    # [CHOT 2026-10-05] 27K co 32M item => KHONG ai full-rank o co do (8.2 GB embedding +
+    # 32.8 GB logit moi batch 256). Lat cat chinh tren 27K dung `--eval-negatives 1024`.
+    # Co nay GIU LAI vi no la bang chung cho bang 2x3 TREN PURE: Krichene & Rendle (KDD
+    # 2020) chung minh sampled metric khong bao toan phat bieu so sanh ("A tot hon B" co
+    # the LAT khi do full), nen bang 2x3 cua Pure can mot lan do full de xac nhan thu tu.
+    # Da chay: hr@10 full-ranking 0.0469 vs sampled 0.0469 => thu tu GIU.
     # Nhung item embedding KHONG phu thuoc timestamp o nhanh candidate: dong 160/190 deu
     # vut bo `item_weight` (`label_e_i, _` / `neg_e_i, _`), no chi dung cho history.
     # => nhung ca catalog MOT LAN, dung lai cho moi batch.
@@ -769,7 +793,8 @@ def evaluate(
             chunks = []
             for lo in range(0, ids.shape[0], 2048):
                 e, _ = embed_items(ids[lo:lo + 2048], ts0[lo:lo + 2048], dataset, item_embed,
-                                   thresholds, item_n_cache, category_n_cache, device)
+                                   item_n_cache, category_n_cache, device,
+                                   pct_table=pct_table)
                 chunks.append(e)
             all_item_e = torch.cat(chunks, dim=0)          # (num_items, d)
         print(f"  [full-ranking] xep hang tren TOAN BO {all_item_e.shape[0]:,} item "
@@ -781,14 +806,10 @@ def evaluate(
             break
 
         fwd = run_batch_forward(
-            batch, dataset, item_embed, seq_model, profile_embed, thresholds, neg_sampler,
-            item_n_cache, category_n_cache, num_negatives, device,
-            static_user_weight=static_user_weight, uniform_negatives=uniform_negatives,
-            log_user_maturity=log_user_maturity, pmi_table=pmi_table,
+            batch, dataset, item_embed, seq_model, neg_sampler,
+            item_n_cache, category_n_cache, num_negatives, device, pct_table,
         )
-        # M=1: e_user_eval (B,d). M>1: pool Poly-encoder tu TOAN chuoi -> (B,M,d).
-        e_u = fwd["e_user_eval"] if retrieval_loss_fn.num_user_vectors == 1 else \
-            retrieval_loss_fn.user_vectors(fwd["pred"], fwd["key_padding_mask"])[0]
+        e_u = fwd["e_user_eval"]
         if full_ranking:
             # Dat positive vao COT 0 nhu cand_e_i de compute_metrics_at_k khong doi:
             # cham diem toan catalog, roi hoan vi cot cua item dich ve dau.
@@ -801,8 +822,6 @@ def evaluate(
             eval_logit = torch.cat([pos_col, eval_logit[:, 1:]], dim=1)
         else:
             eval_logit = retrieval_loss_fn.eval_logit(e_u, fwd["cand_e_i"])
-        if retrieval_loss_fn.num_user_vectors > 1:
-            all_uv_cos.append(retrieval_loss_fn.user_vector_cosine(e_u))
 
         batch_metrics = compute_metrics_at_k(eval_logit)
         order = torch.argsort(eval_logit, dim=1, descending=True)
@@ -816,19 +835,8 @@ def evaluate(
         all_user_cold.append(fwd["is_user_cold"])
         all_item_cold.append(fwd["is_item_cold"])
         all_user_lowhist.append(fwd["is_user_lowhistory"])
-        all_hist_ids.append(fwd["hist_video_ids"])
-        all_label_id.append(fwd["label_video_id"])
-        all_valid.append(fwd["hist_valid_mask"].cpu())
         all_n_u.append(fwd["n_u_at_pred"])
         all_m_sat.append(fwd["m_saturated_frac"])
-
-    if all_uv_cos:
-        # CHI SO THOAI HOA: cosine -> 1 nghia la M vector da hoi tu ve mot, M chi ton tham so.
-        c = sum(all_uv_cos) / len(all_uv_cos)
-        flag = "  [!] DA THOAI HOA ve mot vector" if c > 0.95 else ""
-        print()
-        print(f"  --- MULTI-VECTOR: cosine trung binh giua "
-              f"{retrieval_loss_fn.num_user_vectors} vector user = {c:.4f}{flag}")
 
     per_sample_metrics = {k: torch.cat(v) for k, v in all_metrics.items()}
     is_user_cold = torch.cat(all_user_cold)
@@ -846,19 +854,13 @@ def evaluate(
     result_overall = aggregate_by_group(
         per_sample_metrics, {"all": torch.ones(n_all, dtype=torch.bool)})
 
-    # Truc CHINH: tag item dich nam o lich su gan / xa / ca hai / khong dau (formula.md §−1).
-    signal_masks = classify_signal_position(
-        torch.cat(all_hist_ids), torch.cat(all_label_id), torch.cat(all_valid), item_tag_table)
-    result_signal = aggregate_by_group(per_sample_metrics, signal_masks)
-
     # Lat cat phu: cold user theo hai dinh nghia (strict holdout / few-shot).
     result_cold = aggregate_by_group(per_sample_metrics, {
         "warm_user": ~is_user_cold,
         "cold_user": is_user_cold,
         "lowhistory": is_user_lowhist,
     })
-    print_eval_report(result_overall, thresholds.get_tau_snapshot(),
-                      result_signal=result_signal, result_cold=result_cold)
+    print_eval_report(result_overall, result_cold=result_cold)
 
     # Lat cat cold DUY NHAT so sanh duoc: khop n_u (do 2026-09-29, xem eval.py).
     n_u_all = torch.cat(all_n_u)
@@ -866,18 +868,8 @@ def evaluate(
         per_sample_metrics, is_user_cold, ~is_user_cold, n_u_all,
         name_a="cold", name_b="warm"), expect="b>a")
 
-    # `both` vs `only_short` KHOP n_u — phep do QUYET DINH cho gia thuyet nghen output.
-    # Tho: both 0.0491 < only_short 0.0828, dung lam co so cho ca huong multi-vector.
-    # Nhung `both` median n_u=68 vs only_short=17 (lech 4.0x) va n_u<=10 thi vung `far`
-    # RONG nen KHONG THE vao `both` — dung confound da giet ket luan cold>warm.
-    # Ky vong NEU nghen output la that: both VAN thap hon sau khi khop (a>b sai ky vong).
-    print_matched(matched_by_n_u(
-        per_sample_metrics, signal_masks["both"], signal_masks["only_short"], n_u_all,
-        name_a="both", name_b="onlyshort"), expect="a>b")
-
     item_embed.train()
     seq_model.train()
-    profile_embed.train()
 
 
 if __name__ == "__main__":
@@ -886,14 +878,6 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-epochs", type=int, default=1)
     parser.add_argument("--max-steps-per-epoch", type=int, default=None)
-    parser.add_argument("--softmax-attn", action="store_true", help="ABLATION (formula.md §4.4): softmax thay cho sigmoid")
-    parser.add_argument("--static-delta", action="store_true", help="ABLATION (formula.md §4.4): delta hằng số thay cho delta_h(x_q)")
-    parser.add_argument("--no-pmi", action="store_true", help="ABLATION: tắt PMI bias")
-    parser.add_argument("--num-user-vectors", type=int, default=1,
-                        help="M vector user, routing kieu ComiRec-SA + argmax readout "
-                             "(formula.md §5). M=1 la ban cu. HAI LAN TRUOC DEU COLLAPSE "
-                             "(cosine 0.98) — doc memory gen-recsys-multi-interest-literature "
-                             "truoc khi thu lai. Dung KEM --routing-reg-weight.")
     parser.add_argument("--full-ranking", action="store_true",
                         help="Eval xep hang tren TOAN BO catalog thay vi 1 positive + "
                              "--num-negatives mau. Krichene & Rendle (KDD 2020) chung minh "
@@ -901,27 +885,51 @@ if __name__ == "__main__":
                              "co the LAT khi do full (BERT4Rec vs SASRec la vi du that). "
                              "7583 item du nho de xep hang toan bo. SO SE TUT MANH — day la "
                              "so THAT va so duoc voi literature.")
-    parser.add_argument("--routing-reg-weight", type=float, default=0.0,
-                        help="RR cua REMI (arXiv 2302.14532 eq.13): phat phuong sai routing "
-                             "de bo sparsity. Trong Table 4 cua ho, RR manh hon HAN "
-                             "regularization tren khong gian bieu dien (+28~47%% vs +1~7%%). "
-                             "Repo goc lambda=100 nhung ho SUM theo batch, ta MEAN => PHAI QUET. "
-                             "0 = tat. Chi co tac dung khi --num-user-vectors > 1.")
     parser.add_argument("--no-qk", action="store_true",
                         help="ABLATION FuXi-beta (arXiv 2508.10615): bo han q.k, attention chi "
                              "con bias. Ho bao bo q.k TOT HON tren MovieLens — kiem tren KuaiRand.")
     parser.add_argument("--no-amp", action="store_true", help="Tắt fp16 autocast + GradScaler (mặc định BẬT trên CUDA). Dùng khi nghi ngờ vấn đề độ chính xác")
-    parser.add_argument("--no-profile-token", action="store_true", help="Không prepend e_profile làm token 0 của chuỗi — ablation (xem user_embedding.py)")
-    parser.add_argument("--no-interleave", action="store_true", help="Cộng gộp item+action vào 1 token (chuỗi K) thay vì xen kẽ [Φ,a,Φ,a,...] (chuỗi 2K, đúng HSTU) — ablation")
-    parser.add_argument("--static-user-weight", action="store_true", help="ABLATION #5: u_i TĨNH per-user (N_u tại điểm dự đoán, broadcast ra K vị trí) thay vì per-position. Thí nghiệm tách bạch đóng góp 'cold-start là đại lượng per-position' — xem run_batch_forward()")
-    parser.add_argument("--no-beta", action="store_true", help="ABLATION #3: tắt số hạng β·log m_j trong attention bias")
+    parser.add_argument("--eval-negatives", type=int, default=1024,
+                        help="So candidate luc EVAL = 1 positive + (N-1) negative. KHAC "
+                             "--num-negatives (512, dung cho sampled-softmax luc train: do "
+                             "la ngan sach gradient, da do la du). 1024 la quy uoc nganh cho "
+                             "catalog lon: full-ranking tren 32M item khong ai lam. CHU Y: "
+                             "sampled metric KHONG bao toan phat bieu so sanh (Krichene & "
+                             "Rendle KDD 2020) nen moi bang so sanh phai bao cao CUNG mot N.")
+    parser.add_argument("--max-seq-len", type=int, default=MAX_SEQ_LEN,
+                        help="Do dai cua so lich su K. 256 la so cua Pure (p99=234). Tren "
+                             "27K median 1,744 / p99 12,915 nen K=256 chi giu 9.8%% tuong "
+                             "tac — dung 1024 tro len. Attention O((2K)^2): K=1024 ton 16x, "
+                             "K=2048 ton 64x so voi 256.")
+    parser.add_argument("--no-random-window", action="store_true",
+                        help="Tat cua so truot ngau nhien luc train (xem "
+                             "dataset._window_start). Mac dinh BAT: cua so co dinh cat cung "
+                             "vung 'xa', dung thu ma delta_h(x_q) can de hoc pham vi nhin.")
+    parser.add_argument("--no-tag", action="store_true",
+                        help="ABLATION (formula.md muc 1): bo nhanh 2 (tag) cua content "
+                             "token. Bi CHAN khi dataset cung khong co category 4 cap — "
+                             "luc do content token chi con GMU, khong con gi de hop nhat.")
+    parser.add_argument("--no-cat", action="store_true",
+                        help="ABLATION (formula.md §1): bo nhanh 3 cua content token "
+                             "(category 4 cap), W^fuse ve d x 2d. Khong co tac dung tren "
+                             "dataset khong co kuairand_video_categories.csv (Pure) vi "
+                             "nhanh nay da tu tat san.")
+    parser.add_argument("--no-age", action="store_true",
+                        help="ABLATION (formula.md §2): bo W_age.phi(age_t) khoi action "
+                             "token. W_age zero-init nen da co ablation gian tiep qua "
+                             "||W_age|| sau train; co nay cho ablation TRUC TIEP. Khong co "
+                             "tac dung khi upload_dt qua it gia tri (Pure: 3 ngay).")
     parser.add_argument("--save-every", type=int, default=None, help="Lưu checkpoint mỗi N step (ngoài lần lưu cuối mỗi epoch, vốn LUÔN chạy). Dùng khi session hay bị ngắt giữa chừng")
     parser.add_argument("--save-path", default=None, help="Đường dẫn checkpoint; mặc định <output-dir>/ckpt.pt. Trên Kaggle nên trỏ vào /kaggle/working (output-dir có thể read-only)")
     parser.add_argument("--resume", default=None, help="Nạp checkpoint và train TIẾP từ đúng step đã dừng (gồm cả optimizer state)")
     parser.add_argument("--num-workers", type=int, default=4, help="Worker nạp dữ liệu (mặc định 4). Nghẽn là CPU chứ không phải GPU — đặt 0 để debug hoặc khi môi trường không cho fork")
     parser.add_argument("--eval-only", action="store_true", help="Không train, chỉ nạp checkpoint (--resume/--save-path) và chạy evaluate() — dùng để chạy lại chẩn đoán trên CÙNG model, ~8 phút thay vì train lại ~2 giờ")
-    parser.add_argument("--log-user-maturity", action="store_true", help="[ĐÃ THỬ, CÓ HẠI — ĐỪNG BẬT] log1p(N_u)-log1p(τ_u) thay log(tanh(N_u/τ_u)) cho log_u. Bão hoà của cái cũ CÓ THẬT (|prod| yếu đi 1,000 lần ở user warm) nhưng KHÔNG phải nguyên nhân rank xấu: train lại cho warm_warm 0.2574->0.2175 (-16%%) và rho(N_u,rank) không nhúc nhích (+0.081->+0.0755, còn tệ hơn: +0.120). Nguyên nhân thật là CONFOUND độ khó — xem _report_confound_diagnostic(). Giữ lại để ablation")
-    parser.add_argument("--uniform-negatives", action="store_true", help="CHẨN ĐOÁN [2026-09-21]: eval với candidate rút UNIFORM thay vì theo tần suất. Trả lời: item cold recall=0 vì embedding rác, hay vì luôn phải đấu 100 item warm? Chỉ dùng với --eval-only")
+    parser.add_argument("--eval-split", choices=["val", "test"], default="val",
+                        help="Split để eval. 'val' (mặc định) dùng để TUNE và chọn nhánh "
+                             "ablation. 'test' chỉ chạy ĐÚNG MỘT LẦN sau khi đã chốt cấu "
+                             "hình — mọi số báo cáo phải lấy từ đây. Trước 2026-10-07 cả "
+                             "hai chỗ gọi evaluate() đều hardcode 'val' nên test.npy chưa "
+                             "bao giờ được chấm, và tune/report dùng chung một split.")
     parser.add_argument("--checkpoint", action="store_true", help="Gradient checkpointing: chậm ~30%%, tiết kiệm ~70%% VRAM. BẮT BUỘC cho nhánh có γ ở batch=256 trên T4 15GB (nếu không sẽ CUDA OOM ở loss.backward)")
     args = parser.parse_args()
     train(
@@ -930,23 +938,19 @@ if __name__ == "__main__":
         num_epochs=args.num_epochs,
         max_steps_per_epoch=args.max_steps_per_epoch,
         amp=not args.no_amp,
-        use_softmax=args.softmax_attn,
-        static_delta=args.static_delta,
-        use_pmi=not args.no_pmi,
         use_qk=not args.no_qk,
-        num_user_vectors=args.num_user_vectors,
-        routing_reg_weight=args.routing_reg_weight,
         full_ranking=args.full_ranking,
-        use_profile_token=not args.no_profile_token,
-        interleave=not args.no_interleave,
-        static_user_weight=args.static_user_weight,
-        use_beta=not args.no_beta,
         use_checkpoint=args.checkpoint,
         save_every=args.save_every,
         save_path=args.save_path,
         resume=args.resume,
         eval_only=args.eval_only,
-        uniform_negatives=args.uniform_negatives,
-        log_user_maturity=args.log_user_maturity,
+        eval_split=args.eval_split,
+        eval_negatives=args.eval_negatives,
+        max_seq_len=args.max_seq_len,
+        random_window=not args.no_random_window,
+        no_tag=args.no_tag,
+        no_cat=args.no_cat,
+        no_age=args.no_age,
         num_workers=args.num_workers,
     )
