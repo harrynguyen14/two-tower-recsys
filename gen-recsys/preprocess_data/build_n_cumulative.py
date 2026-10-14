@@ -30,7 +30,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
-from schema import (  # [SỬA 2026-10-07] đường dẫn gom về schema.py (env GEN_RECSYS_DATASET)
+from schema import (
     LOG_SCHEMA,
     LOG_STANDARD_FILES,
     VIDEO_BASIC_CATEGORY_FIELD,
@@ -45,8 +45,8 @@ from schema import (  # [SỬA 2026-10-07] đường dẫn gom về schema.py (e
 # ngay với FileNotFoundError: item_N_ids.npy — 5/5 nhánh ablation cùng chết.
 #
 # Dùng env var thay vì thêm tham số hàm: build_n_cache()/lookup_n_at_t_batch() được gọi từ
-# 4 file khác nhau (train.py, build_interactions.py, build_dataset_kuairand.py,
-# test_pipeline_smoke.py); đổi chữ ký hàm sẽ phải sửa cả 4 và dễ sót. train.py set env này
+# nhiều file khác nhau (train.py, build_interactions.py, test_pipeline_smoke.py); đổi chữ ký
+# hàm sẽ phải sửa hết và dễ sót. train.py set env này
 # ngay khi biết --output-dir, TRƯỚC khi import module — xem train.py.
 # Không set env -> giữ nguyên hành vi cũ, nên 4 caller hiện tại không bị ảnh hưởng.
 OUT_DIR = Path(os.environ.get("GEN_RECSYS_OUT_DIR") or (Path(__file__).parent / "output"))
@@ -112,8 +112,8 @@ def build_item_n_cumulative() -> None:
 # Ly do: KHONG AI DOC file no ghi ra. `dataset.py` lay hist_n_u bang phep tru
 # `(window_start - user_start) + arange(window_len)` — dung cung so, re hon han, khong can
 # searchsorted. Pass nay sinh ra 2026-09-14 cho `user_weight` per-position; `user_weight` da
-# bo 2026-10-06 cung tau_u (formula.md §0: 27K khong co cold user, VA attention khong doc
-# log_u o bat ky so hang nao cua §4.1). Tren 27K no quet 322M dong de ghi file khong ai mo.
+# bo 2026-10-06 cung tau_u (formula.md §0: attention khong doc log_u o bat ky so hang nao
+# cua §4.1), nen file ghi ra khong ai mo.
 #
 # `hist_n_u` VAN SONG nhung chi dung 1 gia tri cuoi (`n_u_at_pred`) cho chan doan
 # `matched_by_n_u` o eval — khop confound, khong vao model.

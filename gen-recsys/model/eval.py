@@ -1,10 +1,10 @@
 """Đánh giá model — HR@K, Recall@K, NDCG@K.
 
 [XOÁ 2026-10-05] `classify_signal_position` / `SIGNAL_GROUPS` / `SHORT_WINDOW` đã BỎ:
-nhãn short/long dựa trên cửa sổ 10-item CỐ ĐỊNH, đo lại trên 27K cho thấy cửa sổ đó trải
-199.8h và 68.6% nhãn SAI (formula.md §10). Trục chính giờ là bảng 2x3 ablation, không phải
-lát cắt vị trí tín hiệu. `matched_by_n_u` giữ lại — nó là công cụ khớp confound, dùng cho
-cold/warm và bất kỳ hai nhóm nào chạm ở vị trí chuỗi khác nhau.
+nhãn short/long dựa trên cửa sổ 10-item CỐ ĐỊNH, đo lại cho thấy cửa sổ đó trải 199.8h và
+68.6% nhãn SAI (formula.md §10). Trục chính giờ là bảng 2x3 ablation, không phải lát cắt vị
+trí tín hiệu. `matched_by_n_u` giữ lại — nó là công cụ khớp confound, dùng cho cold/warm và
+bất kỳ hai nhóm nào chạm ở vị trí chuỗi khác nhau.
 
 Bảng 4 ô cold-start (user×item) ĐÃ BỎ: định vị cold-start không còn theo đuổi.
 """
@@ -12,6 +12,29 @@ Bảng 4 ô cold-start (user×item) ĐÃ BỎ: định vị cold-start không c�
 from __future__ import annotations
 
 import torch
+
+
+@torch.no_grad()
+def compute_positive_rank(logit: torch.Tensor) -> torch.Tensor:
+    """Thu hang (rank) cua positive (luon o cot 0), tie-safe.
+
+    [SỬA 2026-10-13] KHÔNG dùng `argsort` — nó không `stable=True` nên khi có TIE (nhiều
+    candidate cùng logit), PyTorch không đảm bảo thứ tự, và vì positive luôn ở cột 0, tie
+    thường cho positive "thắng" một cách hệ thống (bias lạc quan). Đây là lỗi nặng hơn sau
+    khi đổi dot-product -> cosine (bị chặn [-1,1] -> tie nhiều hơn hẳn). Thay bằng rank kỳ
+    vọng dưới hoán vị ngẫu nhiên của các phần tử bằng nhau: rank = n_greater + n_tie/2
+    (n_tie KHÔNG tính chính positive).
+
+    [SỬA 2026-10-14 — code review] Tach thanh ham RIENG, dung CHUNG cho ca
+    compute_metrics_at_k (hr/ndcg/mrr) VA moi noi khac can rank (train.py diagnostics) —
+    truoc day train.py tu tinh LAI rank bang argsort cu ngay ben canh loi goi
+    compute_metrics_at_k, lam 2 bo so lieu (headline metric vs diagnostics) LECH NHAU
+    tren chinh batch do khi co tie.
+    """
+    pos_logit = logit[:, :1]
+    n_greater = (logit > pos_logit).sum(dim=1).float()
+    n_tie = (logit == pos_logit).sum(dim=1).float() - 1.0  # trừ chính positive (cột 0)
+    return n_greater + n_tie / 2.0
 
 
 @torch.no_grad()
@@ -24,8 +47,7 @@ def compute_metrics_at_k(
     Positive luôn ở cột 0. Với 1 positive/sample thì HR@K == Recall@K về giá trị; giữ cả
     hai vì literature báo cáo lẫn lộn hai tên và ta cần đối chiếu trực tiếp.
     """
-    order = torch.argsort(logit, dim=1, descending=True)
-    positive_rank = (order == 0).float().argmax(dim=1)
+    positive_rank = compute_positive_rank(logit)
 
     metrics: dict[str, torch.Tensor] = {}
     for k in k_values:

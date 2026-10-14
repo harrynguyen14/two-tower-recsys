@@ -6,7 +6,6 @@ import argparse
 import os
 import sys
 import time
-import os
 from pathlib import Path
 
 import numpy as np
@@ -32,7 +31,7 @@ from build_n_cumulative import build_n_cache, lookup_n_at_t_batch_cached
 
 from dataset import ACTION_VECTOR_FIELDS, GenRecsysDataset, ITEM_CATEGORICAL_FIELDS, MAX_SEQ_LEN
 from eval import (aggregate_by_group, matched_by_n_u, compute_metrics_at_k,
-                  print_matched, print_eval_report)
+                  compute_positive_rank, print_matched, print_eval_report)
 from item_embedding import ItemEmbedding, ItemEmbeddingConfig
 from learnable_thresholds import (item_percentile_table,
                                   lookup_percentile)
@@ -57,30 +56,25 @@ def item_features_to_device(features: dict, device: torch.device) -> dict:
         "music_idx": features["music_idx"].to(device, non_blocking=True),
         "caption_embedding": features["caption_embedding"].to(device, non_blocking=True),
         "caption_mask": features["caption_mask"].to(device, non_blocking=True),
-        "category_level_ids": (
-            {k: v.to(device, non_blocking=True)
-             for k, v in features["category_level_ids"].items()}
-            if features["category_level_ids"] is not None else None
-        ),
     }
 
 
-def compute_n_i_n_category(
-    dataset: GenRecsysDataset,
+def compute_n_i(
     item_n_cache: dict,
-    category_n_cache: dict,
     video_ids_cpu: torch.Tensor,
     timestamps_cpu: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """N_i(video_id, t) qua item_N, N_category(category_id, t) qua category_N — CẢ HAI"""
+) -> torch.Tensor:
+    """N_i(video_id, t) qua item_N — tra tai DUNG thoi diem t (khong leak tuong lai).
+
+    [SUA 2026-10-13 — error.md #8] Truoc la `compute_n_i_n_category`, tra CA N_i va
+    N_category; N_category tinh ra roi BI BO (`n_i, _ = compute_n_i_n_category(...)`),
+    khong bao gio vao model (category_id da rut khoi content token tu lau, thay bang
+    tag_ids — xem dataset.py). Xoa han phan tinh du, doi ten ham dung voi viec no lam.
+    """
     video_ids_np = video_ids_cpu.numpy()
     ts_np = timestamps_cpu.numpy()
     n_i = lookup_n_at_t_batch_cached(item_n_cache, video_ids_np, ts_np)
-
-    category_ids_np = dataset.get_category_ids(video_ids_cpu).numpy()
-    n_category = lookup_n_at_t_batch_cached(category_n_cache, category_ids_np, ts_np)
-
-    return torch.from_numpy(n_i.astype(np.float32)), torch.from_numpy(n_category.astype(np.float32))
+    return torch.from_numpy(n_i.astype(np.float32))
 
 
 def embed_items(
@@ -89,7 +83,6 @@ def embed_items(
     dataset: GenRecsysDataset,
     item_embed: ItemEmbedding,
     item_n_cache: dict,
-    category_n_cache: dict,
     device: torch.device,
     pct_table: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -103,7 +96,7 @@ def embed_items(
     `pct_table` dựng 1 lần trên train (xem build_percentile_table); None thì bỏ hẳn số
     hạng maturity thay vì âm thầm dùng thang sai.
     """
-    n_i, _ = compute_n_i_n_category(dataset, item_n_cache, category_n_cache, video_ids_cpu, timestamps_cpu)
+    n_i = compute_n_i(item_n_cache, video_ids_cpu, timestamps_cpu)
     if pct_table is None:
         raise ValueError(
             "embed_items cần pct_table: `log m_p` nhận PERCENTILE, truyền N_i thô sẽ "
@@ -119,13 +112,42 @@ def embed_items(
         video_ids_cpu.to(device, non_blocking=True), features["category_ids"],
         features["author_idx"], features["music_idx"],
         features["caption_embedding"], features["caption_mask"], features["tag_ids"],
-        category_level_ids=features["category_level_ids"],
     )
     return e_i_final, item_weight
 
 
+def load_or_compute_p80(
+    dataset: GenRecsysDataset, output_dir: Path | None,
+) -> np.int64:
+    """Doc mốc p80 tu `train_val_boundary_p80.npy` (ghi boi build_interactions.py).
+
+    [SỬA 2026-10-13 — error.md #15] p80 ĐỌC từ file (CÙNG lúc tính split train/val/test
+    ở build_interactions.py) nếu file tồn tại — trước đây TÍNH LẠI độc lập bằng
+    `np.percentile` ngay tại đây, 2 nguồn không có gì đảm bảo mãi khớp nếu 1 trong 2 công
+    thức đổi. Fallback tính lại + CẢNH BÁO nếu file chưa có (dữ liệu cũ build trước khi
+    thêm dòng lưu file này).
+
+    [SỬA 2026-10-14 — doc lai code] Tach thanh ham RIENG, dung CHUNG cho ca
+    build_percentile_table (bang maturity) VA NegativeSampler (tranh leak val/test,
+    error.md #9) — truoc day CA HAI noi doc file nay DOC LAP, gay trung lap khong can
+    thiet (khong sai, nhung thua).
+    """
+    p80_path = Path(output_dir) / "train_val_boundary_p80.npy" if output_dir else None
+    if p80_path is not None and p80_path.exists():
+        return np.int64(np.load(p80_path))
+    import warnings
+    warnings.warn(
+        "train_val_boundary_p80.npy khong ton tai — TINH LAI p80 doc lap tai day "
+        "(co the LECH voi build_interactions.py neu khong cung du lieu/cong thuc). "
+        "Build lai du lieu de dung file nguon duy nhat.",
+        stacklevel=2,
+    )
+    label_t = dataset.history_meta["t"][dataset.sample_position].astype(np.int64)
+    return np.int64(np.percentile(label_t, 80))
+
+
 def build_percentile_table(
-    dataset: GenRecsysDataset, item_n_cache: dict,
+    dataset: GenRecsysDataset, item_n_cache: dict, p80: np.int64,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Bảng N_i -> percentile, dựng 1 LẦN trên TRAIN (formula.md §0).
 
@@ -140,11 +162,10 @@ def build_percentile_table(
     train+test: giá trị runtime point-in-time nhưng PHÉP BIẾN ĐỔI fit trên tương lai).
     Đo được mức độ: spearman(N_i cuối kỳ, N_i tại p80) = 0.9883 — băng thông hẹp, nhưng
     15.5% item lệch percentile > 0.05 (max 0.745), đủ để reviewer bắt. Sửa rẻ nên sửa.
-    p80 tính lại đúng công thức của build_interactions.py:86 (percentile 80 của timestamp
-    LABEL), không đọc từ file vì pipeline không lưu mốc này ra đâu.
+
+    [SỬA 2026-10-14] `p80` nay la THAM SO (tinh 1 lan boi load_or_compute_p80 o train()),
+    khong tu doc file RIENG nua — xem load_or_compute_p80.
     """
-    label_t = dataset.history_meta["t"][dataset.sample_position].astype(np.int64)
-    p80 = np.int64(np.percentile(label_t, 80))
     ids = np.arange(dataset.item_static.shape[0], dtype=np.int64)
     t_train_end = np.full(ids.shape[0], p80, dtype=np.int64)
     n_i_all = lookup_n_at_t_batch_cached(item_n_cache, ids, t_train_end)
@@ -173,7 +194,6 @@ def run_batch_forward(
     seq_model: SequenceModel,
     neg_sampler: NegativeSampler,
     item_n_cache: dict,
-    category_n_cache: dict,
     num_negatives: int,
     device: torch.device,
     pct_table: tuple[np.ndarray, np.ndarray],
@@ -192,7 +212,7 @@ def run_batch_forward(
 
     hist_e_i, hist_item_weight = embed_items(
         hist_video_ids_cpu.reshape(-1), hist_timestamps_cpu.reshape(-1),
-        dataset, item_embed, item_n_cache, category_n_cache, device,
+        dataset, item_embed, item_n_cache, device,
         pct_table=pct_table,
     )
     hist_e_i = hist_e_i.view(B, K, -1)
@@ -210,7 +230,7 @@ def run_batch_forward(
 
     label_e_i, _ = embed_items(
         label_video_id_cpu, label_timestamp_cpu, dataset, item_embed,
-        item_n_cache, category_n_cache, device, pct_table=pct_table,
+        item_n_cache, device, pct_table=pct_table,
     )
     _ie = getattr(item_embed, "module", item_embed)
     label_embed_stats = {k: v.clone() for k, v in _ie._last_stats.items()}
@@ -247,7 +267,7 @@ def run_batch_forward(
     neg_ts_cpu = label_timestamp_cpu.unsqueeze(1).expand(-1, num_negatives).reshape(-1)
     neg_e_i, _ = embed_items(
         neg_ids.cpu().reshape(-1), neg_ts_cpu, dataset, item_embed,
-        item_n_cache, category_n_cache, device, pct_table=pct_table,
+        item_n_cache, device, pct_table=pct_table,
     )
     neg_e_i = neg_e_i.view(B, num_negatives, -1)
     target_log_q = neg_sampler.log_q_for(target_ids_cpu.reshape(-1).to(device, non_blocking=True)).view(B, K)
@@ -295,13 +315,34 @@ def train(
     batch_size: int = 64,
     num_negatives: int = 512,
     eval_negatives: int = 1024,
-    # [SUA 2026-10-07] 0.1 -> 0.8. `_score` khong con chia sqrt(d) nen t_base gio la nhiet do
-    # THAT; 0.8 = sqrt(64)*0.1 = dung nhiet do hieu dung cu => so cu van so sanh duoc.
-    t_base: float = 0.8,
+    # [SUA 2026-10-09] 0.8 -> 0.07 + hoc duoc. `_score` gio L2-NORMALIZE ca hai phia nen
+    # diem la COSINE trong [-1,1]: 0.8 cu cho logit toi da 1.25 — qua phang de phan biet
+    # 7,583 item. 0.07 ~ init CLIP, va `learnable_temp` de model tu tim. Chi tiet nguyen nhan
+    # (|e_pos| troi len 473 sau fix #1 => CE saturate => hr@10 0.0018): retrieval.py.
+    # CANH BAO: doi thang logit => checkpoint TRUOC 10-09 KHONG nap lai de so sanh duoc.
+    t_base: float = 0.07,
+    learnable_temp: bool = True,
+    # [THEM 2026-10-13] CCR (Zhou et al. AAAI'24, arXiv:2401.00165) — formula.md §5bis.
+    # 0.0 MAC DINH: loss khong doi (ablation sach). Khong co co CLI, cung nhom "sieu tham
+    # so khong co co" nhu t_base/ranking_loss_weight — can tune can than tren validation,
+    # khong nen de bat nham qua dong lenh.
+    ccr_beta: float = 0.0,
     lr: float = 1e-3,
+    # [THEM 2026-10-13] error.md #21: da co scaler.unscale_(optimizer) truoc buoc nay
+    # (de clip o DUNG thang gradient that, khong phai thang da nhan fp16 scale) nhung
+    # truoc day KHONG clip gi ca — mat chinh ly do thuong lam unscale_ som. 1.0 la gia
+    # tri mac dinh pho bien (PyTorch tutorial, nhieu paper NLP/recsys), chua tune rieng
+    # cho model nay.
+    grad_clip_norm: float = 1.0,
     ranking_loss_weight: float = 0.5,
     num_epochs: int = 1,
     max_steps_per_epoch: int | None = None,
+    # [THEM 2026-10-13] error.md #22: truoc day evaluate() dung CHUNG max_steps_per_epoch
+    # (gioi han so BATCH TRAIN moi epoch cho debug/chay nhanh) de cat luon so batch EVAL —
+    # cung loai rui ro "tune va report tren cung split" da tung tra gia (xem loi #4 dau
+    # formula.md). Tach rieng: None = eval tren TOAN BO (hanh vi mac dinh cu neu
+    # max_steps_per_epoch=None, nhung tu nay KHONG con bi anh huong boi gia tri train).
+    eval_max_batches: int | None = None,
     amp: bool = True,
     use_qk: bool = True,
     dynamic_ts: bool = False,
@@ -323,10 +364,9 @@ def train(
     random_window: bool = True,
     no_tag: bool = False,
     # [THEM 2026-10-08] Bo nhanh caption khoi GMU. Dung de chay thu model KHI CHUA CO
-    # caption_embeddings.npy (tren 27K: 22.9 GB fp16, encode ~32h). Dataset cung TU DONG
-    # tat khi thieu file, nen co nay chi can khi muon tat DU DA co file (ablation that).
+    # caption_embeddings.npy. Dataset cung TU DONG tat khi thieu file, nen co nay chi can
+    # khi muon tat DU DA co file (ablation that).
     no_caption: bool = False,
-    no_cat: bool = False,
     no_age: bool = False,
     num_workers: int = 4,
     device_str: str = "cuda" if torch.cuda.is_available() else "cpu",
@@ -366,11 +406,9 @@ def train(
     num_music = int(train_dataset.item_static["music_idx"].max()) + 1
     num_categories = build_category_counts(output_dir / "item_static.npy")
 
-    # Nhanh 3 (category 4 cap) chi bat khi dataset CO du 4 field VA khong bi --no-cat.
-    num_category_levels = None if no_cat else train_dataset.num_category_levels()
     item_config = ItemEmbeddingConfig(
         num_items=num_items, num_authors=num_authors, num_music=num_music,
-        num_categories=num_categories, num_category_levels=num_category_levels,
+        num_categories=num_categories,
         num_tags=train_dataset.num_tags(), use_tag=not no_tag, dim=dim,
         # `train_dataset.use_caption` da gop ca co --no-caption LAN viec file co ton tai
         # khong (dataset tu tat khi thieu), nen lay tu day thay vi tu `no_caption`.
@@ -386,9 +424,16 @@ def train(
         static_delta=static_delta,
         use_age=(train_dataset.has_age and not no_age),
     ).to(device, non_blocking=True)
-    retrieval_loss_fn = RetrievalLoss(dim=dim, t_base=t_base).to(device, non_blocking=True)
+    retrieval_loss_fn = RetrievalLoss(
+        dim=dim, t_base=t_base, learnable_temp=learnable_temp, ccr_beta=ccr_beta,
+    ).to(device, non_blocking=True)
     ranking_loss_fn = RankingLoss(dim=dim).to(device, non_blocking=True)
-    neg_sampler = NegativeSampler(output_dir, num_items=num_items)
+    # [THEM 2026-10-13 — error.md #9, DON 2026-10-14] Doc p80 MOT LAN DUY NHAT, dung chung
+    # cho ca NegativeSampler (tranh leak val+test vao phan phoi negative) VA
+    # build_percentile_table (tranh leak vao bang maturity) — truoc day 2 cho doc file
+    # nay DOC LAP nhau, trung lap khong can thiet.
+    p80 = load_or_compute_p80(train_dataset, output_dir)
+    neg_sampler = NegativeSampler(output_dir, num_items=num_items, p80=p80)
 
     dense_params = (
         item_embed.dense_parameters()
@@ -408,26 +453,23 @@ def train(
     else:
         item_embed_ddp, seq_model_ddp = item_embed, seq_model
 
-    log("[train] building N_i/N_category cache (1 lần, dùng xuyên suốt training)...")
+    log("[train] building N_i cache (1 lần, dùng xuyên suốt training)...")
 
     item_n_cache = build_n_cache("item_N")
-    category_n_cache = build_n_cache("category_N")
 
     # Bang N_i -> percentile, dung 1 LAN tren train (formula.md §0). Truoc 2026-10-05 cho
     # nay truyen N_i THO vao item_weight — xem embed_items.
-    pct_table = build_percentile_table(train_dataset, item_n_cache)
+    pct_table = build_percentile_table(train_dataset, item_n_cache, p80)
     log(f"[train] bang percentile N_i: {len(pct_table[0]):,} gia tri N_i duy nhat")
 
-    if no_tag and num_category_levels is None:
+    if no_tag:
         raise ValueError(
-            "--no-tag tren dataset khong co category 4 cap: content token chi con GMU va "
-            "`fuse` thanh phep chieu d->d. Gan nhu chac la nham co."
+            "--no-tag: content token chi con GMU va `fuse` thanh phep chieu d->d, khong "
+            "con gi de hop nhat. Gan nhu chac la nham co."
         )
 
     log(f"[train] nhanh tag: {'TAT' if no_tag else 'BAT'}"
-        f" | nhanh category 4 cap: "
-        f"{'BAT' if num_category_levels is not None else 'TAT'} | age: "
-        f"{'BAT' if (train_dataset.has_age and not no_age) else 'TAT'}")
+        f" | age: {'BAT' if (train_dataset.has_age and not no_age) else 'TAT'}")
 
     steps_per_epoch = min(len(train_loader), max_steps_per_epoch) if max_steps_per_epoch else len(train_loader)
 
@@ -439,12 +481,24 @@ def train(
         "dim": dim, "num_heads": num_heads, "num_layers": num_layers, "ffn_dim": ffn_dim,
         "amp": amp, "use_qk": use_qk, "dynamic_ts": dynamic_ts,
         "static_delta": static_delta,
+        "t_base": t_base, "learnable_temp": learnable_temp,
         "max_seq_len": max_seq_len, "eval_negatives": eval_negatives,
         "random_window": random_window,
-        "no_tag": no_tag, "no_cat": no_cat, "no_age": no_age,
+        "no_tag": no_tag, "no_age": no_age,
         # Lay tu dataset (gop ca co --no-caption lan viec file co ton tai), de checkpoint
         # ghi dung cau hinh THUC TE da train, khong phai y dinh tren CLI.
         "use_caption": train_dataset.use_caption,
+    }
+    # [THEM 2026-10-13] error.md #18: hyperparameter HUAN LUYEN (duoc phep doi giua cac
+    # lan resume, vd ha lr) — KHONG dua vao ckpt_config (cai do RAISE khi lech, dung cho
+    # KIEN TRUC). Thieu field nay thi checkpoint khong tu du de biet da chay voi gia tri
+    # gi, phai nho/doc lai log CLI (neu con).
+    run_metadata = {
+        "lr": lr, "grad_clip_norm": grad_clip_norm,
+        "ranking_loss_weight": ranking_loss_weight,
+        "batch_size": batch_size, "num_negatives": num_negatives,
+        "eval_negatives": eval_negatives, "ccr_beta": ccr_beta,
+        "full_ranking": full_ranking, "eval_split": eval_split,
     }
     ckpt_path = Path(save_path) if save_path else output_dir / "ckpt.pt"
 
@@ -457,13 +511,18 @@ def train(
         )
         start_epoch, start_step = state["epoch"], state["step"]
         log(f"[resume] nạp {src} — epoch={start_epoch} step={start_step}")
+        # [SUA 2026-10-14 — code review] In run_metadata cua LAN CHAY TRUOC — truoc day
+        # save_checkpoint ghi field nay nhung khong noi nao doc lai, nguoi resume van
+        # phai tu nho/doc log CLI cu (dung dieu #18 dinh sua).
+        if state.get("run_metadata"):
+            log(f"[resume] hyperparameter lan chay truoc: {state['run_metadata']}")
 
     if eval_only:
         evaluate(
             eval_split, output_dir, item_embed, seq_model, neg_sampler,
-            retrieval_loss_fn, item_n_cache, category_n_cache, eval_negatives, batch_size, device,
+            retrieval_loss_fn, item_n_cache, eval_negatives, batch_size, device,
             pct_table, use_caption=train_dataset.use_caption,
-            max_seq_len=max_seq_len, max_batches=max_steps_per_epoch,
+            max_seq_len=max_seq_len, max_batches=eval_max_batches,
             num_workers=num_workers,
             full_ranking=full_ranking,
         )
@@ -493,7 +552,7 @@ def train(
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
                 fwd = run_batch_forward(
                     batch, train_dataset, item_embed_ddp, seq_model_ddp, neg_sampler,
-                    item_n_cache, category_n_cache, num_negatives, device, pct_table,
+                    item_n_cache, num_negatives, device, pct_table,
                 )
                 forward_time_acc += time.perf_counter() - step_start
 
@@ -512,6 +571,13 @@ def train(
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
+
+            # [THEM 2026-10-13] error.md #21: da unscale_ (dung de clip o DUNG thang
+            # gradient that) nhung truoc day KHONG clip gi — bo lo chinh ly do thuong
+            # goi unscale_ som. Thieu clip => mot batch co gradient dot bien (vd item
+            # cuc hiem, log(m_p) rat am truoc khi tach beta thanh gate, hoac delta_proj
+            # troi xa — xem formula.md §4.1bis/§4.1ter) co the day optimizer di xa.
+            torch.nn.utils.clip_grad_norm_(dense_params, max_norm=grad_clip_norm)
 
             grad_norms = {}
             for pname in ("beta", "delta", "ts_w"):
@@ -533,7 +599,7 @@ def train(
                     ckpt_path, epoch=epoch, step=step + 1,
                     global_step=epoch * steps_per_epoch + step + 1, modules=ckpt_modules,
                     optimizer=optimizer, scaler=scaler,
-                    config=ckpt_config,
+                    config=ckpt_config, run_metadata=run_metadata,
                 )
                 tqdm.write(f"[ckpt] đã lưu {ckpt_path} (epoch={epoch} step={step + 1})")
 
@@ -562,7 +628,7 @@ def train(
                 ckpt_path, epoch=epoch + 1, step=0,
                 global_step=(epoch + 1) * steps_per_epoch, modules=ckpt_modules,
                 optimizer=optimizer, scaler=scaler,
-                config=ckpt_config,
+                config=ckpt_config, run_metadata=run_metadata,
             )
             print(f"[ckpt] đã lưu {ckpt_path} (hết epoch {epoch})")
         if ddp:
@@ -572,9 +638,9 @@ def train(
             continue
         evaluate(
             eval_split, output_dir, item_embed, seq_model, neg_sampler, retrieval_loss_fn,
-            item_n_cache, category_n_cache, eval_negatives, batch_size, device,
+            item_n_cache, eval_negatives, batch_size, device,
             pct_table, use_caption=train_dataset.use_caption,
-            max_seq_len=max_seq_len, max_batches=max_steps_per_epoch,
+            max_seq_len=max_seq_len, max_batches=eval_max_batches,
             num_workers=num_workers, full_ranking=full_ranking,
         )
 
@@ -591,12 +657,23 @@ def cleanup_ddp(ddp: bool) -> None:
 
 
 def save_checkpoint(path: Path, *, epoch: int, step: int, global_step: int,
-                    modules: dict, optimizer, scaler, config: dict) -> None:
-    """Lưu đủ để train tiếp ĐÚNG chỗ đã dừng, không chỉ để eval."""
+                    modules: dict, optimizer, scaler, config: dict,
+                    run_metadata: dict | None = None) -> None:
+    """Lưu đủ để train tiếp ĐÚNG chỗ đã dừng, không chỉ để eval.
+
+    [THEM 2026-10-13] error.md #18: `config` CHỈ chứa tham số KIẾN TRÚC (dim, num_heads,
+    ...) — `load_checkpoint` so khớp nó và RAISE nếu lệch (đúng, vì đổi kiến trúc giữa
+    chừng ra model lai). `run_metadata` là field RIÊNG, KHÔNG đi qua so khớp đó, dùng để
+    ghi lại hyperparameter huấn luyện (lr, batch_size, ranking_loss_weight...) — các giá
+    trị NÀY được phép đổi giữa các lần resume (ví dụ hạ lr) nên không thể nhồi vào
+    `config`. Thiếu field này thì checkpoint không tự đủ để reproduce — trước đây chỉ có
+    thể suy luận ngược từ lệnh CLI đã chạy (nếu còn nhớ/còn log).
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     blob = {
         "epoch": epoch, "step": step, "global_step": global_step, "config": config,
+        "run_metadata": run_metadata or {},
         "optimizer": optimizer.state_dict(),
         "scaler": scaler.state_dict(),
     }
@@ -609,7 +686,11 @@ def save_checkpoint(path: Path, *, epoch: int, step: int, global_step: int,
 
 def load_checkpoint(path: Path, *, modules: dict, optimizer=None, scaler=None,
                     config: dict | None = None) -> dict:
-    """Nạp checkpoint; trả về {"epoch", "step", "global_step"} để train() chạy tiếp."""
+    """Nạp checkpoint; trả về {"epoch", "step", "global_step", "run_metadata"}.
+
+    [SUA 2026-10-14] Doc lai docstring: them "run_metadata" (hyperparameter huan luyen
+    cua lan chay truoc, xem save_checkpoint) — truoc day chi tra 3 key dau, dung trong
+    khi code da them key thu 4 (error.md #18 nang cap)."""
     blob = torch.load(Path(path), map_location="cpu", weights_only=False)
 
     if config is not None:
@@ -637,7 +718,12 @@ def load_checkpoint(path: Path, *, modules: dict, optimizer=None, scaler=None,
     if scaler is not None and "scaler" in blob:
         scaler.load_state_dict(blob["scaler"])
     return {"epoch": blob.get("epoch", 0), "step": blob.get("step", 0),
-            "global_step": blob.get("global_step", 0)}
+            "global_step": blob.get("global_step", 0),
+            # [SUA 2026-10-14 — code review] Truoc day save_checkpoint ghi run_metadata
+            # (lr, grad_clip_norm, ranking_loss_weight...) nhung load_checkpoint KHONG
+            # doc lai field nay — write-only, khong giai quyet dung muc tieu #18 (muc
+            # tieu la checkpoint TU DU de reproduce/kiem tra khi resume).
+            "run_metadata": blob.get("run_metadata", {})}
 
 
 def _report_history_diagnostic(
@@ -766,7 +852,6 @@ def evaluate(
     neg_sampler: NegativeSampler,
     retrieval_loss_fn: RetrievalLoss,
     item_n_cache: dict,
-    category_n_cache: dict,
     num_negatives: int,
     batch_size: int,
     device: torch.device,
@@ -796,11 +881,10 @@ def evaluate(
 
     # FULL RANKING -- CHI dung duoc tren catalog NHO (Pure: 7,583 item).
     #
-    # [CHOT 2026-10-05] 27K co 32M item => KHONG ai full-rank o co do (8.2 GB embedding +
-    # 32.8 GB logit moi batch 256). Lat cat chinh tren 27K dung `--eval-negatives 1024`.
-    # Co nay GIU LAI vi no la bang chung cho bang 2x3 TREN PURE: Krichene & Rendle (KDD
-    # 2020) chung minh sampled metric khong bao toan phat bieu so sanh ("A tot hon B" co
-    # the LAT khi do full), nen bang 2x3 cua Pure can mot lan do full de xac nhan thu tu.
+    # [CHOT 2026-10-05] Co nay GIU LAI vi no la bang chung cho bang 2x3 TREN PURE: Krichene &
+    # Rendle (KDD 2020) chung minh sampled metric khong bao toan phat bieu so sanh ("A tot
+    # hon B" co the LAT khi do full), nen bang 2x3 cua Pure can mot lan do full de xac nhan
+    # thu tu.
     # Da chay: hr@10 full-ranking 0.0469 vs sampled 0.0469 => thu tu GIU.
     # Nhung item embedding KHONG phu thuoc timestamp o nhanh candidate: dong 160/190 deu
     # vut bo `item_weight` (`label_e_i, _` / `neg_e_i, _`), no chi dung cho history.
@@ -813,7 +897,7 @@ def evaluate(
             chunks = []
             for lo in range(0, ids.shape[0], 2048):
                 e, _ = embed_items(ids[lo:lo + 2048], ts0[lo:lo + 2048], dataset, item_embed,
-                                   item_n_cache, category_n_cache, device,
+                                   item_n_cache, device,
                                    pct_table=pct_table)
                 chunks.append(e)
             all_item_e = torch.cat(chunks, dim=0)          # (num_items, d)
@@ -827,7 +911,7 @@ def evaluate(
 
         fwd = run_batch_forward(
             batch, dataset, item_embed, seq_model, neg_sampler,
-            item_n_cache, category_n_cache, num_negatives, device, pct_table,
+            item_n_cache, num_negatives, device, pct_table,
         )
         e_u = fwd["e_user_eval"]
         if full_ranking:
@@ -844,8 +928,11 @@ def evaluate(
             eval_logit = retrieval_loss_fn.eval_logit(e_u, fwd["cand_e_i"])
 
         batch_metrics = compute_metrics_at_k(eval_logit)
-        order = torch.argsort(eval_logit, dim=1, descending=True)
-        rank = (order == 0).float().argmax(dim=1)
+        # [SUA 2026-10-14 — code review] Truoc day tinh LAI rank bang argsort KHONG
+        # stable ngay ben canh loi goi compute_metrics_at_k (von da dung cong thuc
+        # tie-safe) — lam 2 bo so lieu (headline metric vs diagnostics all_rank) LECH
+        # NHAU tren chinh batch co tie. Dung chung ham compute_positive_rank.
+        rank = compute_positive_rank(eval_logit)
         all_rank.append(rank.cpu())
         all_norm_user.append(fwd["e_user_eval"].norm(dim=-1).cpu())
         all_norm_pos.append(fwd["cand_e_i"][:, 0].norm(dim=-1).cpu())
@@ -898,6 +985,10 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-epochs", type=int, default=1)
     parser.add_argument("--max-steps-per-epoch", type=int, default=None)
+    parser.add_argument("--eval-max-batches", type=int, default=None,
+                        help="[error.md #22] So batch EVAL toi da, TACH RIENG khoi "
+                             "--max-steps-per-epoch (von chi gioi han batch TRAIN). "
+                             "Mac dinh None = eval tren TOAN BO split.")
     parser.add_argument("--full-ranking", action="store_true",
                         help="Eval xep hang tren TOAN BO catalog thay vi 1 positive + "
                              "--num-negatives mau. Krichene & Rendle (KDD 2020) chung minh "
@@ -911,6 +1002,11 @@ if __name__ == "__main__":
     parser.add_argument("--dynamic-ts", action="store_true",
                         help="W_ts DONG: bang tra vector dieu bien theo query (formula.md §4.1). "
                              "Mac dinh TINH (scalar moi bucket).")
+    parser.add_argument("--t-base", type=float, default=0.07,
+                        help="Nhiet do retrieval (thang COSINE). Neu --learnable-temp (mac dinh) "
+                             "thi day la gia tri KHOI TAO; neu --fixed-temp thi la hang so.")
+    parser.add_argument("--fixed-temp", action="store_true",
+                        help="Nhiet do CO DINH o --t-base thay vi hoc duoc (ablation).")
     parser.add_argument("--static-delta", action="store_true",
                         help="delta TINH: dong bang delta_proj o zero => delta_h hang so qua moi "
                              "query. O A1/A3 cua bang 2x2 (formula.md §4.4 nhom A).")
@@ -923,23 +1019,15 @@ if __name__ == "__main__":
                              "sampled metric KHONG bao toan phat bieu so sanh (Krichene & "
                              "Rendle KDD 2020) nen moi bang so sanh phai bao cao CUNG mot N.")
     parser.add_argument("--max-seq-len", type=int, default=MAX_SEQ_LEN,
-                        help="Do dai cua so lich su K. 256 la so cua Pure (p99=234). Tren "
-                             "27K median 1,744 / p99 12,915 nen K=256 chi giu 9.8%% tuong "
-                             "tac — dung 1024 tro len. Attention O((2K)^2): K=1024 ton 16x, "
-                             "K=2048 ton 64x so voi 256.")
+                        help="Do dai cua so lich su K. 256 la so cua Pure (p99=234). "
+                             "Attention O((2K)^2): K=1024 ton 16x, K=2048 ton 64x so voi 256.")
     parser.add_argument("--no-random-window", action="store_true",
                         help="Tat cua so truot ngau nhien luc train (xem "
                              "dataset._window_start). Mac dinh BAT: cua so co dinh cat cung "
                              "vung 'xa', dung thu ma delta_h(x_q) can de hoc pham vi nhin.")
     parser.add_argument("--no-tag", action="store_true",
                         help="ABLATION (formula.md muc 1): bo nhanh 2 (tag) cua content "
-                             "token. Bi CHAN khi dataset cung khong co category 4 cap — "
-                             "luc do content token chi con GMU, khong con gi de hop nhat.")
-    parser.add_argument("--no-cat", action="store_true",
-                        help="ABLATION (formula.md §1): bo nhanh 3 cua content token "
-                             "(category 4 cap), W^fuse ve d x 2d. Khong co tac dung tren "
-                             "dataset khong co kuairand_video_categories.csv (Pure) vi "
-                             "nhanh nay da tu tat san.")
+                             "token — content token chi con GMU, khong con gi de hop nhat.")
     parser.add_argument("--no-age", action="store_true",
                         help="ABLATION (formula.md §2): bo W_age.phi(age_t) khoi action "
                              "token. W_age zero-init nen da co ablation gian tiep qua "
@@ -953,11 +1041,8 @@ if __name__ == "__main__":
     parser.add_argument("--no-caption", action="store_true",
                         help="ABLATION (formula.md §1): bo modality `caption` khoi GMU. "
                              "Dataset TU DONG tat khi thieu caption_embeddings.npy, nen co "
-                             "nay chi can khi muon tat DU DA co file. Tren 27K file do nang "
-                             "22.9 GB fp16 (32,038,725 x 384) va phai encode ~32h, nen day la "
-                             "duong chay thu model truoc khi encode xong. GMU con 4 modality "
-                             "(video_type, music_type, author, music) + nhanh tag + nhanh "
-                             "category 4 cap.")
+                             "nay chi can khi muon tat DU DA co file. GMU con 4 modality "
+                             "(video_type, music_type, author, music) + nhanh tag.")
     parser.add_argument("--eval-split", choices=["val", "test"], default="val",
                         help="Split để eval. 'val' (mặc định) dùng để TUNE và chọn nhánh "
                              "ablation. 'test' chỉ chạy ĐÚNG MỘT LẦN sau khi đã chốt cấu "
@@ -965,16 +1050,32 @@ if __name__ == "__main__":
                              "hai chỗ gọi evaluate() đều hardcode 'val' nên test.npy chưa "
                              "bao giờ được chấm, và tune/report dùng chung một split.")
     parser.add_argument("--checkpoint", action="store_true", help="Gradient checkpointing: chậm ~30%%, tiết kiệm ~70%% VRAM. BẮT BUỘC cho nhánh có γ ở batch=256 trên T4 15GB (nếu không sẽ CUDA OOM ở loss.backward)")
+    # [THEM 2026-10-13] error.md #20: lr/ranking_loss_weight la tham so cua train() tu
+    # lau nhung chua bao gio co co CLI — chi doi duoc bang cach goi train() truc tiep
+    # tu Python, khong qua dong lenh.
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate (Adam)")
+    parser.add_argument("--ranking-loss-weight", type=float, default=0.5,
+                        help="He so lambda nhan vao ranking loss truoc khi cong voi "
+                             "retrieval loss (L = L_ret + lambda*L_rank)")
+    parser.add_argument("--grad-clip-norm", type=float, default=1.0,
+                        help="[error.md #21] Max norm cho clip_grad_norm_, ap dung "
+                             "SAU scaler.unscale_ (dung thang gradient that)")
     args = parser.parse_args()
     train(
         output_dir=args.output_dir,
         batch_size=args.batch_size,
         num_epochs=args.num_epochs,
         max_steps_per_epoch=args.max_steps_per_epoch,
+        eval_max_batches=args.eval_max_batches,
         amp=not args.no_amp,
         use_qk=not args.no_qk,
         dynamic_ts=args.dynamic_ts,
         static_delta=args.static_delta,
+        t_base=args.t_base,
+        learnable_temp=not args.fixed_temp,
+        lr=args.lr,
+        grad_clip_norm=args.grad_clip_norm,
+        ranking_loss_weight=args.ranking_loss_weight,
         full_ranking=args.full_ranking,
         use_checkpoint=args.checkpoint,
         save_every=args.save_every,
@@ -987,7 +1088,6 @@ if __name__ == "__main__":
         max_seq_len=args.max_seq_len,
         random_window=not args.no_random_window,
         no_tag=args.no_tag,
-        no_cat=args.no_cat,
         no_age=args.no_age,
         num_workers=args.num_workers,
     )

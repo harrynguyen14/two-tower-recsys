@@ -19,8 +19,8 @@ KuaiRand-Pure ở BẤT KỲ mốc train/test nào — 99% trong 7,551 item "ra 
 chỉ trong 3 NGÀY ĐẦU của cửa sổ log 29.5 ngày (2,771+3,328+1,380 item ở ngày 0-2), sau đó
 gần như KHÔNG có item mới nào xuất hiện nữa (chỉ vài đơn vị/ngày). Ở mốc p80 hiện tại,
 strict item-holdout chỉ cho ĐÚNG 11 item / 27 dòng tương tác — quá mỏng để đo bất kỳ metric
-nào có ý nghĩa. Đây là ĐẶC ĐIỂM CỦA CHÍNH DATASET (Pure là catalog "chính" đã lọc sẵn, khác
-27K có 32M item và luồng item mới liên tục), KHÔNG phải lỗi chọn mốc.
+nào có ý nghĩa. Đây là ĐẶC ĐIỂM CỦA CHÍNH DATASET (Pure là catalog "chính" đã lọc sẵn),
+KHÔNG phải lỗi chọn mốc.
 
 **GIỚI HẠN CẦN GHI RÕ TRONG BÁO CÁO**: is_item_cold trên Pure đo "item ít tương tác tính
 đến thời điểm đó" (low-interaction), KHÔNG phải "item hoàn toàn mới, chưa từng huấn luyện"
@@ -69,8 +69,6 @@ import numpy as np
 from build_n_cumulative import lookup_n_at_t_batch
 from schema import COLD_THRESHOLD_N, LOW_HISTORY_N
 
-# [SỬA 2026-10-07] Theo env `GEN_RECSYS_OUT_DIR` như build_n_cumulative.py đã làm — nếu
-# không, build 27K sẽ ghi train/val/test.npy ĐÈ lên output Pure mà không cảnh báo gì.
 OUT_DIR = Path(os.environ.get("GEN_RECSYS_OUT_DIR") or (Path(__file__).parent / "output"))
 
 
@@ -90,6 +88,14 @@ def build_interactions() -> None:
     train_mask = label_timestamps <= p80
     val_mask = (label_timestamps > p80) & (label_timestamps <= p90)
     test_mask = label_timestamps > p90
+
+    # [THEM 2026-10-13] error.md #15: p80 LA mot nguon duy nhat tu gio. Truoc day
+    # train.py (build_percentile_table) TINH LAI p80 bang np.percentile RIENG tren
+    # label_t cua chinh no — 2 noi doc lap tinh CUNG 1 so, khong co gi dam bao mai khop
+    # neu 1 trong 2 cong thuc doi (vd doi tu percentile 80 sang gia tri khac). Luu ra
+    # file de train.py doc lai, khong tinh lai.
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    np.save(OUT_DIR / "train_val_boundary_p80.npy", np.array(p80, dtype=np.int64))
 
     # N_u tại thời điểm sample = số token lịch sử TRƯỚC vị trí này, tính từ đầu user
     # (sample_position - user_offsets[user] = số token đã đi qua, KHÔNG tính chính label

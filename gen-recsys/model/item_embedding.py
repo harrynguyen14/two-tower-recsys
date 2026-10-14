@@ -10,12 +10,57 @@ from gmu import GMU
 # category ĐÃ RA KHỎI GMU (xem ItemEmbedding.forward). Chỉ còn 2 field nhỏ ở đây.
 CATEGORICAL_FIELDS = ["video_type_id", "music_type_id"]
 
-# Nhánh 3 (formula.md §1) — category 4 cấp, CHỈ có trên 27K (Pure không có file
-# kuairand_video_categories.csv). Thiếu field trong item_static => nhánh tự tắt.
-CATEGORY_LEVEL_FIELDS = ["cat_l1_id", "cat_l2_id", "cat_l3_id", "cat_l4_id"]
-
 TAG_PAD = 0  # khớp build_item_static.TAG_PAD — index 0 = "không có tag"
-CATEGORY_PAD = 0  # khớp build_item_static: UNKNOWN (-124 ở CSV) -> 0
+
+
+class TagPMA(nn.Module):
+    """Pooling by Multihead Attention, k=1 (Lee et al. ICML 2019, arXiv:1810.00825).
+
+    PMA_1(Z) = MAB(s, rFF(Z)), MAB(X,Y) = LayerNorm(H + rFF(H)),
+    H = LayerNorm(X + Multihead(X,Y,Y)). Seed s hoc duoc, KHONG phu thuoc item — dong vai
+    tro "query ngam dinh" hoi tap tag "tag nao quan trong nhat o day".
+
+    So voi mean-pooling cu: trong so tag KHONG con chia deu 1/|T_t|, ma hoc qua attention.
+    Dung cho |T_t| NHO (Pure: toi da 3 tag/item) — formula.md §1 da ghi ro rui ro CHUA
+    kiem chung o quy mo set nho nay, khac boi canh goc cua paper (set lon, point cloud).
+    """
+
+    def __init__(self, dim: int, num_heads: int = 4):
+        super().__init__()
+        assert dim % num_heads == 0, "dim phai chia het cho num_heads"
+        self.dim = dim
+        self.num_heads = num_heads
+        self.seed = nn.Parameter(torch.empty(1, 1, dim))
+        nn.init.xavier_uniform_(self.seed)
+
+        self.rff_in = nn.Sequential(nn.Linear(dim, dim), nn.ReLU())
+        self.mha = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.ln1 = nn.LayerNorm(dim)
+        self.rff_out = nn.Sequential(nn.Linear(dim, dim), nn.ReLU(), nn.Linear(dim, dim))
+        self.ln2 = nn.LayerNorm(dim)
+
+    def forward(self, tags: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+        """tags: (N, T, dim) tag embedding (gom ca PAD). valid_mask: (N, T) bool, True=tag that.
+
+        Item khong co tag that nao (valid_mask toan False) se khien softmax attention tren
+        toan bo hang la -inf -> NaN. Xu ly: voi item do, bo qua key_padding_mask (attend
+        deu moi slot, dieu bang PAD=0 cua tag_embedding) — ket qua la vector gan 0, khop
+        hanh vi "item khong tag" cua ban mean-pooling cu.
+        """
+        n = tags.shape[0]
+        z = self.rff_in(tags)
+        seed = self.seed.expand(n, -1, -1)
+
+        has_any_valid = valid_mask.any(dim=-1)
+        key_padding_mask = ~valid_mask
+        key_padding_mask = torch.where(
+            has_any_valid.unsqueeze(-1), key_padding_mask, torch.zeros_like(key_padding_mask)
+        )
+
+        attn_out, _ = self.mha(seed, z, z, key_padding_mask=key_padding_mask, need_weights=False)
+        h = self.ln1(seed + attn_out)
+        out = self.ln2(h + self.rff_out(h))
+        return out.squeeze(1)
 
 
 class ItemEmbeddingConfig:
@@ -28,7 +73,6 @@ class ItemEmbeddingConfig:
         num_tags: int,
         use_tag: bool = True,
         use_caption: bool = True,
-        num_category_levels: dict[str, int] | None = None,
         dim: int = 64,
         cat_embed_dim: int = 16,
         id_embed_dim: int = 16,
@@ -42,14 +86,10 @@ class ItemEmbeddingConfig:
         # False = ablation --no-tag: bo nhanh 2, W^fuse bot 1 nhanh (formula.md muc 1)
         self.use_tag = use_tag
         # [THEM 2026-10-08] False = ablation --no-caption: bo modality `caption` khoi GMU.
-        # Dung de chay duoc KHI CHUA CO caption_embeddings.npy — tren 27K file do nang
-        # 22.9 GB fp16 (32,038,725 x 384) va phai encode ~15.4h, nen can chay thu model
-        # truoc khi cho encode xong. GMU con 4 modality (video_type, music_type, author,
-        # music) + nhanh tag + nhanh category 4 cap, nen content token VAN phan biet duoc
-        # item; gate softmax tu chuan hoa lai tren 4 modality (xem gmu.py).
+        # Dung de chay duoc KHI CHUA CO caption_embeddings.npy. GMU con 4 modality
+        # (video_type, music_type, author, music) + nhanh tag, nen content token VAN phan
+        # biet duoc item; gate softmax tu chuan hoa lai tren 4 modality (xem gmu.py).
         self.use_caption = use_caption
-        # None = dataset KHÔNG có category 4 cấp (Pure) => nhánh 3 tắt, W^fuse về d x 2d
-        self.num_category_levels = num_category_levels
         self.dim = dim
         self.cat_embed_dim = cat_embed_dim
         self.id_embed_dim = id_embed_dim
@@ -83,23 +123,14 @@ class ItemEmbedding(nn.Module):
             nn.Embedding(config.num_tags, config.dim, padding_idx=TAG_PAD)
             if config.use_tag else None
         )
+        # [THEM 2026-10-09] PMA (Lee et al. ICML 2019, arXiv:1810.00825 cong thuc 11/6/7),
+        # thay mean-pooling cu — xem formula.md §1. k=1 seed vector hoc duoc, MAB = 2 lop
+        # rFF + 2 LayerNorm boc quanh multihead attention (KHONG phai 1 attention tran).
+        self.tag_pma = TagPMA(config.dim) if config.use_tag else None
 
-        # Nhánh 3 — category 4 cấp (formula.md §1). Mỗi cấp một bảng riêng rồi concat +
-        # chiếu: cấp 1 (39 nhãn) BÃO HOÀ nên một bảng gộp sẽ để cấp 1 lấn, còn cộng thì
-        # ép mọi cấp cùng thang. 4 x d_c -> d.
-        self.level_embeddings = None
-        if config.num_category_levels is not None:
-            self.level_embeddings = nn.ModuleDict({
-                field: nn.Embedding(config.num_category_levels[field], config.cat_embed_dim,
-                                    padding_idx=CATEGORY_PAD)
-                for field in CATEGORY_LEVEL_FIELDS
-            })
-            self.cat_proj = nn.Linear(4 * config.cat_embed_dim, config.dim)
-
-        # So nhanh = item (luon co) + tag? + cat?. Tat CA HAI thi content token chi con
-        # GMU va `fuse` thanh phep chieu d->d, khong con gi de "hop nhat" => train.py chan.
-        num_branches = (1 + int(self.tag_embedding is not None)
-                          + int(self.level_embeddings is not None))
+        # So nhanh = item (luon co) + tag?. Tat tag thi content token chi con GMU va
+        # `fuse` thanh phep chieu d->d, khong con gi de "hop nhat" => train.py chan.
+        num_branches = 1 + int(self.tag_embedding is not None)
         self.fuse = nn.Linear(num_branches * config.dim, config.dim)
 
         self._last_stats: dict[str, torch.Tensor] = {}
@@ -113,7 +144,6 @@ class ItemEmbedding(nn.Module):
         caption_embedding: torch.Tensor,
         caption_mask: torch.Tensor,
         tag_ids: torch.Tensor,
-        category_level_ids: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """e_i = content token (HSTU gọi Φ_t). Xem formula.md §1."""
         gmu_inputs = {field: self.category_embeddings[field](category_ids[field]) for field in CATEGORICAL_FIELDS}
@@ -128,29 +158,16 @@ class ItemEmbedding(nn.Module):
         else:
             e_item = self.content_gmu(gmu_inputs)
 
-        # `tag` là MULTI-LABEL (75% item 1 tag, 23% có 2, 0.4% có 3) — mean trên các tag
-        # THẬT. Item chung tag ⇒ chung một nửa đầu vào của fuse, nên chúng gần nhau ngay
+        # `tag` là MULTI-LABEL (75% item 1 tag, 23% có 2, 0.4% có 3) — PMA (TagPMA) thay
+        # mean cũ: seed học được attend lên các tag THẬT, trọng số không còn chia đều.
+        # Item chung tag ⇒ chung một phần đầu vào của fuse, nên chúng gần nhau hơn ngay
         # cả khi caption/author khác hẳn.
         branches = [e_item]
         e_tag = None
         if self.tag_embedding is not None:
-            valid = (tag_ids != TAG_PAD).unsqueeze(-1).to(e_item.dtype)
-            e_tag = ((self.tag_embedding(tag_ids) * valid).sum(dim=-2)
-                     / valid.sum(dim=-2).clamp(min=1.0))
+            valid = tag_ids != TAG_PAD
+            e_tag = self.tag_pma(self.tag_embedding(tag_ids), valid)
             branches.append(e_tag)
-
-        e_cat = None
-        if self.level_embeddings is not None:
-            if category_level_ids is None:
-                raise ValueError(
-                    "model có nhánh category 4 cấp nhưng caller không truyền "
-                    "category_level_ids — nhánh sẽ im lặng rơi khỏi graph."
-                )
-            e_cat = self.cat_proj(torch.cat(
-                [self.level_embeddings[f](category_level_ids[f]) for f in CATEGORY_LEVEL_FIELDS],
-                dim=-1,
-            ))
-            branches.append(e_cat)
 
         e_content = self.fuse(torch.cat(branches, dim=-1))
 
@@ -160,8 +177,6 @@ class ItemEmbedding(nn.Module):
         }
         if e_tag is not None:
             self._last_stats["norm_tag"] = e_tag.detach().norm(dim=-1)
-        if e_cat is not None:
-            self._last_stats["norm_cat"] = e_cat.detach().norm(dim=-1)
         return e_content
 
     def dense_parameters(self) -> list[nn.Parameter]:

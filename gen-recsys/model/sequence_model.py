@@ -28,13 +28,13 @@ class SequenceModel(nn.Module):
         self.dim = dim
         self.max_seq_len = max_seq_len
 
-        self.action_encoder = ActionEncoder(dim, use_age=use_age)
+        self.action_encoder = ActionEncoder(dim)
         self.position_embedding = nn.Embedding(max_seq_len, dim)
 
         self.decoder = SequenceDecoder(
             dim, num_heads, num_layers, ffn_dim, dropout, max_seq_len=max_seq_len,
             use_checkpoint=use_checkpoint, use_qk=use_qk, dynamic_ts=dynamic_ts,
-            static_delta=static_delta,
+            static_delta=static_delta, use_age=use_age,
         )
 
     def forward(
@@ -49,7 +49,7 @@ class SequenceModel(nn.Module):
     ) -> torch.Tensor:
         """Trả về hidden state TẠI VỊ TRÍ ITEM: (B, K, dim) — caller"""
         B, K, _ = item_embeddings.shape
-        a = self.action_encoder(action_vectors, hist_timestamps, hist_age_days)
+        a = self.action_encoder(action_vectors, hist_timestamps)
 
         # Chuỗi XEN KẼ [Φ_0, a_0, Φ_1, a_1, ...], L = 2K (formula.md §3, HSTU Table 1).
         token = torch.stack([item_embeddings, a], dim=2).view(B, 2 * K, self.dim)
@@ -68,7 +68,15 @@ class SequenceModel(nn.Module):
         if hist_timestamps is not None:
             token_timestamps = hist_timestamps.repeat_interleave(2, dim=1)
 
+        # age_t (formula.md §2bis): gia tri cua ca token item LAN token action tai cung vi
+        # tri deu la tuoi cua ITEM do (age khong co ban rieng cho action) — repeat_interleave
+        # giong het cach lam voi timestamps o tren.
+        token_age_days = None
+        if hist_age_days is not None:
+            token_age_days = hist_age_days.repeat_interleave(2, dim=1)
+
         hidden = self.decoder(token, key_padding_mask, log_m=log_m,
-                              token_timestamps=token_timestamps)
+                              token_timestamps=token_timestamps,
+                              token_age_days=token_age_days)
 
         return hidden[:, ::2]

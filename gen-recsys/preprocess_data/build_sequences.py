@@ -35,31 +35,19 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
-from schema import (  # [SỬA 2026-10-07] đường dẫn gom về schema.py (env GEN_RECSYS_DATASET)
-    ACTION_VECTOR_FIELDS,
-    DATASET,
-    LOG_STANDARD_FILES,
-)
+from schema import ACTION_VECTOR_FIELDS, LOG_STANDARD_FILES
 # [SỬA 2026-10-07] Bỏ import `MAX_SEQ_LEN` — KHÔNG dùng ở đâu trong file này. Preprocess ghi
 # lịch sử ĐẦY ĐỦ (CSR qua user_offsets); việc cắt cửa sổ K là của `dataset.py` lúc train
 # (`--max-seq-len`). Nghĩa là output .npy KHÔNG phụ thuộc K: đổi K không cần build lại.
 
-# [SỬA 2026-10-07] Theo env `GEN_RECSYS_OUT_DIR` như build_n_cumulative.py đã làm. Trước đây
-# hard-code cạnh file code, nên build 27K sẽ GHI ĐÈ output Pure (cùng tên file .npy) — mất
-# dữ liệu Pure mà không có cảnh báo nào.
 OUT_DIR = Path(os.environ.get("GEN_RECSYS_OUT_DIR") or (Path(__file__).parent / "output"))
-# [SỬA 2026-09-13] Pure chỉ ~1.4M dòng (so với 322M của 27K) — 100 bucket không cần thiết
-# nữa (mỗi bucket chỉ ~14K dòng, overhead chia bucket > lợi ích tránh OOM). Giảm xuống 10
-# để giảm số lần quét lại CSV (mỗi bucket phải scan lại toàn bộ LOG_STANDARD_FILES).
-#
-# [SỬA 2026-10-07] Theo dataset: 27K có ~322M dòng / 23 GB CSV, 10 bucket nghĩa là ~32M
-# dòng/bucket phải sort trong RAM cùng lúc => OOM trên máy 31.7 GB. 100 bucket đưa về
-# ~3.2M dòng/bucket, đổi lại quét CSV 100 lần thay vì 10. Đây là đánh đổi RAM/IO, và với
-# 27K thì RAM là thứ hết trước.
+# [SỬA 2026-09-13] Pure chỉ ~1.4M dòng — 100 bucket không cần thiết (mỗi bucket chỉ ~14K
+# dòng, overhead chia bucket > lợi ích tránh OOM). Giảm xuống 10 để giảm số lần quét lại CSV
+# (mỗi bucket phải scan lại toàn bộ LOG_STANDARD_FILES).
 #
 # LƯU Ý: đổi NUM_BUCKETS làm đổi play_ratio của MỌI dòng nếu rank được tính trong bucket —
 # xem _compute_duration_edges_and_rank_table, nó tính TOÀN CỤC đúng vì lý do này.
-NUM_BUCKETS = 100 if DATASET == "27k" else 10
+NUM_BUCKETS = 10
 
 
 def _compute_global_log1p_max() -> tuple[float, float]:
@@ -99,13 +87,12 @@ NUM_DURATION_GROUPS = 10  # số nhóm duration cho D2Q; đo được 35x giữa
 #
 # round(3) khử bias tốt NHẤT (corr -0.056, gần 0 nhất) với ít khoá nhất. Nghịch lý biểu kiến
 # "làm tròn thô hơn lại chính xác hơn" có lý do thật: play_raw là thương hai số nguyên nên
-# gần như LIÊN TỤC (94.6% giá trị duy nhất ở Pure, 88.3% ở 27K). Không làm tròn thì mỗi giá
-# trị thành một khoá riêng, mid-rank không còn ties để lấy trung bình, và thứ hạng biến thành
-# chỉ số thứ tự thuần — đó là lý do dict cũ ĐẢO DẤU (+0.506). Làm tròn gộp ties lại cho
-# mid-rank làm đúng việc của nó.
+# gần như LIÊN TỤC (94.6% giá trị duy nhất ở Pure). Không làm tròn thì mỗi giá trị thành một
+# khoá riêng, mid-rank không còn ties để lấy trung bình, và thứ hạng biến thành chỉ số thứ tự
+# thuần — đó là lý do dict cũ ĐẢO DẤU (+0.506). Làm tròn gộp ties lại cho mid-rank làm đúng
+# việc của nó.
 #
-# Scale: 10 nhóm x tối đa 1,001 giá trị = <= 10,010 khoá, BẤT KỂ dataset lớn cỡ nào — thay cho
-# ~284M khoá (~28 GB) mà 27K sẽ cần nếu không làm tròn.
+# Scale: 10 nhóm x tối đa 1,001 giá trị = <= 10,010 khoá, BẤT KỂ dataset lớn cỡ nào.
 PLAY_RAW_DECIMALS = 3
 
 
@@ -140,11 +127,10 @@ def _compute_duration_edges_and_rank_table() -> tuple[list[float], list[dict[flo
       duration_edges — NUM_DURATION_GROUPS-1 biên chia duration_ms thành decile
       rank_tables[g] — dict {play_raw đã làm tròn -> percentile mid-rank} cho nhóm duration g
 
-    [SỬA 2026-10-05 — CHẶN trên 27K] Bảng vẫn là dict tra trực tiếp (chính xác tuyệt đối trên
-    thang đã làm tròn), nhưng `play_raw` được **làm tròn PLAY_RAW_DECIMALS=3 chữ số** trước khi
-    dựng. Không làm tròn thì nó không scale: `play_raw` là thương hai số nguyên nên gần như
-    liên tục — 27K cho 88.3% giá trị duy nhất (đo: 1,047,291 trên 1,186,059 dòng), ngoại suy
-    322M dòng là ~284M khoá, dict Python ~**28 GB**.
+    [SỬA 2026-10-05] Bảng vẫn là dict tra trực tiếp (chính xác tuyệt đối trên thang đã làm
+    tròn), nhưng `play_raw` được **làm tròn PLAY_RAW_DECIMALS=3 chữ số** trước khi dựng.
+    Không làm tròn thì nó không scale: `play_raw` là thương hai số nguyên nên gần như liên
+    tục, mỗi giá trị thành một khoá riêng.
 
     Làm tròn còn khử bias TỐT HƠN, không chỉ rẻ hơn — xem bảng đo ở PLAY_RAW_DECIMALS.
     """
@@ -240,7 +226,7 @@ def _compute_derived_action_fields(
     tagged = df.with_columns(play_raw.alias("_play_raw"), group_expr.alias("_g"))
 
     # [SỬA 2026-10-05] Tra dict trên play_raw ĐÃ LÀM TRÒN, thay cho replace_strict trên
-    # play_raw thô (không scale: 27K cần ~284M khoá ~28 GB, xem PLAY_RAW_DECIMALS).
+    # play_raw thô (không scale với catalog lớn hơn — xem PLAY_RAW_DECIMALS).
     #
     # map_batches giữ được LAZY (hàm này nhận cả LazyFrame của pipeline lẫn DataFrame của
     # test) và chạy một lần trên cả cột thay vì NUM_DURATION_GROUPS lần when/then.
@@ -284,15 +270,27 @@ def _iter_log_buckets():
     profile_max, comment_max = _compute_global_log1p_max()
     duration_edges, rank_tables = _compute_duration_edges_and_rank_table()
 
-    scans_base = [pl.scan_csv(f) for f in LOG_STANDARD_FILES]
-    base = pl.concat(scans_base)
+    # [SUA 2026-10-13 — error.md #14, DON GIAN HOA 2026-10-14 — code review] Gan
+    # "_orig_idx" de lam TIEBREAK on dinh khi sort. Truoc day sort(["user_id",
+    # "time_ms"]) khong co tiebreak thu 3 — 96,687 dong trung (user_id, time_ms) co THU
+    # TU TOKEN KHONG XAC DINH giua cac lan chay (polars khong dam bao stable sort tren
+    # moi backend/version). _orig_idx = thu tu dong TOAN CUC sau khi concat.
+    #
+    # [SUA 2026-10-14] Ban truoc quet MOI file CSV 2 LAN (1 lan rieng chi de pl.len() lay
+    # n_rows tinh offset, 1 lan trong scans_base) — di NGUOC muc tieu giam so lan quet CSV
+    # ma chinh file nay ghi ro ly do NUM_BUCKETS (dong ~15 duoi). with_row_index() SAU KHI
+    # concat() da TU DONG tinh dung offset tich luy THEO DUNG THU TU file (verify truc
+    # tiep: 2 file 3+2 dong -> idx 0..4 lien tuc, dung thu tu) — khong can pass rieng dem
+    # so dong truoc, concat() + with_row_index() la 1 LAN quet duy nhat.
+    base = pl.concat([pl.scan_csv(f) for f in LOG_STANDARD_FILES]).with_row_index("_orig_idx")
 
     for bucket_idx in range(NUM_BUCKETS):
         bucket_filtered = base.filter(pl.col("user_id") % NUM_BUCKETS == bucket_idx)
         bucket = (
             _compute_derived_action_fields(bucket_filtered, profile_max, comment_max,
                                            duration_edges, rank_tables)
-            .sort(["user_id", "time_ms"])
+            .sort(["user_id", "time_ms", "_orig_idx"])
+            .drop("_orig_idx")
             .collect(streaming=True)
         )
         yield bucket

@@ -8,16 +8,12 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-MAX_SEQ_LEN = 256  # mac dinh cho Pure; 27K phai dung --max-seq-len 1024 (xem duoi)
+MAX_SEQ_LEN = 256
 
 # category_id (tag da factorize CA CHUOI) KHONG con vao content token — xem tag_ids.
 # Giu lai trong item_static vi category_N/N_category van tra cuu theo no.
 ITEM_CATEGORICAL_FIELDS = ["video_type_id", "music_type_id"]
 
-# Nhanh 3 (formula.md §1) va age (§2) — CHI co khi build_item_static ghi duoc chung
-# (27K co ca hai; Pure khong co file categories va upload_dt chi 3 gia tri). Dataset tu
-# phat hien qua ten field trong item_static thay vi co cau hinh rieng.
-CATEGORY_LEVEL_FIELDS = ["cat_l1_id", "cat_l2_id", "cat_l3_id", "cat_l4_id"]
 MS_PER_DAY = 86_400_000
 
 ACTION_VECTOR_FIELDS = [
@@ -49,9 +45,8 @@ class GenRecsysDataset(Dataset):
 
         self.item_static = np.load(self.output_dir / "item_static.npy", mmap_mode="r")
         # [SUA 2026-10-08] Caption la OPTIONAL. Tat bang `use_caption=False` (co --no-caption)
-        # HOAC tu dong tat khi thieu file — tren 27K `caption_embeddings.npy` nang 22.9 GB
-        # fp16 (32,038,725 x 384) va phai encode ~15.4h, nen can chay thu model TRUOC khi
-        # cho encode xong. Truoc day thieu file la FileNotFoundError chet ngay o __init__.
+        # HOAC tu dong tat khi thieu file. Truoc day thieu file la FileNotFoundError chet
+        # ngay o __init__.
         cap_emb = self.output_dir / "caption_embeddings.npy"
         cap_has = self.output_dir / "caption_has_caption.npy"
         self.use_caption = use_caption and cap_emb.exists() and cap_has.exists()
@@ -68,7 +63,6 @@ class GenRecsysDataset(Dataset):
                       f" => nhanh caption TAT (GMU con 4 modality)")
 
         names = self.item_static.dtype.names
-        self.has_category_levels = all(f in names for f in CATEGORY_LEVEL_FIELDS)
         self.has_age = "upload_day" in names
 
     def __len__(self) -> int:
@@ -152,11 +146,10 @@ class GenRecsysDataset(Dataset):
         EVAL (random_window=False): LUON la `max_seq_len` item NGAY TRUOC diem du doan —
         dung y nhu luc serving.
 
-        TRAIN (random_window=True): lay cua so o vi tri NGAU NHIEN trong qua khu. Ly do la
-        so do tren 27K: median 1,744 tuong tac/user (p99 12,915, max 67,647), nen cua so
-        co dinh K=1024 chi phu 34% tuong tac va vung "xa" bi CAT CUNG — dung thu ma
-        delta_h(x_q) (confidence_attention, §4.1) can de hoc pham vi nhin. Lay ngau nhien
-        thi qua nhieu epoch model thay gan het chuoi, va moi epoch van chi tra O((2K)^2).
+        TRAIN (random_window=True): lay cua so o vi tri NGAU NHIEN trong qua khu. Ly do: cua
+        so co dinh luon cat cung vung "xa" — dung thu ma delta_h(x_q) (confidence_attention,
+        §4.1) can de hoc pham vi nhin. Lay ngau nhien thi qua nhieu epoch model thay gan het
+        chuoi, va moi epoch van chi tra O((2K)^2).
 
         KHONG lay mau thua dan ve qua khu (log-spaced): nhu vay `log_rel_distance` khong
         con la khoang cach THAT giua hai token, va delta_h se hoc tren mot thang bi bop meo.
@@ -177,18 +170,11 @@ class GenRecsysDataset(Dataset):
     def num_tags(self) -> int:
         """So hang bang E^tag = ma tag LON NHAT + 1, khong phai so tag duy nhat.
 
-        Tag id THUA (27K: 58 tag duy nhat nhung max id 68) nen dem so tag duy nhat se cho
-        bang QUA NHO va nn.Embedding nem IndexError. Truoc 2026-10-05 cho nay la hang so
-        47 (cua Pure) trong ItemEmbeddingConfig va train.py khong truyen gi — tren 27K se
-        vo ngay o forward dau tien.
+        Tag id co the THUA (max id > so tag duy nhat) nen dem so tag duy nhat se cho bang
+        QUA NHO va nn.Embedding nem IndexError. Truoc 2026-10-05 cho nay la hang so cung
+        trong ItemEmbeddingConfig va train.py khong truyen gi.
         """
         return int(self.item_static["tag_ids"].max()) + 1
-
-    def num_category_levels(self) -> dict[str, int] | None:
-        """So nhan moi cap — truyen vao ItemEmbeddingConfig. None neu dataset khong co."""
-        if not self.has_category_levels:
-            return None
-        return {f: int(self.item_static[f].max()) + 1 for f in CATEGORY_LEVEL_FIELDS}
 
     def get_age_days(self, video_ids: torch.Tensor, timestamps: torch.Tensor) -> torch.Tensor:
         """age_t = so ngay tu luc item ra mat toi luc xem (formula.md §2).
@@ -228,9 +214,5 @@ class GenRecsysDataset(Dataset):
             "caption_embedding": torch.from_numpy(caption_embedding),
             "caption_mask": torch.from_numpy(caption_mask),
             "tag_ids": torch.from_numpy(rows["tag_ids"].astype(np.int64)),
-            "category_level_ids": {
-                field: torch.from_numpy(rows[field].astype(np.int64))
-                for field in CATEGORY_LEVEL_FIELDS
-            } if self.has_category_levels else None,
         }
 

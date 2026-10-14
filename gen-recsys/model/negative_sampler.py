@@ -1,15 +1,14 @@
 """Negative sampler cho sampled-softmax retrieval loss — sample theo TẦN SUẤT xuất hiện.
 
-[SỬA 2026-10-05 — ALIAS TABLE, bắt buộc cho 27K] `np.random.choice(N, p=...)` KHÔNG dùng
-alias table: mỗi lần gọi nó dựng CDF rồi searchsorted, O(N) trên mỗi batch. Đo trực tiếp
-(batch 32 x 512 negative, đúng cấu hình train):
+[SỬA 2026-10-05 — ALIAS TABLE] `np.random.choice(N, p=...)` KHÔNG dùng alias table: mỗi lần
+gọi nó dựng CDF rồi searchsorted, O(N) trên mỗi batch. Đo trực tiếp (batch 32 x 512 negative,
+đúng cấu hình train):
 
     N = 7,583 (Pure)   :   2.2 ms/batch
     N = 1,000,000      :  19.7 ms/batch
-    N = 32,038,693     : 423.7 ms/batch  => 1 epoch ~ 1,177 GIỜ chỉ để sample negative
 
-Pure chạy được nên lỗi chưa bao giờ lộ. Alias table (Walker 1977) dựng 1 lần rồi sample
-O(1): 41.8s dựng + 3.71 ms/batch = NHANH HƠN 114x, 1 epoch còn ~10.3 giờ. Bảng 256 MB
+Alias table (Walker 1977) dựng 1 lần rồi sample O(1): 41.8s dựng + 3.71 ms/batch = NHANH HƠN
+114x so với cách cũ ở N lớn. Bảng 256 MB
 (prob fp32 + alias int32) cho 32M item.
 
 KHÔNG chuyển sang uniform (0.08 ms/batch) để tránh việc này: phân phối negative là thứ đã
@@ -17,25 +16,77 @@ KHÔNG chuyển sang uniform (0.08 ms/batch) để tránh việc này: phân ph�
 +0.001 (xem memory gen-recsys-ngan-sach-gradient). [XOÁ 2026-10-06] Cờ `--uniform-negatives`
 (chẩn đoán cold item) đã bỏ cùng các nhánh ablation khác — cold-start không còn theo đuổi
 (formula.md §−1).
+
+[SỬA 2026-10-13 — error.md #9] TRƯỚC ĐÂY `freq_observed = np.diff(item_offsets)` dùng N_i
+CUỐI KỲ (tổng toàn bộ log train+val+test, vì item_N_*.npy build từ TOÀN BỘ
+LOG_STANDARD_FILES không filter split) — log_q và alias table (phân phối negative) bị FIT
+TRÊN CẢ VAL+TEST, một dạng leak khác với leak đã sửa ở §0 cho percentile m_t (formula.md
+§0 đã sửa bằng cách tra N_i TẠI MỐC p80, không phải N_i cuối kỳ — ở đây làm tương tự).
+Sửa: nếu có `p80`, tra N_i của MỖI item TẠI đúng mốc đó (dùng cùng cơ chế
+`lookup_n_at_t_batch` mà build_percentile_table/build_interactions đã dùng) thay vì N_i
+cuối kỳ. `p80=None` (ví dụ gọi trực tiếp không qua train.py) giữ hành vi CŨ + cảnh báo.
 """
 
 from __future__ import annotations
 
+import sys
+import warnings
 from pathlib import Path
 
 import numpy as np
 import torch
 
+sys.path.insert(0, str(Path(__file__).parent.parent / "preprocess_data"))
+from build_n_cumulative import lookup_n_at_t_batch  # noqa: E402
+
 
 class NegativeSampler:
-    def __init__(self, output_dir: str | Path, num_items: int):
+    def __init__(self, output_dir: str | Path, num_items: int, p80: int | None = None):
         output_dir = Path(output_dir)
         item_ids = np.load(output_dir / "item_N_ids.npy")
-        item_offsets = np.load(output_dir / "item_N_offsets.npy")
-        freq_observed = np.diff(item_offsets).astype(np.float64)
+
+        if p80 is not None:
+            # N_i TAI MOC p80 cho MOI item — khong leak val/test (cung co che voi §0).
+            ts_at_p80 = np.full(item_ids.shape[0], p80, dtype=np.int64)
+            freq_observed = lookup_n_at_t_batch("item_N", item_ids, ts_at_p80).astype(np.float64)
+        else:
+            warnings.warn(
+                "NegativeSampler khong nhan p80 — dung N_i CUOI KY (fit tren CA "
+                "val+test, error.md #9). Truyen p80 (tu train_val_boundary_p80.npy) "
+                "de tranh leak.",
+                stacklevel=2,
+            )
+            item_offsets = np.load(output_dir / "item_N_offsets.npy")
+            freq_observed = np.diff(item_offsets).astype(np.float64)
 
         freq = np.ones(num_items, dtype=np.float64)
         freq[item_ids] = freq_observed
+
+        # [SUA 2026-10-14 — phat hien khi chay smoke-test sau fix #9] Item ra mat SAU
+        # p80 co N_i(p80)=0 THAT (0.15% tren Pure, 11/7551 item) — dung ve y nghia (item
+        # nay chua "pho bien" trong giai doan train), nhung log(0)=-inf gay NaN ha luu:
+        # log_q_for() co the duoc goi cho CHINH item nay neu no la POSITIVE cua 1 sample
+        # val/test (dung vi val/test o SAU p80) — scaled_logit = s/temp - (-inf) = +inf.
+        # Dung san nho thay 0 tuyet doi: item van gan nhu KHONG BAO GIO duoc sample lam
+        # negative (prob cuc nho), nhung log_q_for() khong con tra -inf.
+        #
+        # [SUA 2026-10-14 — code review] Floor nay AP DUNG DONG LOAT cho moi item co
+        # freq=0, nen neu MOT bug alignment TUONG LAI (vd lech item_ids voi freq_observed
+        # do off-by-one trong join/lookup) tao ra freq=0 cho NHIEU item hon han 11/7551 da
+        # biet, floor se AM THAM hap thu thanh xac suat nho hop le thay vi crash ro qua
+        # NaN nhu code CU — mat kha nang phat hien bug moi. Canh bao ro khi ty le vuot han
+        # muc da biet (nguong 1% = ~7x muc 0.15% da do, du rong de khong bao dong gia).
+        n_zero = int((freq_observed == 0).sum())
+        frac_zero = n_zero / max(len(freq_observed), 1)
+        if frac_zero > 0.01:
+            warnings.warn(
+                f"NegativeSampler: {n_zero}/{len(freq_observed)} item co N_i=0 "
+                f"({frac_zero*100:.2f}%) — VUOT XA muc da biet (0.15%, 11/7551 tren "
+                f"Pure). Co the la bug alignment MOI (item_ids lech voi freq_observed), "
+                f"khong chi item ra mat sau p80. Kiem tra TRUOC khi tin ket qua.",
+                stacklevel=2,
+            )
+        freq = np.maximum(freq, 1e-8)
 
         self.probs = freq / freq.sum()
         self.log_probs = np.log(self.probs)
@@ -71,6 +122,40 @@ class NegativeSampler:
                 if n_collide == 0:
                     break
                 neg_ids[collide] = self._draw((n_collide,))
+            else:
+                # [THEM 2026-10-13, NANG CAP 2026-10-14 — code review] error.md #19:
+                # truoc day het 10 vong ma van con collide thi CHI warn roi AM THAM giu
+                # nguyen gia tri trung — van di thang vao loss, van gay "CE ket o log(2)"
+                # dung nhu docstring da canh bao, warning khong ngan duoc gi ca. Sua THAT:
+                # voi dung cac vi tri con collide, thay bang uniform random tren catalog,
+                # LOAI TRU dung set pos cua CHINH sample do (np.setdiff1d dam bao TUYET
+                # DOI khong trung, khac het 10 vong resample theo phan phoi popularity
+                # von co the mai khong thoat duoc neu pos chiem ty trong lon trong phan
+                # phoi). Hy sinh: cac vi tri HIEM nay nhan negative THEO UNIFORM thay vi
+                # popularity — chap nhan duoc vi day la fallback cuc hiem, khong phai
+                # hanh vi chinh cua sampler.
+                collide = (neg_ids[:, :, None] == pos[:, None, :]).any(axis=-1)
+                n_collide_final = int(collide.sum())
+                if n_collide_final > 0:
+                    warnings.warn(
+                        f"NegativeSampler.sample: con {n_collide_final} negative trung "
+                        f"positive SAU 10 lan resample — thay THEO UNIFORM (loai tru "
+                        f"dung) de dam bao KHONG con trung, thay vi giu nguyen gia tri "
+                        f"trung nhu truoc. Kiem tra exclude co dung khong, hoac exclude "
+                        f"qua lon so catalog.",
+                        stacklevel=2,
+                    )
+                    rows, cols = np.where(collide)
+                    for r in np.unique(rows):
+                        mask_r = rows == r
+                        n_r = int(mask_r.sum())
+                        excluded_r = pos[r]
+                        # setdiff1d dam bao TUYET DOI khong trung — khong con vong lap
+                        valid_ids = np.setdiff1d(
+                            np.arange(self.num_items), excluded_r, assume_unique=False
+                        )
+                        replacement = np.random.choice(valid_ids, size=n_r, replace=True)
+                        neg_ids[r, cols[mask_r]] = replacement
 
         log_q = self.log_probs[neg_ids]
         return (

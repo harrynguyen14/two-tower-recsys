@@ -1,11 +1,10 @@
 """Độ trưởng thành của item: N_i(t) -> percentile. Xem formula.md §0.
 
 [SỬA 2026-10-05] `item_weight` đổi từ `tanh(N_i/τ_i)` sang **percentile** (formula.md §0).
-`N_i` là đếm TUYỆT ĐỐI, không có đơn vị bất biến — nó phụ thuộc cỡ dataset (Pure 1.44M vs
-27K 322M tương tác = 224x), độ dài cửa sổ log, VÀ thời điểm serving (cùng một item, sau 6
-tháng N_i phình lên). Cái cuối nghiêm trọng nhất vì xảy ra NGAY TRONG PRODUCTION: tanh bão
-hoà về 1 => log m_p -> 0 => số hạng `β_h log m_p` TẮT DẦN theo thời gian chạy. Đúng cơ chế
-đã đo với u_t (|prod| yếu đi 1000x).
+`N_i` là đếm TUYỆT ĐỐI, không có đơn vị bất biến — nó phụ thuộc cỡ dataset, độ dài cửa sổ
+log, VÀ thời điểm serving (cùng một item, sau 6 tháng N_i phình lên). Cái cuối nghiêm trọng
+nhất vì xảy ra NGAY TRONG PRODUCTION: tanh bão hoà về 1 => log m_p -> 0 => số hạng
+`β_h log m_p` TẮT DẦN theo thời gian chạy. Đúng cơ chế đã đo với u_t (|prod| yếu đi 1000x).
 
 Percentile bất biến theo cả ba. Cùng kỹ thuật đã dùng cho play_ratio (D2Q,
 build_sequences._compute_derived_action_fields) — ở đó giá trị thô phụ thuộc duration.
@@ -18,8 +17,8 @@ median: tanh chỉ +0.149 còn percentile +0.512 (3.4x). tanh tiêu phí dải �
 percentile không cần ngưỡng nên không có gì để học.
 
 [XOÁ 2026-10-06] Cả class `LearnableThresholds` đã bỏ cùng τ_u. formula.md §0 bỏ u_t
-(27K không có cold user, N_u min=100) nên `user_weight` hết đối tượng phục vụ — và
-attention đã KHÔNG đọc `log_u` ở bất kỳ số hạng nào, nên đó là đường ống chết: τ_u là
+nên `user_weight` hết đối tượng phục vụ — và attention đã KHÔNG đọc `log_u` ở bất kỳ số
+hạng nào, nên đó là đường ống chết: τ_u là
 nn.Parameter nằm trong optimizer mà không bao giờ nhận gradient. Bỏ τ_u xong thì class
 rỗng tham số (item_weight chỉ là identity), nên gọi `lookup_percentile` trực tiếp.
 """
