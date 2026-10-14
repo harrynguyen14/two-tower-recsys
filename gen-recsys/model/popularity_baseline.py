@@ -14,11 +14,28 @@ Chay (test, DUNG 1 LAN sau khi da chot moi thu tren val):
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
+
+# [SUA] build_n_cumulative.OUT_DIR duoc doc tai IMPORT-time tu env GEN_RECSYS_OUT_DIR
+# (xem train.py:25-27, cung pattern). Phai set bien env NAY truoc khi import module do,
+# neu khong no se roi ve default "./output" canh file thay vi --output-dir CLI truyen vao.
+def _peek_output_dir() -> str | None:
+    for i, a in enumerate(sys.argv):
+        if a == "--output-dir" and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if a.startswith("--output-dir="):
+            return a.split("=", 1)[1]
+    return None
+
+
+_out = _peek_output_dir()
+if _out and not os.environ.get("GEN_RECSYS_OUT_DIR"):
+    os.environ["GEN_RECSYS_OUT_DIR"] = str(Path(_out).resolve())
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "preprocess_data"))
 from build_n_cumulative import build_n_cache, lookup_n_at_t_batch_cached  # noqa: E402
