@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -56,25 +57,45 @@ def item_features_to_device(features: dict, device: torch.device) -> dict:
     }
 
 
-def embed_items(
-    video_ids_cpu: torch.Tensor,
-    dataset: GenRecsysDataset,
-    item_embed: ItemEmbedding,
-    device: torch.device,
-) -> torch.Tensor:
-    """Embed item theo video_id (content + item-ID).
+def catalog_features(dataset: GenRecsysDataset, device: torch.device) -> dict:
+    """Feature cua TOAN catalog, dua len GPU 1 LAN luc khoi tao.
 
-    [XOA 2026-10-15] Bang maturity (N_i tai timestamp -> percentile -> trong so item, formula.md
-    §0) da bo: no chi con nuoi beta gate (da xoa) va 2 bang chan doan do bao hoa trong eval. Embed
-    item KHONG con phu thuoc timestamp => bo luon tham so timestamp va bang N_i.
+    [THEM 2026-10-15 — tang toc] Truoc day moi step gom feature tren CPU cho ~100K luot tra
+    (128x256 lich su + 128x512 negative) roi copy sang GPU: CPU 107%, GPU 73% tren Kaggle T4.
+    Pure chi co 7,583 item va embed item gio CHI phu thuoc video_id (bang maturity da xoa)
+    => giu feature catalog tren GPU (~12 MB), xem embed_catalog.
     """
-    feats = dataset.get_item_features(video_ids_cpu)
-    features = item_features_to_device(feats, device)
+    ids = torch.arange(len(dataset.item_static))
+    return item_features_to_device(dataset.get_item_features(ids), device)
+
+
+def embed_catalog(item_embed: ItemEmbedding, cat_feats: dict, device: torch.device) -> torch.Tensor:
+    """(num_items, d): chay item tower MOT LAN cho ca catalog — moi step goi 1 lan roi gather.
+
+    Toan hoc Y HET embed tung id rieng (item tower khong dropout, khong phu thuoc batch):
+    gradient cua 1 item = tong gradient moi lan no xuat hien, dung nhu truoc. Khoi luong tinh
+    giam ~13x (7,583 thay vi ~100K hang). ponytail: chi hop catalog NHO (Pure); catalog
+    lon (27K: 32M item) phai quay lai embed theo id cua batch.
+    """
+    n = cat_feats["author_idx"].shape[0]
     return item_embed(
-        video_ids_cpu.to(device, non_blocking=True), features["category_ids"],
-        features["author_idx"], features["music_idx"],
-        features["caption_embedding"], features["caption_mask"], features["tag_ids"],
+        torch.arange(n, device=device), cat_feats["category_ids"],
+        cat_feats["author_idx"], cat_feats["music_idx"],
+        cat_feats["caption_embedding"], cat_feats["caption_mask"], cat_feats["tag_ids"],
     )
+
+
+def lr_factor(step: int, total_steps: int, warmup_steps: int) -> float:
+    """He so LR tai global step: warmup TUYEN TINH roi COSINE ve 0 (Loshchilov & Hutter, SGDR).
+
+    [THEM 2026-10-15] Tinh truc tiep tu global step => khong co state scheduler phai luu,
+    --resume tu dung dung cho. Warmup on dinh giai doan dau (loss cao, ID/delta/W_ts vua roi
+    khoi 0); cosine giam LR cuoi ky de hoi tu sau hon voi cung ngan sach step.
+    """
+    if step < warmup_steps:
+        return (step + 1) / warmup_steps
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
 
 
 def load_or_compute_p80(
@@ -122,14 +143,21 @@ def setup_ddp() -> tuple[bool, int, int, int]:
 
 def run_batch_forward(
     batch: dict,
-    dataset: GenRecsysDataset,
+    cat_feats: dict,
     item_embed: ItemEmbedding,
     seq_model: SequenceModel,
     neg_sampler: NegativeSampler,
     num_negatives: int,
     device: torch.device,
+    all_item_e: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """1 forward pass đầy đủ cho 1 batch — dùng CHUNG bởi train() và evaluate()."""
+    """1 forward pass đầy đủ cho 1 batch — dùng CHUNG bởi train() và evaluate().
+
+    `all_item_e`: embedding catalog tinh SAN (eval, no_grad — tinh 1 lan cho ca split).
+    None (train) => tinh lai MOI step de gradient chay vao item tower.
+    """
+    if all_item_e is None:
+        all_item_e = embed_catalog(item_embed, cat_feats, device)
     hist_video_ids_cpu = batch["hist_video_ids"]
     hist_timestamps_cpu = batch["hist_timestamps"]
     hist_action = batch["hist_action"].to(device, non_blocking=True)
@@ -140,15 +168,11 @@ def run_batch_forward(
 
     B, K = hist_video_ids_cpu.shape
 
-    hist_e_i = embed_items(
-        hist_video_ids_cpu.reshape(-1), dataset, item_embed, device,
-    ).view(B, K, -1)
+    hist_e_i = all_item_e[hist_video_ids_cpu.to(device, non_blocking=True)]   # (B, K, d)
 
     hist_n_u = batch["hist_n_u"].to(device, non_blocking=True)
 
-    label_e_i = embed_items(label_video_id_cpu, dataset, item_embed, device)
-    _ie = getattr(item_embed, "module", item_embed)
-    label_embed_stats = {k: v.clone() for k, v in _ie._last_stats.items()}
+    label_e_i = all_item_e[label_video_id_cpu.to(device, non_blocking=True)]
 
     hidden = seq_model(
         hist_e_i, hist_action, key_padding_mask,
@@ -194,9 +218,7 @@ def run_batch_forward(
     neg_ids, neg_log_q = neg_sampler.sample(
         B, num_negatives, device, exclude=target_ids_cpu,
     )
-    neg_e_i = embed_items(
-        neg_ids.cpu().reshape(-1), dataset, item_embed, device,
-    ).view(B, num_negatives, -1)
+    neg_e_i = all_item_e[neg_ids.to(device, non_blocking=True)]               # (B, C, d)
     target_log_q = neg_sampler.log_q_for(target_ids_cpu.reshape(-1).to(device, non_blocking=True)).view(B, K)
 
     e_user_eval = hidden[:, -1, :]
@@ -222,7 +244,6 @@ def run_batch_forward(
         "label_action": label_action,
         "is_user_cold": batch["is_user_cold"],
         "is_item_cold": batch["is_item_cold"],
-        "label_embed_stats": label_embed_stats,
         "is_user_lowhistory": batch["is_user_lowhistory"],
         "hist_video_ids": hist_video_ids_cpu,
         "label_video_id": label_video_id_cpu,
@@ -260,6 +281,9 @@ def train(
     # AdamW (decay TACH khoi gradient) — Adam + L2 thi decay bi chia cho sqrt(v), yeu that
     # thuong o tham so gradient lon. 0.01 = mac dinh AdamW, chua tune.
     weight_decay: float = 0.01,
+    # [THEM 2026-10-15] warmup tuyen tinh + cosine ve 0, xem lr_factor. "constant" = hanh vi cu.
+    lr_schedule: str = "cosine",
+    warmup_frac: float = 0.05,
     ranking_loss_weight: float = 0.5,
     num_epochs: int = 1,
     max_steps_per_epoch: int | None = None,
@@ -406,6 +430,9 @@ def train(
         f" | item-ID: {'TAT' if no_item_id else 'BAT'}")
 
     steps_per_epoch = min(len(train_loader), max_steps_per_epoch) if max_steps_per_epoch else len(train_loader)
+    total_steps = num_epochs * steps_per_epoch
+    warmup_steps = max(1, int(warmup_frac * total_steps))
+    cat_feats = catalog_features(train_dataset, device)
 
     ckpt_modules = {
         "item_embed": item_embed, "seq_model": seq_model,
@@ -429,6 +456,7 @@ def train(
     # gi, phai nho/doc lai log CLI (neu con).
     run_metadata = {
         "lr": lr, "grad_clip_norm": grad_clip_norm, "weight_decay": weight_decay,
+        "lr_schedule": lr_schedule, "warmup_frac": warmup_frac,
         "ranking_loss_weight": ranking_loss_weight,
         "batch_size": batch_size, "num_negatives": num_negatives,
         "eval_negatives": eval_negatives,
@@ -484,7 +512,7 @@ def train(
             step_start = time.perf_counter()
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
                 fwd = run_batch_forward(
-                    batch, train_dataset, item_embed_ddp, seq_model_ddp, neg_sampler,
+                    batch, cat_feats, item_embed_ddp, seq_model_ddp, neg_sampler,
                     num_negatives, device,
                 )
                 forward_time_acc += time.perf_counter() - step_start
@@ -521,6 +549,10 @@ def train(
                         total += g.norm().item() ** 2
                 grad_norms[pname] = total ** 0.5
 
+            if lr_schedule == "cosine":
+                cur_lr = lr * lr_factor(epoch * steps_per_epoch + step, total_steps, warmup_steps)
+                for g in optimizer.param_groups:
+                    g["lr"] = cur_lr
             scaler.step(optimizer)
             scaler.update()
             step_time_acc += time.perf_counter() - step_start
@@ -553,6 +585,7 @@ def train(
                     f" |ts|={vals['ts_w']:.2e}"
                     f" gd={grad_norms['delta']:.2e}"
                     f" gts={grad_norms['ts_w']:.2e}"
+                    f" lr={optimizer.param_groups[0]['lr']:.2e}"
                     f"{fwd_msg}"
                 )
 
@@ -762,14 +795,10 @@ def evaluate(
     # thu tu.
     # Da chay: hr@10 full-ranking 0.0469 vs sampled 0.0469 => thu tu GIU.
     # Item embedding KHONG phu thuoc timestamp => nhung ca catalog MOT LAN, dung lai moi batch.
-    all_item_e = None
+    cat_feats = catalog_features(dataset, device)
+    with torch.no_grad():
+        all_item_e = embed_catalog(item_embed, cat_feats, device)     # (num_items, d), 1 LAN
     if full_ranking:
-        ids = torch.arange(dataset.item_static.shape[0])
-        with torch.no_grad():
-            chunks = []
-            for lo in range(0, ids.shape[0], 2048):
-                chunks.append(embed_items(ids[lo:lo + 2048], dataset, item_embed, device))
-            all_item_e = torch.cat(chunks, dim=0)          # (num_items, d)
         print(f"  [full-ranking] xep hang tren TOAN BO {all_item_e.shape[0]:,} item "
               f"(thay vi {num_negatives + 1} mau)")
 
@@ -779,8 +808,8 @@ def evaluate(
             break
 
         fwd = run_batch_forward(
-            batch, dataset, item_embed, seq_model, neg_sampler,
-            num_negatives, device,
+            batch, cat_feats, item_embed, seq_model, neg_sampler,
+            num_negatives, device, all_item_e=all_item_e,
         )
         e_u = fwd["e_user_eval"]
         if full_ranking:
@@ -926,6 +955,10 @@ if __name__ == "__main__":
                              "1704.06369: logit cosine lam norm phinh). 0 = tat")
     parser.add_argument("--no-item-id", action="store_true",
                         help="Ablation: tat item-ID embedding, Phi_i = content THUAN (hanh vi truoc 2026-10-15)")
+    parser.add_argument("--lr-schedule", choices=["cosine", "constant"], default="cosine",
+                        help="cosine = warmup tuyen tinh + cosine ve 0 (mac dinh); constant = LR co dinh (hanh vi truoc 2026-10-15)")
+    parser.add_argument("--warmup-frac", type=float, default=0.05,
+                        help="Ti le tong so step dung de warmup (mac dinh 5%%)")
     args = parser.parse_args()
     train(
         output_dir=args.output_dir,
@@ -942,6 +975,8 @@ if __name__ == "__main__":
         lr=args.lr,
         grad_clip_norm=args.grad_clip_norm,
         weight_decay=args.weight_decay,
+        lr_schedule=args.lr_schedule,
+        warmup_frac=args.warmup_frac,
         ranking_loss_weight=args.ranking_loss_weight,
         full_ranking=args.full_ranking,
         use_checkpoint=args.checkpoint,
