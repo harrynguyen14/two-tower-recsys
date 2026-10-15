@@ -90,7 +90,7 @@ def build_interactions() -> None:
     test_mask = label_timestamps > p90
 
     # [THEM 2026-10-13] error.md #15: p80 LA mot nguon duy nhat tu gio. Truoc day
-    # train.py (build_percentile_table) TINH LAI p80 bang np.percentile RIENG tren
+    # train.py TINH LAI p80 bang np.percentile RIENG tren
     # label_t cua chinh no — 2 noi doc lap tinh CUNG 1 so, khong co gi dam bao mai khop
     # neu 1 trong 2 cong thuc doi (vd doi tu percentile 80 sang gia tri khac). Luu ra
     # file de train.py doc lai, khong tinh lai.

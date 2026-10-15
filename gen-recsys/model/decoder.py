@@ -15,13 +15,12 @@ class DecoderBlock(nn.Module):
         use_qk: bool = True,
         dynamic_ts: bool = False,
         static_delta: bool = False,
-        use_age: bool = True,
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = ConfidenceModulatedAttention(
             dim, num_heads, dropout, max_seq_len=max_seq_len, use_qk=use_qk,
-            dynamic_ts=dynamic_ts, static_delta=static_delta, use_age=use_age,
+            dynamic_ts=dynamic_ts, static_delta=static_delta,
         )
         self.norm2 = nn.LayerNorm(dim)
         self.ffn = nn.Sequential(
@@ -35,12 +34,9 @@ class DecoderBlock(nn.Module):
         self,
         x: torch.Tensor,
         key_padding_mask: torch.Tensor | None = None,
-        log_m: torch.Tensor | None = None,
         ts_bucket: torch.Tensor | None = None,
-        token_age_days: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x), key_padding_mask, log_m=log_m,
-                          ts_bucket=ts_bucket, hist_age_days=token_age_days)
+        x = x + self.attn(self.norm1(x), key_padding_mask, ts_bucket=ts_bucket)
         x = x + self.ffn(self.norm2(x))
         return x
 
@@ -55,14 +51,13 @@ class SequenceDecoder(nn.Module):
         use_qk: bool = True,
         dynamic_ts: bool = False,
         static_delta: bool = False,
-        use_age: bool = True,
     ):
         super().__init__()
         self.use_checkpoint = use_checkpoint
         self.layers = nn.ModuleList([
             DecoderBlock(
                 dim, num_heads, ffn_dim, dropout, max_seq_len=max_seq_len, use_qk=use_qk,
-                dynamic_ts=dynamic_ts, static_delta=static_delta, use_age=use_age,
+                dynamic_ts=dynamic_ts, static_delta=static_delta,
             )
             for _ in range(num_layers)
         ])
@@ -72,11 +67,9 @@ class SequenceDecoder(nn.Module):
         self,
         token_embeddings: torch.Tensor,
         key_padding_mask: torch.Tensor | None = None,
-        log_m: torch.Tensor | None = None,
         token_timestamps: torch.Tensor | None = None,
-        token_age_days: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """log_m truyền cho MỌI layer (không chỉ layer đầu): nó là thuộc tính của TOKEN"""
+        """ts_bucket tính 1 lần từ timestamps rồi truyền cho MỌI layer."""
 
         ts_bucket = compute_ts_bucket(token_timestamps) if token_timestamps is not None else None
 
@@ -84,10 +77,8 @@ class SequenceDecoder(nn.Module):
         for layer in self.layers:
             if self.use_checkpoint and self.training:
                 x = checkpoint(
-                    layer, x, key_padding_mask, log_m, ts_bucket, token_age_days,
-                    use_reentrant=False,
+                    layer, x, key_padding_mask, ts_bucket, use_reentrant=False,
                 )
             else:
-                x = layer(x, key_padding_mask, log_m=log_m, ts_bucket=ts_bucket,
-                          token_age_days=token_age_days)
+                x = layer(x, key_padding_mask, ts_bucket=ts_bucket)
         return self.final_norm(x)

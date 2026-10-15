@@ -49,39 +49,11 @@ TS_BUCKET_DIVISOR = 0.1505
 # lon hon), khong phai sua loi dang xay ra bay gio.
 DELTA_PROJ_LIMIT = 1.0
 
-# [SUA 2026-10-13] beta*log(m_p) CHUYEN khoi logit sang "value-confidence gate" — xem
-# formula.md §4.1bis. Ly do: log(m_p) co range toi ~-9 (item hiem tren Pure, N_i min),
-# RONG HON HAN range cua delta*log(dist) (~0-0.6) hay W_ts/W_age moi bucket (~0.2-0.3) SAU
-# TRAIN — khi cong chung 1 logit truoc sigmoid, mot minh beta*log(m_p) co the AP CHE ca 3
-# bias con lai cho item hiem, bat ke query dang hoi gi. Sua: KHONG con cong vao logit; thay
-# vao do r_p = m_p**beta_h = exp(beta_h*log(m_p)) nhan truc tiep vao attn_weight (SAU
-# sigmoid(logit), TRUOC khi nhan v) — dung vai tro "do tin cay cua value" (item hiem ->
-# embedding it duoc hoc -> gate thap khi beta>0) thay vi "do lien quan giua query-key" (logit).
-# Dung power-law (khong dung sigmoid(..+const)) vi beta=0 cho r_p = m_p**0 = 1.0 CHINH XAC
-# (tuyet doi, khong xap xi) voi MOI m_p — giu dung pattern zero-init/ablation sach (diff
-# tuyet doi = 0.000e+00) ma delta/W_ts/age da dung, thay vi sigmoid(0+C) chi xap xi 1.
-# Clamp max=1 chi can khi beta hoc AM (m_p**beta > 1 voi m_p<1) — khong anh huong tai init.
-# beta_h TAI DUNG tham so da co (khong them tham so hoc moi).
-
-# [THEM 2026-10-09] age_t chuyen tu action token (action_encoder.py) sang day — xem
-# AgeAwareBias ben duoi va formula.md §2bis. Bucket LOG tren thang NGAY, do truc tiep tren
-# Pure: age min=0 max=29 (dataset chi thu thap 29.5 ngay, item ra mat gan nhu cung luc dau
-# ky). Divisor chon de 29 nam o bin cuoi ma van giu phan giai vung day (median=3):
-# log1p(29)/0.38 ~ 9 bin — SO VOI 49 bin cu (hieu chinh theo dataset da xoa, max=1421 ngay,
-# qua thua cho thang 0-29 that cua Pure).
-NUM_AGE_BUCKETS = 10
-AGE_BUCKET_DIVISOR = 0.38
-
-
-def age_bucket(hist_age_days: torch.Tensor) -> torch.Tensor:
-    """(B, L) tuổi item theo NGÀY (>=0) -> (B, L) chỉ số bucket log, long.
-
-    `.detach()`: chỉ số bucket không có gradient — gradient chỉ chảy vào bảng tra.
-    age âm (item thiếu upload_dt, đánh dấu -1) về bin 0.
-    """
-    a = hist_age_days.detach().clamp(min=0).float()
-    bucket = torch.log1p(a) / AGE_BUCKET_DIVISOR
-    return bucket.clamp(min=0, max=NUM_AGE_BUCKETS - 1).long()
+# [XOA 2026-10-15] beta gate (r_p = m_p**beta_h, formula.md §4.1bis) VA age bias
+# (AgeAwareBias, §2bis) DA BO HAN — rut gon so hang ve dung cau hoi nghien cuu (bang 2x2
+# q.k x delta tinh/dong, formula.md §−1). beta: chua tung co so do that (chet o 14/16 head
+# moi run truoc vi clamp), va la co che popularity THU HAI chong len logQ o loss. age: Pure
+# khong co upload_dt => code chet tren Pure. Muon khoi phuc: git show truoc 2026-10-15.
 
 
 def compute_ts_bucket(hist_timestamps: torch.Tensor) -> torch.Tensor:
@@ -118,68 +90,12 @@ class AddTsBias(torch.autograd.Function):
         return grad_out, grad_w, None
 
 
-class AgeAwareBias(nn.Module):
-    """logit[b,h,q,j] += W_age[h, age_bucket[b,j]] + gamma_proj_h(x_q) * W_age[h, bucket[b,j]]
-    — xem formula.md §2bis.
-
-    Cung pattern voi delta_h(x_q) (ca hai deu bias PAIRWISE dieu bien theo QUERY, khong
-    phai token tinh): W_age la bang tra THEO KEY j (tuoi cua item dang duoc attend toi) —
-    SO HANG TINH, moi user deu thay. gamma_proj(x_q) la PHAN DIEU BIEN THEM tu chinh token
-    dang hoi (query) — neu user nay (bieu dien qua x_q, tuc la lich su gan nhat) co xu
-    huong thich item moi, gamma se hoc am khi age nho; nguoc lai duong khi thich item cu.
-
-    [SUA 2026-10-09 — BUG tu phat hien qua test] KHONG duoc viet thanh TICH
-    `gamma_q(x_q) * W_age(age)` voi ca hai zero-init: d(logit)/d(W_age) = gamma_q, ma
-    gamma_q=0 luc init => W_age khong bao gio nhan gradient (tich hai so zero luon cho
-    gradient zero qua mot trong hai nhanh). Sua thanh TONG hai so hang: (1) W_age cong
-    THANG vao logit (nhan gradient TRUC TIEP, khong qua gamma), (2) gamma_proj(x_q) nhan
-    VOI W_age roi cong them — day la phan DIEU BIEN, zero-init rieng. Khoi dau gamma=0 nen
-    so hang (2) = 0 nhung so hang (1) van dung W_age=0 (chua hoc) => logit age = 0 y het
-    ban khong co age (ablation mien phi), va CA HAI tham so deu nhan gradient tu buoc dau.
-    """
-
-    def __init__(self, dim: int, num_heads: int):
-        super().__init__()
-        self.num_heads = num_heads
-        self.W_age = nn.Parameter(torch.zeros(num_heads, NUM_AGE_BUCKETS))
-        self.gamma_proj = nn.Linear(dim, num_heads)
-        nn.init.zeros_(self.gamma_proj.weight)
-        nn.init.zeros_(self.gamma_proj.bias)
-
-    def forward(self, x: torch.Tensor, age_bucket_idx: torch.Tensor) -> torch.Tensor:
-        """x: (B,L,dim) token (dung lam query). age_bucket_idx: (B,L) bucket tuoi tai KEY.
-
-        Tra ve (B,H,L,L) de cong truc tiep vao logit — KHONG materialize (B,H,L,L,head_dim)
-        nhu nhanh dynamic_ts, vi o day chi can 1 scalar/head moi (q,j), khong phai vector.
-        """
-        B, L, _ = x.shape
-        # (B,L) -> gia tri W_age theo KEY j, cho tung head: (H,B,L) -> (B,H,1,L)
-        age_val = self.W_age[:, age_bucket_idx]  # (H,B,L)
-        age_val = age_val.permute(1, 0, 2).unsqueeze(2)  # (B,H,1,L)
-
-        # so hang TINH: moi query thay CUNG gia tri W_age(age_j) — nhan gradient truc tiep.
-        static_term = age_val.expand(B, self.num_heads, L, L)
-
-        # so hang DIEU BIEN: (B,L,H) -> (B,H,L,1), nhan voi age_val (B,H,1,L) -> (B,H,L,L).
-        gamma_q = self.gamma_proj(x).transpose(1, 2).unsqueeze(-1)  # (B,H,L,1)
-        dynamic_term = gamma_q * age_val  # (B,H,L,1)*(B,H,1,L) -> (B,H,L,L)
-
-        return static_term + dynamic_term
-
-
 class ConfidenceModulatedAttention(nn.Module):
-    """Sigmoid attention + pairwise bias (xem docstring module).
-
-    [SUA 2026-10-13] beta*log(m_p) KHONG con trong logit — xem formula.md §4.1bis. No la
-    gate r_p = m_p**beta_h nhan vao attn_weight SAU sigmoid(logit), dong vai "do tin cay
-    cua value" (item hiem -> gate thap khi beta>0), khac voi delta/W_ts/W_age van o trong
-    logit (dong vai "do lien quan giua query-key").
-    """
+    """Sigmoid attention + pairwise bias: q.k (tuy chon) + delta*log(dist) + W_ts (xem docstring module)."""
 
     def __init__(
         self, dim: int, num_heads: int, dropout: float = 0.0, max_seq_len: int = 513,
         use_qk: bool = True, dynamic_ts: bool = False, static_delta: bool = False,
-        use_age: bool = True,
     ):
         super().__init__()
         assert dim % num_heads == 0, "dim phải chia hết cho num_heads"
@@ -187,11 +103,8 @@ class ConfidenceModulatedAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         # ABLATION FuXi-beta (arXiv 2508.10615): ho bao BO q.k lai TOT HON tren MovieLens.
-        # Tat q.k => attention chi con cac bias (rab tinh/dong + maturity + time).
+        # Tat q.k => attention chi con cac bias (delta*log dist + W_ts).
         self.use_qk = use_qk
-
-        self.use_age = use_age
-        self.age_bias = AgeAwareBias(dim, num_heads) if use_age else None
 
         self.q_proj = nn.Linear(dim, dim)
         self.k_proj = nn.Linear(dim, dim)
@@ -199,7 +112,6 @@ class ConfidenceModulatedAttention(nn.Module):
         self.out_proj = nn.Linear(dim, dim)
         self.dropout = nn.Dropout(dropout)
 
-        self.beta = nn.Parameter(torch.zeros(num_heads))
         self.delta = nn.Parameter(torch.zeros(num_heads))
         # W_ts DONG (nang cap 2): bang tra doi tu scalar sang VECTOR, roi dieu bien
         # theo query. Tinh: ts_w[h, bucket] la mot so. Dong: ts_w[h, bucket] la vector
@@ -210,9 +122,15 @@ class ConfidenceModulatedAttention(nn.Module):
             self.ts_w = nn.Parameter(torch.zeros(num_heads, NUM_TS_BUCKETS + 1, self.head_dim))
             # g_h(x_q): init zero => khoi dau logit ts = 0 Y HET ts_w=0 cua ban tinh,
             # nen ban tinh van la nhom doi chung hop le (cung ly le nhu delta_proj).
+            # [SUA 2026-10-15 — W_ts dong CHET] Truoc day ts_gate VA ts_w CUNG zero-init:
+            # logit += <g(x_q), ts_w[bucket]> => d/d ts_w = g = 0, d/d g = ts_w = 0 => SADDLE,
+            # ca hai KHONG BAO GIO nhan gradient (audit 10-14: grad = 0 tuyet doi ca 4 layer;
+            # log Kaggle B2 |ts|=0 gts=0 suot 1500 step => B2 thuc chat = "khong co time bias",
+            # so sanh B1/B2 VO NGHIA). Cung bug AgeAwareBias da sua 10-09 nhung quen o day.
+            # Quy tac LoRA (arXiv 2106.09685: A random, B zero): trong 1 TICH chi DUNG MOT
+            # thua so = 0. Giu ts_w = 0 (=> logit ts luc init = 0 CHINH XAC, ablation sach),
+            # ts_gate init MAC DINH (khac 0) => d/d ts_w = g(x) != 0 ngay buoc 1.
             self.ts_gate = nn.Linear(dim, num_heads * self.head_dim)
-            nn.init.zeros_(self.ts_gate.weight)
-            nn.init.zeros_(self.ts_gate.bias)
         else:
             self.ts_w = nn.Parameter(torch.zeros(num_heads, NUM_TS_BUCKETS + 1))
 
@@ -240,9 +158,7 @@ class ConfidenceModulatedAttention(nn.Module):
         self,
         x: torch.Tensor,
         key_padding_mask: torch.Tensor | None = None,
-        log_m: torch.Tensor | None = None,
         ts_bucket: torch.Tensor | None = None,
-        hist_age_days: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, L, _ = x.shape
 
@@ -256,9 +172,6 @@ class ConfidenceModulatedAttention(nn.Module):
         else:
             # khong co q.k: logit khoi dau = 0, moi tin hieu den TU BIAS.
             logit = torch.zeros(B, self.num_heads, L, L, dtype=q.dtype, device=q.device)
-
-        if self.age_bias is not None and hist_age_days is not None:
-            logit = logit + self.age_bias(x, age_bucket(hist_age_days))
 
         log_rel = self.log_rel_distance[:L, :L].view(1, 1, L, L)
         # δ_h(x_q): (B,H,L) broadcast với (L,L) — không materialize thêm (B,H,L,L).
@@ -293,15 +206,6 @@ class ConfidenceModulatedAttention(nn.Module):
         # formula.md §4.2. n_q = số token hợp lệ trong tầm nhìn causal của q.
         n_q = (~invalid).sum(dim=-1, keepdim=True).clamp(min=1).to(logit.dtype)
         attn_weight = torch.sigmoid(logit - torch.log(n_q))
-
-        if log_m is not None:
-            # r_p = exp(beta_h*log(m_p)) = m_p**beta_h — "do tin cay cua value", nhan SAU
-            # sigmoid(logit), KHONG cong vao logit. beta=0 => r_p=1.0 CHINH XAC (ablation
-            # sach). Xem formula.md §4.1bis.
-            r_p = torch.exp(
-                self.beta.view(1, -1, 1) * log_m.view(B, 1, L)
-            ).clamp(max=1.0)  # (B,H,L) theo KEY p; clamp chi tac dung khi beta hoc am
-            attn_weight = attn_weight * r_p.unsqueeze(2)  # broadcast (B,H,1,L) -> (B,H,L,L)
 
         attn_weight = attn_weight.masked_fill(invalid, 0.0)
 

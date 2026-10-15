@@ -31,7 +31,6 @@ import numpy as np
 import polars as pl
 
 from schema import (
-    LOG_SCHEMA,
     LOG_STANDARD_FILES,
     VIDEO_BASIC_CATEGORY_FIELD,
     VIDEO_BASIC_FILE,

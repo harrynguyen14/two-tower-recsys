@@ -1,7 +1,8 @@
 """Mã hoá action_vector (11 chiều) + giờ-trong-ngày thành 1 token a_t.
 
 [XOÁ 2026-10-09] age_t ĐÃ CHUYỂN khỏi action token, sang confidence_attention.py như một
-pairwise bias điều biến theo query (cùng pattern với delta_h(x_q)) — xem AgeAwareBias ở đó
+pairwise bias điều biến theo query (AgeAwareBias) — [2026-10-15] AgeAwareBias cũng đã XOÁ
+(Pure không có upload_dt)
 và formula.md §2bis. Lý do: age_t cộng thẳng vào action token là đặc trưng TĨNH của riêng
 item tại thời điểm xem, không có chỗ để biểu diễn "user này thích item mới hay cũ" — mọi
 user thấy "item tuổi X" đều cộng đúng 1 vector giống hệt nhau. Đưa vào attention cho phép

@@ -27,14 +27,11 @@ if _out and not os.environ.get("GEN_RECSYS_OUT_DIR"):
     os.environ["GEN_RECSYS_OUT_DIR"] = str(Path(_out).resolve())
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "preprocess_data"))
-from build_n_cumulative import build_n_cache, lookup_n_at_t_batch_cached
 
 from dataset import ACTION_VECTOR_FIELDS, GenRecsysDataset, ITEM_CATEGORICAL_FIELDS, MAX_SEQ_LEN
 from eval import (aggregate_by_group, matched_by_n_u, compute_metrics_at_k,
                   compute_positive_rank, print_matched, print_eval_report)
 from item_embedding import ItemEmbedding, ItemEmbeddingConfig
-from learnable_thresholds import (item_percentile_table,
-                                  lookup_percentile)
 from negative_sampler import NegativeSampler
 from ranking_loss import BINARY_ACTION_FIELDS, RankingLoss
 from retrieval import RetrievalLoss
@@ -59,61 +56,25 @@ def item_features_to_device(features: dict, device: torch.device) -> dict:
     }
 
 
-def compute_n_i(
-    item_n_cache: dict,
-    video_ids_cpu: torch.Tensor,
-    timestamps_cpu: torch.Tensor,
-) -> torch.Tensor:
-    """N_i(video_id, t) qua item_N — tra tai DUNG thoi diem t (khong leak tuong lai).
-
-    [SUA 2026-10-13 — error.md #8] Truoc la `compute_n_i_n_category`, tra CA N_i va
-    N_category; N_category tinh ra roi BI BO (`n_i, _ = compute_n_i_n_category(...)`),
-    khong bao gio vao model (category_id da rut khoi content token tu lau, thay bang
-    tag_ids — xem dataset.py). Xoa han phan tinh du, doi ten ham dung voi viec no lam.
-    """
-    video_ids_np = video_ids_cpu.numpy()
-    ts_np = timestamps_cpu.numpy()
-    n_i = lookup_n_at_t_batch_cached(item_n_cache, video_ids_np, ts_np)
-    return torch.from_numpy(n_i.astype(np.float32))
-
-
 def embed_items(
     video_ids_cpu: torch.Tensor,
-    timestamps_cpu: torch.Tensor,
     dataset: GenRecsysDataset,
     item_embed: ItemEmbedding,
-    item_n_cache: dict,
     device: torch.device,
-    pct_table: tuple[np.ndarray, np.ndarray] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Tra N_i theo đúng timestamp, ĐỔI SANG PERCENTILE, rồi embed item.
+) -> torch.Tensor:
+    """Embed item theo video_id (content + item-ID).
 
-    [SỬA 2026-10-05] Trước đây truyền N_i THÔ vào `item_weight` — đúng khi nó còn là
-    `tanh(N_i/τ_i)`, nhưng formula.md §0 đã đổi sang percentile, nên truyền N_i thô là
-    nhét SỐ ĐẾM (0..10,424) thẳng vào attention qua `β_h log m_p`. Phải tra
-    `lookup_percentile` TRƯỚC.
-
-    `pct_table` dựng 1 lần trên train (xem build_percentile_table); None thì bỏ hẳn số
-    hạng maturity thay vì âm thầm dùng thang sai.
+    [XOA 2026-10-15] Bang maturity (N_i tai timestamp -> percentile -> trong so item, formula.md
+    §0) da bo: no chi con nuoi beta gate (da xoa) va 2 bang chan doan do bao hoa trong eval. Embed
+    item KHONG con phu thuoc timestamp => bo luon tham so timestamp va bang N_i.
     """
-    n_i = compute_n_i(item_n_cache, video_ids_cpu, timestamps_cpu)
-    if pct_table is None:
-        raise ValueError(
-            "embed_items cần pct_table: `log m_p` nhận PERCENTILE, truyền N_i thô sẽ "
-            "đưa số đếm vào attention (xem learnable_thresholds.lookup_percentile)."
-        )
-    uniq, pct = pct_table
-    n_i_pct = torch.from_numpy(lookup_percentile(uniq, pct, n_i.numpy()))
-    item_weight = n_i_pct.to(device, non_blocking=True)
-
     feats = dataset.get_item_features(video_ids_cpu)
     features = item_features_to_device(feats, device)
-    e_i_final = item_embed(
+    return item_embed(
         video_ids_cpu.to(device, non_blocking=True), features["category_ids"],
         features["author_idx"], features["music_idx"],
         features["caption_embedding"], features["caption_mask"], features["tag_ids"],
     )
-    return e_i_final, item_weight
 
 
 def load_or_compute_p80(
@@ -127,10 +88,8 @@ def load_or_compute_p80(
     thức đổi. Fallback tính lại + CẢNH BÁO nếu file chưa có (dữ liệu cũ build trước khi
     thêm dòng lưu file này).
 
-    [SỬA 2026-10-14 — doc lai code] Tach thanh ham RIENG, dung CHUNG cho ca
-    build_percentile_table (bang maturity) VA NegativeSampler (tranh leak val/test,
-    error.md #9) — truoc day CA HAI noi doc file nay DOC LAP, gay trung lap khong can
-    thiet (khong sai, nhung thua).
+    [2026-10-15] Gio CHI con NegativeSampler dung (tranh leak val/test, error.md #9) — bang
+    maturity tung dung chung da xoa.
     """
     p80_path = Path(output_dir) / "train_val_boundary_p80.npy" if output_dir else None
     if p80_path is not None and p80_path.exists():
@@ -144,32 +103,6 @@ def load_or_compute_p80(
     )
     label_t = dataset.history_meta["t"][dataset.sample_position].astype(np.int64)
     return np.int64(np.percentile(label_t, 80))
-
-
-def build_percentile_table(
-    dataset: GenRecsysDataset, item_n_cache: dict, p80: np.int64,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Bảng N_i -> percentile, dựng 1 LẦN trên TRAIN (formula.md §0).
-
-    Dựng trên N_i tại BIÊN TRAIN (p80) thay vì N_i tại từng timestamp: bảng chỉ định nghĩa
-    THANG ĐO (item này phổ biến tới đâu so với các item khác), không phải giá trị dùng ở
-    runtime. Dùng N_i theo timestamp sẽ cho mỗi (item, t) một thang riêng — không còn so
-    sánh được giữa các vị trí trong cùng chuỗi.
-
-    [SỬA 2026-10-07] `t = int64.max` -> `t = p80`. Trước đây bảng fit trên N_i CUỐI KỲ của
-    TOÀN BỘ dataset, tức gồm cả val và test — bảng này đi thẳng vào attention qua
-    `β_h log m_p`, nên đó là leak (cùng loại với chuẩn hoá feature bằng mean/std của cả
-    train+test: giá trị runtime point-in-time nhưng PHÉP BIẾN ĐỔI fit trên tương lai).
-    Đo được mức độ: spearman(N_i cuối kỳ, N_i tại p80) = 0.9883 — băng thông hẹp, nhưng
-    15.5% item lệch percentile > 0.05 (max 0.745), đủ để reviewer bắt. Sửa rẻ nên sửa.
-
-    [SỬA 2026-10-14] `p80` nay la THAM SO (tinh 1 lan boi load_or_compute_p80 o train()),
-    khong tu doc file RIENG nua — xem load_or_compute_p80.
-    """
-    ids = np.arange(dataset.item_static.shape[0], dtype=np.int64)
-    t_train_end = np.full(ids.shape[0], p80, dtype=np.int64)
-    n_i_all = lookup_n_at_t_batch_cached(item_n_cache, ids, t_train_end)
-    return item_percentile_table(n_i_all)
 
 
 def setup_ddp() -> tuple[bool, int, int, int]:
@@ -193,10 +126,8 @@ def run_batch_forward(
     item_embed: ItemEmbedding,
     seq_model: SequenceModel,
     neg_sampler: NegativeSampler,
-    item_n_cache: dict,
     num_negatives: int,
     device: torch.device,
-    pct_table: tuple[np.ndarray, np.ndarray],
 ) -> dict[str, torch.Tensor]:
     """1 forward pass đầy đủ cho 1 batch — dùng CHUNG bởi train() và evaluate()."""
     hist_video_ids_cpu = batch["hist_video_ids"]
@@ -205,39 +136,22 @@ def run_batch_forward(
     key_padding_mask = batch["key_padding_mask"].to(device, non_blocking=True)
     hist_valid_mask = batch["hist_valid_mask"].to(device, non_blocking=True)
     label_video_id_cpu = batch["label_video_id"]
-    label_timestamp_cpu = batch["label_timestamp"]
     label_action = batch["label_action"].to(device, non_blocking=True)
 
     B, K = hist_video_ids_cpu.shape
 
-    hist_e_i, hist_item_weight = embed_items(
-        hist_video_ids_cpu.reshape(-1), hist_timestamps_cpu.reshape(-1),
-        dataset, item_embed, item_n_cache, device,
-        pct_table=pct_table,
-    )
-    hist_e_i = hist_e_i.view(B, K, -1)
-    hist_item_weight = hist_item_weight.view(B, K)
+    hist_e_i = embed_items(
+        hist_video_ids_cpu.reshape(-1), dataset, item_embed, device,
+    ).view(B, K, -1)
 
     hist_n_u = batch["hist_n_u"].to(device, non_blocking=True)
 
-    # age_t (formula.md §2) — None nếu dataset không có upload_dt dùng được (Pure);
-    # ActionEncoder bỏ hẳn số hạng khi nhận None.
-    hist_age = (
-        dataset.get_age_days(hist_video_ids_cpu.reshape(-1), hist_timestamps_cpu.reshape(-1))
-        .view(B, K).to(device, non_blocking=True)
-        if dataset.has_age else None
-    )
-
-    label_e_i, _ = embed_items(
-        label_video_id_cpu, label_timestamp_cpu, dataset, item_embed,
-        item_n_cache, device, pct_table=pct_table,
-    )
+    label_e_i = embed_items(label_video_id_cpu, dataset, item_embed, device)
     _ie = getattr(item_embed, "module", item_embed)
     label_embed_stats = {k: v.clone() for k, v in _ie._last_stats.items()}
 
     hidden = seq_model(
-        hist_e_i, hist_action, key_padding_mask, hist_age_days=hist_age,
-        item_weight=hist_item_weight,
+        hist_e_i, hist_action, key_padding_mask,
         hist_timestamps=hist_timestamps_cpu.to(device, non_blocking=True),
         hist_video_ids=hist_video_ids_cpu.to(device, non_blocking=True),
     )
@@ -249,7 +163,23 @@ def run_batch_forward(
     # collapse ma SimSiam/BYOL phai chan bang stop-gradient. Do duoc: |grad| duong target
     # = 22.8 (khac 0 ro rang). NGHI VAN: ket luan "multi-vector that bai" (cosine->0.98) co
     # the la HE QUA cua shortcut nay chu khong phai cua multi-vector — chay lai truoc khi chot.
-    target_e_i = torch.cat([hist_e_i[:, 1:, :], label_e_i.unsqueeze(1)], dim=1).detach()
+    #
+    # [BO .detach() 2026-10-14 — ROOT CAUSE regression "model khong hoc duoc gi"] Lap luan
+    # SimSiam/BYOL o tren SAI cho bai nay: SimSiam/BYOL KHONG co negative nen moi can
+    # stop-gradient; o day sampled-softmax CO 512 negative lay tu CUNG bang Phi_i, chinh mau
+    # so softmax chan collapse (SASRec/HSTU deu de gradient chay ca 2 nhanh). Te hon,
+    # detach CHI nhanh positive con `neg_e_i` VAN co gradient => Phi_i chi nhan luc DAY ra
+    # xa pred, khong bao gio duoc KEO ve => |e_pos| troi 84-500 (khong phai do thieu
+    # normalize — cosine 10-09 chi che trieu chung) va item token la content THUAN (khong
+    # co ID embedding) nen khong con duong nao khac de can chinh. A/B cung data p80, cung
+    # code HEAD, chi khac dong nay (CPU, batch 64, seq 64, 600 step, 3840 mau val
+    # full-ranking):
+    #     .detach()  : retrieval 7.69 -> 7.42 (dung yen), hr@10 0.0016 (random 0.0013),
+    #                  median rank 3736/7583, |e_pos| 265
+    #     bo detach  : retrieval 7.76 -> 5.87,            hr@10 0.0336 (> pop 0.0239),
+    #                  median rank 707,                   |e_pos| 3.6
+    # Moc tot cu (hr@10 0.0469, 10-02, commit 212cb7d) cung KHONG co detach.
+    target_e_i = torch.cat([hist_e_i[:, 1:, :], label_e_i.unsqueeze(1)], dim=1)
     target_ids_cpu = torch.cat([hist_video_ids_cpu[:, 1:], label_video_id_cpu.unsqueeze(1)], dim=1)
     pair_valid = hist_valid_mask.clone()
     pair_valid[:, :-1] &= hist_valid_mask[:, 1:]
@@ -264,12 +194,9 @@ def run_batch_forward(
     neg_ids, neg_log_q = neg_sampler.sample(
         B, num_negatives, device, exclude=target_ids_cpu,
     )
-    neg_ts_cpu = label_timestamp_cpu.unsqueeze(1).expand(-1, num_negatives).reshape(-1)
-    neg_e_i, _ = embed_items(
-        neg_ids.cpu().reshape(-1), neg_ts_cpu, dataset, item_embed,
-        item_n_cache, device, pct_table=pct_table,
-    )
-    neg_e_i = neg_e_i.view(B, num_negatives, -1)
+    neg_e_i = embed_items(
+        neg_ids.cpu().reshape(-1), dataset, item_embed, device,
+    ).view(B, num_negatives, -1)
     target_log_q = neg_sampler.log_q_for(target_ids_cpu.reshape(-1).to(device, non_blocking=True)).view(B, K)
 
     e_user_eval = hidden[:, -1, :]
@@ -300,9 +227,6 @@ def run_batch_forward(
         "hist_video_ids": hist_video_ids_cpu,
         "label_video_id": label_video_id_cpu,
         "n_u_at_pred": hist_n_u[:, -1].detach().cpu(),
-        "m_saturated_frac": (
-            (hist_item_weight > 0.95).float() * hist_valid_mask.float()
-        ).sum(1).div(hist_valid_mask.float().sum(1).clamp(min=1)).detach().cpu(),
     }
 
 
@@ -322,11 +246,6 @@ def train(
     # CANH BAO: doi thang logit => checkpoint TRUOC 10-09 KHONG nap lai de so sanh duoc.
     t_base: float = 0.07,
     learnable_temp: bool = True,
-    # [THEM 2026-10-13] CCR (Zhou et al. AAAI'24, arXiv:2401.00165) — formula.md §5bis.
-    # 0.0 MAC DINH: loss khong doi (ablation sach). Khong co co CLI, cung nhom "sieu tham
-    # so khong co co" nhu t_base/ranking_loss_weight — can tune can than tren validation,
-    # khong nen de bat nham qua dong lenh.
-    ccr_beta: float = 0.0,
     lr: float = 1e-3,
     # [THEM 2026-10-13] error.md #21: da co scaler.unscale_(optimizer) truoc buoc nay
     # (de clip o DUNG thang gradient that, khong phai thang da nhan fp16 scale) nhung
@@ -334,6 +253,13 @@ def train(
     # tri mac dinh pho bien (PyTorch tutorial, nhieu paper NLP/recsys), chua tune rieng
     # cho model nay.
     grad_clip_norm: float = 1.0,
+    # [THEM 2026-10-15] NormFace (arXiv 1704.06369 §3.2): logit COSINE => gradient VUONG GOC
+    # voi vector => moi buoc update ||x|| chi TANG ("weight decay is necessary"). Da gap
+    # that: |e_pos| troi 84-500 (luc con .detach(), xem run_batch_forward). Bo detach xong
+    # con 3.6 nhung train dai hon van troi => effective lr tu giam (Weight Norm 1602.07868).
+    # AdamW (decay TACH khoi gradient) — Adam + L2 thi decay bi chia cho sqrt(v), yeu that
+    # thuong o tham so gradient lon. 0.01 = mac dinh AdamW, chua tune.
+    weight_decay: float = 0.01,
     ranking_loss_weight: float = 0.5,
     num_epochs: int = 1,
     max_steps_per_epoch: int | None = None,
@@ -367,7 +293,7 @@ def train(
     # caption_embeddings.npy. Dataset cung TU DONG tat khi thieu file, nen co nay chi can
     # khi muon tat DU DA co file (ablation that).
     no_caption: bool = False,
-    no_age: bool = False,
+    no_item_id: bool = False,
     num_workers: int = 4,
     device_str: str = "cuda" if torch.cuda.is_available() else "cpu",
 ):
@@ -413,6 +339,7 @@ def train(
         # `train_dataset.use_caption` da gop ca co --no-caption LAN viec file co ton tai
         # khong (dataset tu tat khi thieu), nen lay tu day thay vi tu `no_caption`.
         use_caption=train_dataset.use_caption,
+        use_item_id=not no_item_id,
         caption_dim=train_dataset.caption_dim or 384,
     )
     item_embed = ItemEmbedding(item_config).to(device, non_blocking=True)
@@ -422,16 +349,13 @@ def train(
         max_seq_len=2 * max_seq_len + 1,
         use_checkpoint=use_checkpoint, use_qk=use_qk, dynamic_ts=dynamic_ts,
         static_delta=static_delta,
-        use_age=(train_dataset.has_age and not no_age),
     ).to(device, non_blocking=True)
     retrieval_loss_fn = RetrievalLoss(
-        dim=dim, t_base=t_base, learnable_temp=learnable_temp, ccr_beta=ccr_beta,
+        dim=dim, t_base=t_base, learnable_temp=learnable_temp,
     ).to(device, non_blocking=True)
     ranking_loss_fn = RankingLoss(dim=dim).to(device, non_blocking=True)
-    # [THEM 2026-10-13 — error.md #9, DON 2026-10-14] Doc p80 MOT LAN DUY NHAT, dung chung
-    # cho ca NegativeSampler (tranh leak val+test vao phan phoi negative) VA
-    # build_percentile_table (tranh leak vao bang maturity) — truoc day 2 cho doc file
-    # nay DOC LAP nhau, trung lap khong can thiet.
+    # [THEM 2026-10-13 — error.md #9] Doc p80 MOT LAN cho NegativeSampler (tranh leak
+    # val+test vao phan phoi negative).
     p80 = load_or_compute_p80(train_dataset, output_dir)
     neg_sampler = NegativeSampler(output_dir, num_items=num_items, p80=p80)
 
@@ -441,7 +365,26 @@ def train(
         + list(retrieval_loss_fn.parameters())
         + list(ranking_loss_fn.parameters())
     )
-    optimizer = torch.optim.Adam(dense_params, lr=lr, fused=(device.type == "cuda"))
+    # Chi decay MA TRAN trong so + bang embedding (ndim>=2). KHONG decay: bias/LayerNorm
+    # (ndim<2, thong le), delta/log_temp (vo huong — decay keo ve 0 = keo ve NHOM DOI
+    # CHUNG cua ablation; log_temp ve 0 = temp ve 1.0, phang het logit cosine), va bang
+    # bias attention ts_w (2 chieu nhung cung la bias zero-init, cung ly do).
+    _no_decay_names = ("ts_w",)
+    decay, no_decay = [], []
+    for mod in (item_embed, seq_model, retrieval_loss_fn, ranking_loss_fn):
+        for pname, p in mod.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.ndim < 2 or pname.split(".")[-1] in _no_decay_names:
+                no_decay.append(p)
+            else:
+                decay.append(p)
+    assert len(decay) + len(no_decay) == sum(p.requires_grad for p in dense_params)
+    optimizer = torch.optim.AdamW(
+        [{"params": decay, "weight_decay": weight_decay},
+         {"params": no_decay, "weight_decay": 0.0}],
+        lr=lr, fused=(device.type == "cuda"),
+    )
     use_amp = (device.type == "cuda") and amp
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
 
@@ -453,15 +396,6 @@ def train(
     else:
         item_embed_ddp, seq_model_ddp = item_embed, seq_model
 
-    log("[train] building N_i cache (1 lần, dùng xuyên suốt training)...")
-
-    item_n_cache = build_n_cache("item_N")
-
-    # Bang N_i -> percentile, dung 1 LAN tren train (formula.md §0). Truoc 2026-10-05 cho
-    # nay truyen N_i THO vao item_weight — xem embed_items.
-    pct_table = build_percentile_table(train_dataset, item_n_cache, p80)
-    log(f"[train] bang percentile N_i: {len(pct_table[0]):,} gia tri N_i duy nhat")
-
     if no_tag:
         raise ValueError(
             "--no-tag: content token chi con GMU va `fuse` thanh phep chieu d->d, khong "
@@ -469,7 +403,7 @@ def train(
         )
 
     log(f"[train] nhanh tag: {'TAT' if no_tag else 'BAT'}"
-        f" | age: {'BAT' if (train_dataset.has_age and not no_age) else 'TAT'}")
+        f" | item-ID: {'TAT' if no_item_id else 'BAT'}")
 
     steps_per_epoch = min(len(train_loader), max_steps_per_epoch) if max_steps_per_epoch else len(train_loader)
 
@@ -484,7 +418,7 @@ def train(
         "t_base": t_base, "learnable_temp": learnable_temp,
         "max_seq_len": max_seq_len, "eval_negatives": eval_negatives,
         "random_window": random_window,
-        "no_tag": no_tag, "no_age": no_age,
+        "no_tag": no_tag, "no_item_id": no_item_id,
         # Lay tu dataset (gop ca co --no-caption lan viec file co ton tai), de checkpoint
         # ghi dung cau hinh THUC TE da train, khong phai y dinh tren CLI.
         "use_caption": train_dataset.use_caption,
@@ -494,10 +428,10 @@ def train(
     # KIEN TRUC). Thieu field nay thi checkpoint khong tu du de biet da chay voi gia tri
     # gi, phai nho/doc lai log CLI (neu con).
     run_metadata = {
-        "lr": lr, "grad_clip_norm": grad_clip_norm,
+        "lr": lr, "grad_clip_norm": grad_clip_norm, "weight_decay": weight_decay,
         "ranking_loss_weight": ranking_loss_weight,
         "batch_size": batch_size, "num_negatives": num_negatives,
-        "eval_negatives": eval_negatives, "ccr_beta": ccr_beta,
+        "eval_negatives": eval_negatives,
         "full_ranking": full_ranking, "eval_split": eval_split,
     }
     ckpt_path = Path(save_path) if save_path else output_dir / "ckpt.pt"
@@ -520,8 +454,8 @@ def train(
     if eval_only:
         evaluate(
             eval_split, output_dir, item_embed, seq_model, neg_sampler,
-            retrieval_loss_fn, item_n_cache, eval_negatives, batch_size, device,
-            pct_table, use_caption=train_dataset.use_caption,
+            retrieval_loss_fn, eval_negatives, batch_size, device,
+            use_caption=train_dataset.use_caption,
             max_seq_len=max_seq_len, max_batches=eval_max_batches,
             num_workers=num_workers,
             full_ranking=full_ranking,
@@ -548,11 +482,10 @@ def train(
                 continue
 
             step_start = time.perf_counter()
-            B = batch["hist_video_ids"].shape[0]
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
                 fwd = run_batch_forward(
                     batch, train_dataset, item_embed_ddp, seq_model_ddp, neg_sampler,
-                    item_n_cache, num_negatives, device, pct_table,
+                    num_negatives, device,
                 )
                 forward_time_acc += time.perf_counter() - step_start
 
@@ -575,12 +508,12 @@ def train(
             # [THEM 2026-10-13] error.md #21: da unscale_ (dung de clip o DUNG thang
             # gradient that) nhung truoc day KHONG clip gi — bo lo chinh ly do thuong
             # goi unscale_ som. Thieu clip => mot batch co gradient dot bien (vd item
-            # cuc hiem, log(m_p) rat am truoc khi tach beta thanh gate, hoac delta_proj
-            # troi xa — xem formula.md §4.1bis/§4.1ter) co the day optimizer di xa.
+            # cuc hiem, hoac delta_proj troi xa — xem formula.md §4.1ter) co the day
+            # optimizer di xa.
             torch.nn.utils.clip_grad_norm_(dense_params, max_norm=grad_clip_norm)
 
             grad_norms = {}
-            for pname in ("beta", "delta", "ts_w"):
+            for pname in ("delta", "ts_w"):
                 total = 0.0
                 for layer in seq_model.decoder.layers:
                     g = getattr(layer.attn, pname).grad
@@ -610,15 +543,15 @@ def train(
                 step_time_acc = 0.0
                 with torch.no_grad():
                     vals = {}
-                    for pname in ("beta", "delta", "ts_w"):
+                    for pname in ("delta", "ts_w"):
                         ps = [getattr(l.attn, pname).abs().mean().item() for l in seq_model.decoder.layers]
                         vals[pname] = sum(ps) / len(ps)
                 tqdm.write(
                     f"epoch={epoch} step={step} loss={loss.item():.4f} "
                     f"retrieval={r_loss.item():.4f} ranking={k_loss.item():.4f}"
-                    f" | |b|={vals['beta']:.2e} |d|={vals['delta']:.2e}"
+                    f" | |d|={vals['delta']:.2e}"
                     f" |ts|={vals['ts_w']:.2e}"
-                    f" gb={grad_norms['beta']:.2e} gd={grad_norms['delta']:.2e}"
+                    f" gd={grad_norms['delta']:.2e}"
                     f" gts={grad_norms['ts_w']:.2e}"
                     f"{fwd_msg}"
                 )
@@ -638,8 +571,8 @@ def train(
             continue
         evaluate(
             eval_split, output_dir, item_embed, seq_model, neg_sampler, retrieval_loss_fn,
-            item_n_cache, eval_negatives, batch_size, device,
-            pct_table, use_caption=train_dataset.use_caption,
+            eval_negatives, batch_size, device,
+            use_caption=train_dataset.use_caption,
             max_seq_len=max_seq_len, max_batches=eval_max_batches,
             num_workers=num_workers, full_ranking=full_ranking,
         )
@@ -752,62 +685,7 @@ def _report_history_diagnostic(
     rho = torch.corrcoef(torch.stack([ru, rr]))[0, 1].item()
     print(f"    tương quan hạng N_u <-> rank: rho={rho:+.4f}")
     print("    CẢNH BÁO: rho>0 KHÔNG có nghĩa lịch sử dài hại — đã chứng minh 2026-09-22 nó")
-    print("    là CONFOUND (user warm xem đồ ngách hơn -> bài khó hơn). Đọc bảng tiếp theo.")
-
-
-def _report_msat_diagnostic(
-    rank: torch.Tensor,
-    m_sat: torch.Tensor,
-    n_cand: torch.Tensor,
-) -> None:
-    """m_j BÃO HOÀ có hại không? — phép thử trước khi quyết định có sửa hay không."""
-    print("\n  --- CHẨN ĐOÁN: m_j bão hoà có hại không? ---")
-    C = int(n_cand.float().median().item())
-    print(f"    m_j > 0.95 = vùng log(m_j) -> 0, β/γ mất tín hiệu; ngẫu nhiên -> median≈{C // 2}")
-    print(f"    {'% token bão hoà':<20}{'n':>8}{'median rank':>13}{'top-10%':>10}")
-    for lo, hi, ten in [(0.0, 0.15, "0-15%"), (0.15, 0.30, "15-30%"),
-                        (0.30, 0.45, "30-45%"), (0.45, 1.01, "45%+")]:
-        k = (m_sat >= lo) & (m_sat < hi)
-        n = int(k.sum())
-        if n == 0:
-            continue
-        r = rank[k].float()
-        print(f"    {ten:<20}{n:>8}{r.median():>13.0f}{(r < C * 0.1).float().mean():>10.3f}")
-    ra = torch.argsort(torch.argsort(m_sat.float())).float()
-    rr = torch.argsort(torch.argsort(rank.float())).float()
-    rho = torch.corrcoef(torch.stack([ra, rr]))[0, 1].item()
-    print(f"    tương quan hạng (% bão hoà) <-> rank: rho={rho:+.4f}  "
-          f"(>0 = bão hoà m_j HẠI; ≈0 = vô hại, ĐỪNG sửa)")
-
-
-def _report_confound_diagnostic(
-    rank: torch.Tensor,
-    n_u: torch.Tensor,
-    m_sat: torch.Tensor,
-) -> None:
-    """"Lịch sử dài gây hại" có THẬT không, hay chỉ là user warm gặp bài KHÓ hơn?"""
-    def _rho(a: torch.Tensor, b: torch.Tensor) -> float:
-        if a.numel() < 30:
-            return float("nan")
-        ra = torch.argsort(torch.argsort(a.float())).float()
-        rb = torch.argsort(torch.argsort(b.float())).float()
-        return torch.corrcoef(torch.stack([ra, rb]))[0, 1].item()
-
-    print("\n  --- CHẨN ĐOÁN: 'lịch sử dài hại' là THẬT hay chỉ là ĐỘ KHÓ? ---")
-    print(f"    rho tổng thể (N_u <-> rank) = {_rho(n_u, rank):+.4f}")
-    print(f"    rho (N_u <-> m_sat)         = {_rho(n_u, m_sat):+.4f}  "
-          f"(<0 = user warm xem đồ ÍT phổ biến -> bài khó hơn)")
-    print(f"\n    Khống chế độ khó — rho(N_u <-> rank) TRONG từng tầng m_sat:")
-    print(f"    {'tầng m_sat':<16}{'n':>9}{'rho':>10}{'median rank':>13}")
-    for lo, hi, ten in [(0.0, 0.15, "0-15%"), (0.15, 0.30, "15-30%"),
-                        (0.30, 0.45, "30-45%"), (0.45, 1.01, "45%+")]:
-        k = (m_sat >= lo) & (m_sat < hi)
-        n = int(k.sum())
-        if n < 30:
-            continue
-        print(f"    {ten:<16}{n:>9}{_rho(n_u[k], rank[k]):>10.4f}{rank[k].float().median():>13.0f}")
-    print("    -> rho sụp về ~0 trong mọi tầng = CONFOUND, không có gì để sửa;")
-    print("       rho giữ nguyên = lịch sử dài hại thật, độc lập độ khó.")
+    print("    là CONFOUND (user warm xem đồ ngách hơn -> bài khó hơn) — memory 2026-09-22.")
 
 
 def _report_rank_diagnostic(
@@ -851,11 +729,9 @@ def evaluate(
     seq_model: SequenceModel,
     neg_sampler: NegativeSampler,
     retrieval_loss_fn: RetrievalLoss,
-    item_n_cache: dict,
     num_negatives: int,
     batch_size: int,
     device: torch.device,
-    pct_table: tuple[np.ndarray, np.ndarray],
     use_caption: bool = True,
     max_seq_len: int = MAX_SEQ_LEN,
     max_batches: int | None = None,
@@ -876,7 +752,6 @@ def evaluate(
     all_metrics: dict[str, list[torch.Tensor]] = {}
     all_user_cold, all_item_cold, all_user_lowhist = [], [], []
     all_n_u = []
-    all_m_sat = []
     all_rank, all_norm_user, all_norm_pos, all_n_cand = [], [], [], []
 
     # FULL RANKING -- CHI dung duoc tren catalog NHO (Pure: 7,583 item).
@@ -886,20 +761,14 @@ def evaluate(
     # hon B" co the LAT khi do full), nen bang 2x3 cua Pure can mot lan do full de xac nhan
     # thu tu.
     # Da chay: hr@10 full-ranking 0.0469 vs sampled 0.0469 => thu tu GIU.
-    # Nhung item embedding KHONG phu thuoc timestamp o nhanh candidate: dong 160/190 deu
-    # vut bo `item_weight` (`label_e_i, _` / `neg_e_i, _`), no chi dung cho history.
-    # => nhung ca catalog MOT LAN, dung lai cho moi batch.
+    # Item embedding KHONG phu thuoc timestamp => nhung ca catalog MOT LAN, dung lai moi batch.
     all_item_e = None
     if full_ranking:
         ids = torch.arange(dataset.item_static.shape[0])
-        ts0 = torch.zeros(ids.shape[0], dtype=torch.int64)
         with torch.no_grad():
             chunks = []
             for lo in range(0, ids.shape[0], 2048):
-                e, _ = embed_items(ids[lo:lo + 2048], ts0[lo:lo + 2048], dataset, item_embed,
-                                   item_n_cache, device,
-                                   pct_table=pct_table)
-                chunks.append(e)
+                chunks.append(embed_items(ids[lo:lo + 2048], dataset, item_embed, device))
             all_item_e = torch.cat(chunks, dim=0)          # (num_items, d)
         print(f"  [full-ranking] xep hang tren TOAN BO {all_item_e.shape[0]:,} item "
               f"(thay vi {num_negatives + 1} mau)")
@@ -911,7 +780,7 @@ def evaluate(
 
         fwd = run_batch_forward(
             batch, dataset, item_embed, seq_model, neg_sampler,
-            item_n_cache, num_negatives, device, pct_table,
+            num_negatives, device,
         )
         e_u = fwd["e_user_eval"]
         if full_ranking:
@@ -943,7 +812,6 @@ def evaluate(
         all_item_cold.append(fwd["is_item_cold"])
         all_user_lowhist.append(fwd["is_user_lowhistory"])
         all_n_u.append(fwd["n_u_at_pred"])
-        all_m_sat.append(fwd["m_saturated_frac"])
 
     per_sample_metrics = {k: torch.cat(v) for k, v in all_metrics.items()}
     is_user_cold = torch.cat(all_user_cold)
@@ -955,8 +823,6 @@ def evaluate(
         torch.cat(all_n_cand), is_user_cold, is_item_cold,
     )
     _report_history_diagnostic(torch.cat(all_rank), torch.cat(all_n_u), torch.cat(all_n_cand))
-    _report_msat_diagnostic(torch.cat(all_rank), torch.cat(all_m_sat), torch.cat(all_n_cand))
-    _report_confound_diagnostic(torch.cat(all_rank), torch.cat(all_n_u), torch.cat(all_m_sat))
     n_all = next(iter(per_sample_metrics.values())).shape[0]
     result_overall = aggregate_by_group(
         per_sample_metrics, {"all": torch.ones(n_all, dtype=torch.bool)})
@@ -1028,11 +894,6 @@ if __name__ == "__main__":
     parser.add_argument("--no-tag", action="store_true",
                         help="ABLATION (formula.md muc 1): bo nhanh 2 (tag) cua content "
                              "token — content token chi con GMU, khong con gi de hop nhat.")
-    parser.add_argument("--no-age", action="store_true",
-                        help="ABLATION (formula.md §2): bo W_age.phi(age_t) khoi action "
-                             "token. W_age zero-init nen da co ablation gian tiep qua "
-                             "||W_age|| sau train; co nay cho ablation TRUC TIEP. Khong co "
-                             "tac dung khi upload_dt qua it gia tri (Pure: 3 ngay).")
     parser.add_argument("--save-every", type=int, default=None, help="Lưu checkpoint mỗi N step (ngoài lần lưu cuối mỗi epoch, vốn LUÔN chạy). Dùng khi session hay bị ngắt giữa chừng")
     parser.add_argument("--save-path", default=None, help="Đường dẫn checkpoint; mặc định <output-dir>/ckpt.pt. Trên Kaggle nên trỏ vào /kaggle/working (output-dir có thể read-only)")
     parser.add_argument("--resume", default=None, help="Nạp checkpoint và train TIẾP từ đúng step đã dừng (gồm cả optimizer state)")
@@ -1060,6 +921,11 @@ if __name__ == "__main__":
     parser.add_argument("--grad-clip-norm", type=float, default=1.0,
                         help="[error.md #21] Max norm cho clip_grad_norm_, ap dung "
                              "SAU scaler.unscale_ (dung thang gradient that)")
+    parser.add_argument("--weight-decay", type=float, default=0.01,
+                        help="AdamW decoupled weight decay cho ma tran/embedding (NormFace "
+                             "1704.06369: logit cosine lam norm phinh). 0 = tat")
+    parser.add_argument("--no-item-id", action="store_true",
+                        help="Ablation: tat item-ID embedding, Phi_i = content THUAN (hanh vi truoc 2026-10-15)")
     args = parser.parse_args()
     train(
         output_dir=args.output_dir,
@@ -1075,6 +941,7 @@ if __name__ == "__main__":
         learnable_temp=not args.fixed_temp,
         lr=args.lr,
         grad_clip_norm=args.grad_clip_norm,
+        weight_decay=args.weight_decay,
         ranking_loss_weight=args.ranking_loss_weight,
         full_ranking=args.full_ranking,
         use_checkpoint=args.checkpoint,
@@ -1088,6 +955,6 @@ if __name__ == "__main__":
         max_seq_len=args.max_seq_len,
         random_window=not args.no_random_window,
         no_tag=args.no_tag,
-        no_age=args.no_age,
+        no_item_id=args.no_item_id,
         num_workers=args.num_workers,
     )

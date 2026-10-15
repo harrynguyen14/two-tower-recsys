@@ -73,7 +73,6 @@ def main() -> None:
     for idx in range(len(dataset)):
         row = dataset.split_data[idx]
         sample_idx = int(row["index"])
-        user_idx = int(dataset.sample_user_idx[sample_idx])
         position = int(dataset.sample_position[sample_idx])
         label_pos = position  # xem dataset.py: window_end == position cho eval (cua so co dinh)
         label_video_ids.append(int(dataset.history_meta["video_id"][label_pos]))

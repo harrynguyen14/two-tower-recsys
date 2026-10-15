@@ -23,13 +23,11 @@ class RetrievalLoss(nn.Module):
 
     def __init__(
         self, dim: int, t_base: float = 0.07, learnable_temp: bool = True,
-        ccr_beta: float = 0.0,
     ):
         super().__init__()
         self.dim = dim
-        # [THEM 2026-10-13] CCR (Zhou et al. AAAI'24, arXiv:2401.00165) — xem formula.md §5bis.
-        # ccr_beta=0.0 MAC DINH: loss = cross_entropy thuan, Y HET ban cu (ablation sach).
-        self.ccr_beta = ccr_beta
+        # [XOA 2026-10-15] CCR (Zhou et al. AAAI'24) da bo: chua tune, mac dinh tat, va bat
+        # len la DOI ham muc tieu => moi o ablation khong con so duoc. Xem formula.md §5bis.
 
         # [SUA 2026-10-09] L2-NORMALIZE + NHIET DO HOC DUOC. Sua bug model khong hoc:
         # do duoc |e_user|=6.78 nhung |e_pos|=473.57 (lech 70x) => |logit| ~ 4013 =>
@@ -119,15 +117,7 @@ class RetrievalLoss(nn.Module):
         positive_idx: torch.Tensor,
     ) -> torch.Tensor:
         scaled_logit = self.scaled_logit(e_u_final, candidate_embeddings, log_q)
-        loss = F.cross_entropy(scaled_logit, positive_idx, reduction="none")
-        if self.ccr_beta != 0.0:
-            # [THEM 2026-10-13] CCR — xem formula.md §5bis. l_RCL = l_NCE(pos) - beta*E_c[l_NCE(c)].
-            # E_c[l_NCE(c)] = E_c[-log_softmax(logit)[:,c]] = -mean(log_softmax(logit), dim=-1)
-            # (dang closed-form, KHONG can vong lap qua moi candidate — verify maxdiff=0.0e+00
-            # voi cach tinh tung candidate rieng, xem test_retrieval_temp.py).
-            e_c_loss = -F.log_softmax(scaled_logit, dim=-1).mean(dim=-1)
-            loss = loss - self.ccr_beta * e_c_loss
-        return loss.mean()
+        return F.cross_entropy(scaled_logit, positive_idx)
 
     def forward_sequence(
         self,
@@ -159,9 +149,5 @@ class RetrievalLoss(nn.Module):
         loss = F.cross_entropy(
             flat_logits, target.reshape(-1), reduction="none"
         ).view_as(valid_mask)
-        if self.ccr_beta != 0.0:
-            # [THEM 2026-10-13] CCR — cung cong thuc nhu forward(), xem formula.md §5bis.
-            e_c_loss = -F.log_softmax(flat_logits, dim=-1).mean(dim=-1).view_as(valid_mask)
-            loss = loss - self.ccr_beta * e_c_loss
         valid = valid_mask.float()
         return (loss * valid).sum() / valid.sum().clamp(min=1)

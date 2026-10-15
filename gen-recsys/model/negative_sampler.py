@@ -20,11 +20,8 @@ KHÔNG chuyển sang uniform (0.08 ms/batch) để tránh việc này: phân ph�
 [SỬA 2026-10-13 — error.md #9] TRƯỚC ĐÂY `freq_observed = np.diff(item_offsets)` dùng N_i
 CUỐI KỲ (tổng toàn bộ log train+val+test, vì item_N_*.npy build từ TOÀN BỘ
 LOG_STANDARD_FILES không filter split) — log_q và alias table (phân phối negative) bị FIT
-TRÊN CẢ VAL+TEST, một dạng leak khác với leak đã sửa ở §0 cho percentile m_t (formula.md
-§0 đã sửa bằng cách tra N_i TẠI MỐC p80, không phải N_i cuối kỳ — ở đây làm tương tự).
-Sửa: nếu có `p80`, tra N_i của MỖI item TẠI đúng mốc đó (dùng cùng cơ chế
-`lookup_n_at_t_batch` mà build_percentile_table/build_interactions đã dùng) thay vì N_i
-cuối kỳ. `p80=None` (ví dụ gọi trực tiếp không qua train.py) giữ hành vi CŨ + cảnh báo.
+TRÊN CẢ VAL+TEST. Sửa: nếu có `p80`, tra N_i của MỖI item TẠI đúng mốc đó (qua
+`lookup_n_at_t_batch`) thay vì N_i cuối kỳ. `p80=None` (ví dụ gọi trực tiếp không qua train.py) giữ hành vi CŨ + cảnh báo.
 """
 
 from __future__ import annotations

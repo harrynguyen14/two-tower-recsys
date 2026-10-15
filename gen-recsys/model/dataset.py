@@ -14,7 +14,6 @@ MAX_SEQ_LEN = 256
 # Giu lai trong item_static vi category_N/N_category van tra cuu theo no.
 ITEM_CATEGORICAL_FIELDS = ["video_type_id", "music_type_id"]
 
-MS_PER_DAY = 86_400_000
 
 ACTION_VECTOR_FIELDS = [
     "is_click", "is_like", "is_follow", "is_comment", "is_forward", "is_hate",
@@ -51,7 +50,19 @@ class GenRecsysDataset(Dataset):
         cap_has = self.output_dir / "caption_has_caption.npy"
         self.use_caption = use_caption and cap_emb.exists() and cap_has.exists()
         if self.use_caption:
-            self.caption_embeddings = np.load(cap_emb, mmap_mode="r")
+            # [SUA 2026-10-15 — caption DI HUONG] cosine trung binh giua 2 caption bat ky =
+            # 0.866 (|huong trung binh| = 0.93): moi caption gan nhu CUNG mot huong (anisotropy
+            # cua sentence embedding, xem BERT-whitening arXiv 2103.15316). He qua do duoc: moi
+            # ReLU trong ModalityEncoder (gmu.py) thay gan nhu cung input cho moi item => 15%
+            # unit chet ngay luc init, 41% sau 60 step — mat gan nua nang luc nhanh caption, ma
+            # item token la content THUAN (khong ID embedding). Sua: tru mean toan catalog roi
+            # L2-normalize lai (giu thang ~1 nhu cu) => cosine trung binh con 0.0002. Mean
+            # chi la thong ke CONTENT khong nhan, khong leak label. 7583x384 fp32 = 11 MB nen
+            # nap han vao RAM thay mmap. Whitening day du: CHUA lam (centering da du go nghen).
+            cap = np.load(cap_emb).astype(np.float32)
+            cap = cap - cap.mean(axis=0, keepdims=True)
+            cap /= np.maximum(np.linalg.norm(cap, axis=1, keepdims=True), 1e-8)
+            self.caption_embeddings = cap
             self.caption_has_caption = np.load(cap_has, mmap_mode="r")
             self.caption_dim = int(self.caption_embeddings.shape[1])
         else:
@@ -61,9 +72,6 @@ class GenRecsysDataset(Dataset):
             if use_caption:
                 print(f"[dataset] KHONG thay caption_embeddings.npy trong {self.output_dir}"
                       f" => nhanh caption TAT (GMU con 4 modality)")
-
-        names = self.item_static.dtype.names
-        self.has_age = "upload_day" in names
 
     def __len__(self) -> int:
         return len(self.split_data)
@@ -175,17 +183,6 @@ class GenRecsysDataset(Dataset):
         trong ItemEmbeddingConfig va train.py khong truyen gi.
         """
         return int(self.item_static["tag_ids"].max()) + 1
-
-    def get_age_days(self, video_ids: torch.Tensor, timestamps: torch.Tensor) -> torch.Tensor:
-        """age_t = so ngay tu luc item ra mat toi luc xem (formula.md §2).
-
-        Tinh runtime chu khong luu san: age phu thuoc timestamp cua TUNG tuong tac, luu
-        san se la (n_item x n_timestamp). item thieu upload_dt (upload_day=-1) cho age am,
-        action_encoder.age_bucket day ve bin 0.
-        """
-        upload = self.item_static["upload_day"][video_ids.numpy()].astype(np.int64)
-        view_day = timestamps.numpy() // MS_PER_DAY
-        return torch.from_numpy((view_day - upload).astype(np.float32))
 
     def get_category_ids(self, video_ids: torch.Tensor) -> torch.Tensor:
         """category_id (tag cũ, đã factorize) của mỗi video_id — dùng làm entity_id khi"""
