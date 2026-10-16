@@ -48,13 +48,6 @@ tương lai", không leak.
 CHÍNH LÀ mốc p80 — token đầu tiên của user này đã sau p80, nên MỌI token/sample của user
 đó (kể cả các vị trí sau) cũng sau p80, tự động rơi vào val/test.
 
-τ_i CHỈ dùng để gán is_item_cold — KHÔNG phải giá trị nào model dùng.
-
-[XOÁ 2026-10-06] Hai field `user_weight`/`item_weight` đã bỏ khỏi output. Chúng là bản
-`tanh(N/τ)` "để tham khảo" mà `dataset.py` **chưa bao giờ đọc**: model tự tra N_i tại đúng
-timestamp rồi đổi sang percentile (formula.md §0), và `tanh` đã bị bác ở chính §0. Giữ lại
-là mời người đọc sau nầm lẫn hai thang đo khác nhau.
-
 Output: {split}.npy (split = train/val/test) — structured array:
   index         int64    — vị trí gốc trong sample_user_idx/sample_position (mảng đầy đủ)
   is_user_cold  bool     — STRICT HOLDOUT: user có first_seen_ms > boundary train/test

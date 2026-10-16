@@ -10,9 +10,6 @@ from torch.utils.data import Dataset
 
 MAX_SEQ_LEN = 256
 
-# category_id (tag da factorize CA CHUOI) KHONG con vao content token — xem tag_ids.
-# Giu lai trong item_static vi category_N/N_category van tra cuu theo no.
-ITEM_CATEGORICAL_FIELDS = ["video_type_id", "music_type_id"]
 
 
 ACTION_VECTOR_FIELDS = [
@@ -25,7 +22,8 @@ class GenRecsysDataset(Dataset):
     """split = "train" | "val" | "test" — đọc {split}.npy (Pass 5) làm danh sách sample,"""
 
     def __init__(self, output_dir: str | Path, split: str, max_seq_len: int = MAX_SEQ_LEN,
-                 random_window: bool = False, seed: int = 0, use_caption: bool = True):
+                 random_window: bool = False, seed: int = 0, use_caption: bool = True,
+                 caption_file: str = "caption_embeddings.npy"):
         self.output_dir = Path(output_dir)
         self.max_seq_len = max_seq_len
         # CUA SO TRUOT (chi train): xem docstring _window_start.
@@ -43,35 +41,25 @@ class GenRecsysDataset(Dataset):
         self.history_action = np.load(self.output_dir / "history_action_vectors.npy", mmap_mode="r")
 
         self.item_static = np.load(self.output_dir / "item_static.npy", mmap_mode="r")
-        # [SUA 2026-10-08] Caption la OPTIONAL. Tat bang `use_caption=False` (co --no-caption)
-        # HOAC tu dong tat khi thieu file. Truoc day thieu file la FileNotFoundError chet
-        # ngay o __init__.
-        cap_emb = self.output_dir / "caption_embeddings.npy"
-        cap_has = self.output_dir / "caption_has_caption.npy"
-        self.use_caption = use_caption and cap_emb.exists() and cap_has.exists()
+        # Caption OPTIONAL: chi nap khi use_caption (train.py: `not no_content`) VA co file.
+        cap_emb = self.output_dir / caption_file
+        self.use_caption = use_caption and cap_emb.exists()
         if self.use_caption:
-            # [SUA 2026-10-15 — caption DI HUONG] cosine trung binh giua 2 caption bat ky =
-            # 0.866 (|huong trung binh| = 0.93): moi caption gan nhu CUNG mot huong (anisotropy
-            # cua sentence embedding, xem BERT-whitening arXiv 2103.15316). He qua do duoc: moi
-            # ReLU trong ModalityEncoder (gmu.py) thay gan nhu cung input cho moi item => 15%
-            # unit chet ngay luc init, 41% sau 60 step — mat gan nua nang luc nhanh caption, ma
-            # item token la content THUAN (khong ID embedding). Sua: tru mean toan catalog roi
-            # L2-normalize lai (giu thang ~1 nhu cu) => cosine trung binh con 0.0002. Mean
-            # chi la thong ke CONTENT khong nhan, khong leak label. 7583x384 fp32 = 11 MB nen
-            # nap han vao RAM thay mmap. Whitening day du: CHUA lam (centering da du go nghen).
+            # Caption DI HUONG: cosine trung binh giua 2 caption bat ky = 0.866 (anisotropy cua
+            # sentence embedding), nen moi ReLU cua MLP thay gan nhu cung input => nhieu unit
+            # chet. Tru mean toan catalog roi L2-normalize lai => cosine trung binh 0.0002. Mean
+            # chi la thong ke CONTENT khong nhan, khong leak label. 7583x384 fp32 = 11 MB.
+            # Whitening day du: CHUA lam.
             cap = np.load(cap_emb).astype(np.float32)
             cap = cap - cap.mean(axis=0, keepdims=True)
             cap /= np.maximum(np.linalg.norm(cap, axis=1, keepdims=True), 1e-8)
             self.caption_embeddings = cap
-            self.caption_has_caption = np.load(cap_has, mmap_mode="r")
-            self.caption_dim = int(self.caption_embeddings.shape[1])
+            self.caption_dim = int(cap.shape[1])
         else:
             self.caption_embeddings = None
-            self.caption_has_caption = None
             self.caption_dim = 0
             if use_caption:
-                print(f"[dataset] KHONG thay caption_embeddings.npy trong {self.output_dir}"
-                      f" => nhanh caption TAT (GMU con 4 modality)")
+                print(f"[dataset] KHONG thay caption_embeddings.npy trong {self.output_dir}")
 
     def __len__(self) -> int:
         return len(self.split_data)
@@ -155,12 +143,12 @@ class GenRecsysDataset(Dataset):
         dung y nhu luc serving.
 
         TRAIN (random_window=True): lay cua so o vi tri NGAU NHIEN trong qua khu. Ly do: cua
-        so co dinh luon cat cung vung "xa" — dung thu ma delta_h(x_q) (confidence_attention,
-        §4.1) can de hoc pham vi nhin. Lay ngau nhien thi qua nhieu epoch model thay gan het
+        so co dinh luon cat cung vung "xa" — dung thu ma W_ts (confidence_attention,
+        §4.1) can de hoc pham vi nhin (truoc 10-16 la delta_h(x_q), da xoa). Lay ngau nhien thi qua nhieu epoch model thay gan het
         chuoi, va moi epoch van chi tra O((2K)^2).
 
-        KHONG lay mau thua dan ve qua khu (log-spaced): nhu vay `log_rel_distance` khong
-        con la khoang cach THAT giua hai token, va delta_h se hoc tren mot thang bi bop meo.
+        KHONG lay mau thua dan ve qua khu (log-spaced): nhu vay khoang cach giua hai token khong
+        con la khoang cach THAT, va phan phoi gap ma W_ts hoc bi bop meo.
         """
         latest = max(user_start, position - self.max_seq_len)
         if not self.random_window or latest <= user_start:
@@ -184,32 +172,17 @@ class GenRecsysDataset(Dataset):
         """
         return int(self.item_static["tag_ids"].max()) + 1
 
-    def get_category_ids(self, video_ids: torch.Tensor) -> torch.Tensor:
-        """category_id (tag cũ, đã factorize) của mỗi video_id — dùng làm entity_id khi"""
-        idx = video_ids.numpy()
-        return torch.from_numpy(self.item_static["category_id"][idx].astype(np.int64))
-
     def get_item_features(self, video_ids: torch.Tensor) -> dict[str, torch.Tensor]:
         """Tra item_static cho 1 tensor video_id bất kỳ (dùng cho cả token lịch sử lẫn"""
         idx = video_ids.numpy()
         rows = self.item_static[idx]
         if self.use_caption:
             caption_embedding = np.array(self.caption_embeddings[idx], dtype=np.float32)
-            caption_mask = np.array(self.caption_has_caption[idx], dtype=np.float32)
         else:
-            # Caption TAT: tra tensor rong (B, 0) — ItemEmbedding khong dua key `caption` vao
-            # GMU nen hai field nay khong duoc doc; giu chung trong dict de collate_fn va
-            # chu ky forward() khong phai doi theo co.
+            # ID-only (--no-content): tensor rong (B, 0), embed_catalog khong doc.
             caption_embedding = np.zeros((len(idx), 0), dtype=np.float32)
-            caption_mask = np.zeros(len(idx), dtype=np.float32)
         return {
-            "category_ids": {
-                field: torch.from_numpy(rows[field].astype(np.int64)) for field in ITEM_CATEGORICAL_FIELDS
-            },
-            "author_idx": torch.from_numpy(rows["author_idx"].astype(np.int64)),
-            "music_idx": torch.from_numpy(rows["music_idx"].astype(np.int64)),
             "caption_embedding": torch.from_numpy(caption_embedding),
-            "caption_mask": torch.from_numpy(caption_mask),
             "tag_ids": torch.from_numpy(rows["tag_ids"].astype(np.int64)),
         }
 

@@ -1,12 +1,7 @@
 """Đánh giá model — HR@K, Recall@K, NDCG@K.
 
-[XOÁ 2026-10-05] `classify_signal_position` / `SIGNAL_GROUPS` / `SHORT_WINDOW` đã BỎ:
-nhãn short/long dựa trên cửa sổ 10-item CỐ ĐỊNH, đo lại cho thấy cửa sổ đó trải 199.8h và
-68.6% nhãn SAI (formula.md §10). Trục chính giờ là bảng 2x3 ablation, không phải lát cắt vị
-trí tín hiệu. `matched_by_n_u` giữ lại — nó là công cụ khớp confound, dùng cho cold/warm và
-bất kỳ hai nhóm nào chạm ở vị trí chuỗi khác nhau.
-
-Bảng 4 ô cold-start (user×item) ĐÃ BỎ: định vị cold-start không còn theo đuổi.
+`matched_by_n_u` là công cụ khớp confound: so hai nhóm chạm ở vị trí chuỗi khác nhau
+(cold/warm) bằng cách chuẩn hoá theo phân bố n_u.
 """
 
 from __future__ import annotations
@@ -85,10 +80,9 @@ def matched_by_n_u(
     name_b: str = "warm",
 ) -> dict[str, dict[str, float]]:
     """So hai nhom KHOP THEO n_u — cach DUY NHAT so sanh duoc khi hai nhom cham o
-    vi tri chuoi khac nhau. Dung cho cold/warm VA cho nhom tin hieu (`both` median n_u=68
-    vs `only_short`=17, lech 4.0x — do 2026-09-30, `probes/probe_both_confound.py`).
+    vi tri chuoi khac nhau (vd cold/warm).
 
-    Vi sao can (do 2026-09-29, `probes/probe_cold_vs_warm_matched.py`): lat cat
+    Vi sao can (do 2026-09-29): lat cat
     `cold_user`/`warm_user` tho KHONG so sanh duoc vi hai nhom cham o VI TRI CHUOI khac
     nhau — median n_u cold=20 vs warm=69; 51% cold co n_u<=20 so voi 7% warm (lech 6.9x).
     Du doan tuong tac thu 20 DE HON thu 69, nen cold cao hon warm la artefact cua thiet ke

@@ -27,7 +27,7 @@ class RetrievalLoss(nn.Module):
         super().__init__()
         self.dim = dim
         # [XOA 2026-10-15] CCR (Zhou et al. AAAI'24) da bo: chua tune, mac dinh tat, va bat
-        # len la DOI ham muc tieu => moi o ablation khong con so duoc. Xem formula.md §5bis.
+        # len la DOI ham muc tieu => moi o ablation khong con so duoc.
 
         # [SUA 2026-10-09] L2-NORMALIZE + NHIET DO HOC DUOC. Sua bug model khong hoc:
         # do duoc |e_user|=6.78 nhung |e_pos|=473.57 (lech 70x) => |logit| ~ 4013 =>

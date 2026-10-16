@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -29,7 +30,7 @@ if _out and not os.environ.get("GEN_RECSYS_OUT_DIR"):
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "preprocess_data"))
 
-from dataset import ACTION_VECTOR_FIELDS, GenRecsysDataset, ITEM_CATEGORICAL_FIELDS, MAX_SEQ_LEN
+from dataset import ACTION_VECTOR_FIELDS, GenRecsysDataset, MAX_SEQ_LEN
 from eval import (aggregate_by_group, matched_by_n_u, compute_metrics_at_k,
                   compute_positive_rank, print_matched, print_eval_report)
 from item_embedding import ItemEmbedding, ItemEmbeddingConfig
@@ -41,19 +42,10 @@ from sequence_model import SequenceModel
 BINARY_ACTION_INDICES = [ACTION_VECTOR_FIELDS.index(f) for f in BINARY_ACTION_FIELDS]
 
 
-def build_category_counts(item_static_path: Path) -> dict[str, int]:
-    item_static = np.load(item_static_path, mmap_mode="r")
-    return {field: int(item_static[field].max()) + 1 for field in ITEM_CATEGORICAL_FIELDS}
-
-
 def item_features_to_device(features: dict, device: torch.device) -> dict:
     return {
-        "category_ids": {k: v.to(device, non_blocking=True) for k, v in features["category_ids"].items()},
         "tag_ids": features["tag_ids"].to(device, non_blocking=True),
-        "author_idx": features["author_idx"].to(device, non_blocking=True),
-        "music_idx": features["music_idx"].to(device, non_blocking=True),
         "caption_embedding": features["caption_embedding"].to(device, non_blocking=True),
-        "caption_mask": features["caption_mask"].to(device, non_blocking=True),
     }
 
 
@@ -77,11 +69,9 @@ def embed_catalog(item_embed: ItemEmbedding, cat_feats: dict, device: torch.devi
     giam ~13x (7,583 thay vi ~100K hang). ponytail: chi hop catalog NHO (Pure); catalog
     lon (27K: 32M item) phai quay lai embed theo id cua batch.
     """
-    n = cat_feats["author_idx"].shape[0]
+    n = cat_feats["tag_ids"].shape[0]
     return item_embed(
-        torch.arange(n, device=device), cat_feats["category_ids"],
-        cat_feats["author_idx"], cat_feats["music_idx"],
-        cat_feats["caption_embedding"], cat_feats["caption_mask"], cat_feats["tag_ids"],
+        torch.arange(n, device=device), cat_feats["caption_embedding"], cat_feats["tag_ids"],
     )
 
 
@@ -89,7 +79,7 @@ def lr_factor(step: int, total_steps: int, warmup_steps: int) -> float:
     """He so LR tai global step: warmup TUYEN TINH roi COSINE ve 0 (Loshchilov & Hutter, SGDR).
 
     [THEM 2026-10-15] Tinh truc tiep tu global step => khong co state scheduler phai luu,
-    --resume tu dung dung cho. Warmup on dinh giai doan dau (loss cao, ID/delta/W_ts vua roi
+    --resume tu dung dung cho. Warmup on dinh giai doan dau (loss cao, ID/W_ts vua roi
     khoi 0); cosine giam LR cuoi ky de hoi tu sau hon voi cung ngan sach step.
     """
     if step < warmup_steps:
@@ -296,8 +286,6 @@ def train(
     amp: bool = True,
     use_qk: bool = True,
     dynamic_ts: bool = False,
-    static_delta: bool = False,
-    no_delta: bool = False,
     full_ranking: bool = False,
     use_checkpoint: bool = False,
     save_every: int | None = None,
@@ -313,12 +301,9 @@ def train(
     eval_split: str = "val",
     max_seq_len: int = MAX_SEQ_LEN,
     random_window: bool = True,
-    no_tag: bool = False,
-    # [THEM 2026-10-08] Bo nhanh caption khoi GMU. Dung de chay thu model KHI CHUA CO
-    # caption_embeddings.npy. Dataset cung TU DONG tat khi thieu file, nen co nay chi can
-    # khi muon tat DU DA co file (ablation that).
-    no_caption: bool = False,
-    no_item_id: bool = False,
+    no_content: bool = False,
+    caption_file: str = "caption_embeddings.npy",
+    seed: int = 0,
     num_workers: int = 4,
     device_str: str = "cuda" if torch.cuda.is_available() else "cpu",
 ):
@@ -326,6 +311,18 @@ def train(
 
     ddp, rank, local_rank, world_size = setup_ddp()
     is_main = rank == 0
+
+    # [THEM 2026-10-16] --seed: truoc day KHONG seed gi (khoi tao trong so, thu tu batch, negative
+    # deu ngau nhien moi lan chay) => khong biet nhieu giua cac lan chay cung cau hinh, khong the
+    # bao CI95 theo seed. Trong so khoi tao CUNG seed o moi rank (DDP broadcast tu rank 0 anyway);
+    # negative sampler (np.random toan cuc, chay o tien trinh chinh — xem neg_sampler.sample)
+    # seed + rank de cac rank khong rut TRUNG nhau. Worker DataLoader suy seed tu `generator`
+    # ben duoi. KHONG bat cudnn.deterministic: tuyet doi tung bit khong dat duoc va lam cham.
+    random.seed(seed)
+    np.random.seed(seed + rank)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     device = torch.device(f"cuda:{local_rank}") if ddp else torch.device(device_str)
 
     def log(*a, **kw):
@@ -336,35 +333,31 @@ def train(
     # random_window CHI o train (xem dataset._window_start): eval phai dung cua so ngay
     # truoc diem du doan de khop serving.
     train_dataset = GenRecsysDataset(output_dir, split="train", max_seq_len=max_seq_len,
-                                     random_window=random_window,
-                                     use_caption=not no_caption)
+                                     random_window=random_window, seed=seed,
+                                     use_caption=not no_content, caption_file=caption_file)
     train_sampler = (
         torch.utils.data.distributed.DistributedSampler(
-            train_dataset, num_replicas=world_size, rank=rank, shuffle=True,
+            train_dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=seed,
         )
         if ddp else None
     )
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=(train_sampler is None),
-        sampler=train_sampler,
+        sampler=train_sampler, generator=torch.Generator().manual_seed(seed),
         num_workers=num_workers, pin_memory=(device.type == "cuda"),
         persistent_workers=num_workers > 0,
         prefetch_factor=6 if num_workers > 0 else None,
     )
 
     num_items = len(train_dataset.item_static)
-    num_authors = int(train_dataset.item_static["author_idx"].max()) + 1
-    num_music = int(train_dataset.item_static["music_idx"].max()) + 1
-    num_categories = build_category_counts(output_dir / "item_static.npy")
-
+    if not no_content and not train_dataset.use_caption:
+        raise ValueError(
+            "Cau hinh ID + content can caption_embeddings.npy trong --output-dir. "
+            "Khong co file thi dung --no-content (ID-only, = HSTU)."
+        )
     item_config = ItemEmbeddingConfig(
-        num_items=num_items, num_authors=num_authors, num_music=num_music,
-        num_categories=num_categories,
-        num_tags=train_dataset.num_tags(), use_tag=not no_tag, dim=dim,
-        # `train_dataset.use_caption` da gop ca co --no-caption LAN viec file co ton tai
-        # khong (dataset tu tat khi thieu), nen lay tu day thay vi tu `no_caption`.
-        use_caption=train_dataset.use_caption,
-        use_item_id=not no_item_id,
+        num_items=num_items, num_tags=train_dataset.num_tags(),
+        use_content=not no_content, dim=dim,
         caption_dim=train_dataset.caption_dim or 384,
     )
     item_embed = ItemEmbedding(item_config).to(device, non_blocking=True)
@@ -373,7 +366,6 @@ def train(
         dim=dim, num_heads=num_heads, num_layers=num_layers, ffn_dim=ffn_dim,
         max_seq_len=2 * max_seq_len + 1,
         use_checkpoint=use_checkpoint, use_qk=use_qk, dynamic_ts=dynamic_ts,
-        static_delta=static_delta, no_delta=no_delta,
     ).to(device, non_blocking=True)
     retrieval_loss_fn = RetrievalLoss(
         dim=dim, t_base=t_base, learnable_temp=learnable_temp,
@@ -391,7 +383,7 @@ def train(
         + list(ranking_loss_fn.parameters())
     )
     # Chi decay MA TRAN trong so + bang embedding (ndim>=2). KHONG decay: bias/LayerNorm
-    # (ndim<2, thong le), delta/log_temp (vo huong — decay keo ve 0 = keo ve NHOM DOI
+    # (ndim<2, thong le), log_temp (vo huong — decay keo ve 0 = keo ve NHOM DOI
     # CHUNG cua ablation; log_temp ve 0 = temp ve 1.0, phang het logit cosine), va bang
     # bias attention ts_w (2 chieu nhung cung la bias zero-init, cung ly do).
     _no_decay_names = ("ts_w",)
@@ -421,14 +413,7 @@ def train(
     else:
         item_embed_ddp, seq_model_ddp = item_embed, seq_model
 
-    if no_tag:
-        raise ValueError(
-            "--no-tag: content token chi con GMU va `fuse` thanh phep chieu d->d, khong "
-            "con gi de hop nhat. Gan nhu chac la nham co."
-        )
-
-    log(f"[train] nhanh tag: {'TAT' if no_tag else 'BAT'}"
-        f" | item-ID: {'TAT' if no_item_id else 'BAT'}")
+    log(f"[train] cau hinh item: {'ID-only (HSTU)' if no_content else 'ID + content'}")
 
     steps_per_epoch = min(len(train_loader), max_steps_per_epoch) if max_steps_per_epoch else len(train_loader)
     total_steps = num_epochs * steps_per_epoch
@@ -442,14 +427,11 @@ def train(
     ckpt_config = {
         "dim": dim, "num_heads": num_heads, "num_layers": num_layers, "ffn_dim": ffn_dim,
         "amp": amp, "use_qk": use_qk, "dynamic_ts": dynamic_ts,
-        "static_delta": static_delta, "no_delta": no_delta,
         "t_base": t_base, "learnable_temp": learnable_temp,
         "max_seq_len": max_seq_len, "eval_negatives": eval_negatives,
         "random_window": random_window,
-        "no_tag": no_tag, "no_item_id": no_item_id,
-        # Lay tu dataset (gop ca co --no-caption lan viec file co ton tai), de checkpoint
-        # ghi dung cau hinh THUC TE da train, khong phai y dinh tren CLI.
-        "use_caption": train_dataset.use_caption,
+        "use_content": not no_content,
+        "caption_file": caption_file,
     }
     # [THEM 2026-10-13] error.md #18: hyperparameter HUAN LUYEN (duoc phep doi giua cac
     # lan resume, vd ha lr) — KHONG dua vao ckpt_config (cai do RAISE khi lech, dung cho
@@ -462,6 +444,7 @@ def train(
         "batch_size": batch_size, "num_negatives": num_negatives,
         "eval_negatives": eval_negatives,
         "full_ranking": full_ranking, "eval_split": eval_split,
+        "seed": seed,
     }
     ckpt_path = Path(save_path) if save_path else output_dir / "ckpt.pt"
 
@@ -484,7 +467,7 @@ def train(
         evaluate(
             eval_split, output_dir, item_embed, seq_model, neg_sampler,
             retrieval_loss_fn, eval_negatives, batch_size, device,
-            use_caption=train_dataset.use_caption,
+            use_caption=train_dataset.use_caption, caption_file=caption_file,
             max_seq_len=max_seq_len, max_batches=eval_max_batches,
             num_workers=num_workers,
             full_ranking=full_ranking,
@@ -537,12 +520,12 @@ def train(
             # [THEM 2026-10-13] error.md #21: da unscale_ (dung de clip o DUNG thang
             # gradient that) nhung truoc day KHONG clip gi — bo lo chinh ly do thuong
             # goi unscale_ som. Thieu clip => mot batch co gradient dot bien (vd item
-            # cuc hiem, hoac delta_proj troi xa — xem formula.md §4.1ter) co the day
+            # cuc hiem, hoac ts_gate troi xa) co the day
             # optimizer di xa.
             torch.nn.utils.clip_grad_norm_(dense_params, max_norm=grad_clip_norm)
 
             grad_norms = {}
-            for pname in ("delta", "ts_w"):
+            for pname in ("ts_w",):
                 total = 0.0
                 for layer in seq_model.decoder.layers:
                     g = getattr(layer.attn, pname).grad
@@ -576,15 +559,13 @@ def train(
                 step_time_acc = 0.0
                 with torch.no_grad():
                     vals = {}
-                    for pname in ("delta", "ts_w"):
+                    for pname in ("ts_w",):
                         ps = [getattr(l.attn, pname).abs().mean().item() for l in seq_model.decoder.layers]
                         vals[pname] = sum(ps) / len(ps)
                 tqdm.write(
                     f"epoch={epoch} step={step} loss={loss.item():.4f} "
                     f"retrieval={r_loss.item():.4f} ranking={k_loss.item():.4f}"
-                    f" | |d|={vals['delta']:.2e}"
-                    f" |ts|={vals['ts_w']:.2e}"
-                    f" gd={grad_norms['delta']:.2e}"
+                    f" | |ts|={vals['ts_w']:.2e}"
                     f" gts={grad_norms['ts_w']:.2e}"
                     f" lr={optimizer.param_groups[0]['lr']:.2e}"
                     f"{fwd_msg}"
@@ -606,7 +587,7 @@ def train(
         evaluate(
             eval_split, output_dir, item_embed, seq_model, neg_sampler, retrieval_loss_fn,
             eval_negatives, batch_size, device,
-            use_caption=train_dataset.use_caption,
+            use_caption=train_dataset.use_caption, caption_file=caption_file,
             max_seq_len=max_seq_len, max_batches=eval_max_batches,
             num_workers=num_workers, full_ranking=full_ranking,
         )
@@ -767,6 +748,7 @@ def evaluate(
     batch_size: int,
     device: torch.device,
     use_caption: bool = True,
+    caption_file: str = "caption_embeddings.npy",
     max_seq_len: int = MAX_SEQ_LEN,
     max_batches: int | None = None,
     num_workers: int = 4,
@@ -774,7 +756,7 @@ def evaluate(
 ) -> None:
     """Đánh giá Recall/NDCG@K trên split (val/test), tách theo 4 nhóm cold-start — xem"""
     dataset = GenRecsysDataset(output_dir, split=split, max_seq_len=max_seq_len,
-                               use_caption=use_caption)
+                               use_caption=use_caption, caption_file=caption_file)
     loader = DataLoader(
         dataset, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, pin_memory=(device.type == "cuda"),
@@ -903,12 +885,10 @@ if __name__ == "__main__":
                              "thi day la gia tri KHOI TAO; neu --fixed-temp thi la hang so.")
     parser.add_argument("--fixed-temp", action="store_true",
                         help="Nhiet do CO DINH o --t-base thay vi hoc duoc (ablation).")
-    parser.add_argument("--static-delta", action="store_true",
-                        help="delta TINH: dong bang delta_proj o zero => delta_h hang so qua moi "
-                             "query. O A1/A3 cua bang 2x2 (formula.md §4.4 nhom A).")
-    parser.add_argument("--no-delta", action="store_true",
-                        help="BO HAN delta (ca tinh lan dong): delta_h = 0 va dong bang => "
-                             "khong con so hang delta*log(dist). Ablation B5.")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Seed cho khoi tao trong so, thu tu batch, negative, cua so truot. "
+                             "Chay >=3 seed khac nhau de bao mean +- CI95 theo seed. Mac dinh 0 "
+                             "(truoc 2026-10-16 KHONG seed => moi lan chay mot ket qua khac).")
     parser.add_argument("--no-amp", action="store_true", help="Tắt fp16 autocast + GradScaler (mặc định BẬT trên CUDA). Dùng khi nghi ngờ vấn đề độ chính xác")
     parser.add_argument("--eval-negatives", type=int, default=1024,
                         help="So candidate luc EVAL = 1 positive + (N-1) negative. KHAC "
@@ -923,20 +903,19 @@ if __name__ == "__main__":
     parser.add_argument("--no-random-window", action="store_true",
                         help="Tat cua so truot ngau nhien luc train (xem "
                              "dataset._window_start). Mac dinh BAT: cua so co dinh cat cung "
-                             "vung 'xa', dung thu ma delta_h(x_q) can de hoc pham vi nhin.")
-    parser.add_argument("--no-tag", action="store_true",
-                        help="ABLATION (formula.md muc 1): bo nhanh 2 (tag) cua content "
-                             "token — content token chi con GMU, khong con gi de hop nhat.")
+                             "vung 'xa', dung thu ma W_ts can de hoc pham vi nhin.")
+    parser.add_argument("--no-content", action="store_true",
+                        help="ID-only (= HSTU): Phi_i chi la bang ID embedding, bo caption + tag. "
+                             "Mac dinh la ID + content (MLP(caption) ; mean_tag -> concat -> fuse, + ID).")
+    parser.add_argument("--caption-file", default="caption_embeddings.npy",
+                        help="Ten file embedding caption trong --output-dir (shape (num_items, D), da "
+                             "thu tu theo item_static; dataset tu tru mean + L2-normalize). D tu suy ra "
+                             "tu file. Vd caption_embeddings_bge-base-zh.npy (768 chieu).")
     parser.add_argument("--save-every", type=int, default=None, help="Lưu checkpoint mỗi N step (ngoài lần lưu cuối mỗi epoch, vốn LUÔN chạy). Dùng khi session hay bị ngắt giữa chừng")
     parser.add_argument("--save-path", default=None, help="Đường dẫn checkpoint; mặc định <output-dir>/ckpt.pt. Trên Kaggle nên trỏ vào /kaggle/working (output-dir có thể read-only)")
     parser.add_argument("--resume", default=None, help="Nạp checkpoint và train TIẾP từ đúng step đã dừng (gồm cả optimizer state)")
     parser.add_argument("--num-workers", type=int, default=4, help="Worker nạp dữ liệu (mặc định 4). Nghẽn là CPU chứ không phải GPU — đặt 0 để debug hoặc khi môi trường không cho fork")
     parser.add_argument("--eval-only", action="store_true", help="Không train, chỉ nạp checkpoint (--resume/--save-path) và chạy evaluate() — dùng để chạy lại chẩn đoán trên CÙNG model, ~8 phút thay vì train lại ~2 giờ")
-    parser.add_argument("--no-caption", action="store_true",
-                        help="ABLATION (formula.md §1): bo modality `caption` khoi GMU. "
-                             "Dataset TU DONG tat khi thieu caption_embeddings.npy, nen co "
-                             "nay chi can khi muon tat DU DA co file. GMU con 4 modality "
-                             "(video_type, music_type, author, music) + nhanh tag.")
     parser.add_argument("--eval-split", choices=["val", "test"], default="val",
                         help="Split để eval. 'val' (mặc định) dùng để TUNE và chọn nhánh "
                              "ablation. 'test' chỉ chạy ĐÚNG MỘT LẦN sau khi đã chốt cấu "
@@ -957,8 +936,6 @@ if __name__ == "__main__":
     parser.add_argument("--weight-decay", type=float, default=0.01,
                         help="AdamW decoupled weight decay cho ma tran/embedding (NormFace "
                              "1704.06369: logit cosine lam norm phinh). 0 = tat")
-    parser.add_argument("--no-item-id", action="store_true",
-                        help="Ablation: tat item-ID embedding, Phi_i = content THUAN (hanh vi truoc 2026-10-15)")
     parser.add_argument("--lr-schedule", choices=["cosine", "constant"], default="cosine",
                         help="cosine = warmup tuyen tinh + cosine ve 0 (mac dinh); constant = LR co dinh (hanh vi truoc 2026-10-15)")
     parser.add_argument("--warmup-frac", type=float, default=0.05,
@@ -973,8 +950,6 @@ if __name__ == "__main__":
         amp=not args.no_amp,
         use_qk=not args.no_qk,
         dynamic_ts=args.dynamic_ts,
-        static_delta=args.static_delta,
-        no_delta=args.no_delta,
         t_base=args.t_base,
         learnable_temp=not args.fixed_temp,
         lr=args.lr,
@@ -989,12 +964,12 @@ if __name__ == "__main__":
         save_path=args.save_path,
         resume=args.resume,
         eval_only=args.eval_only,
-        no_caption=args.no_caption,
         eval_split=args.eval_split,
         eval_negatives=args.eval_negatives,
         max_seq_len=args.max_seq_len,
         random_window=not args.no_random_window,
-        no_tag=args.no_tag,
-        no_item_id=args.no_item_id,
+        no_content=args.no_content,
+        caption_file=args.caption_file,
+        seed=args.seed,
         num_workers=args.num_workers,
     )

@@ -43,7 +43,7 @@ class NegativeSampler:
         item_ids = np.load(output_dir / "item_N_ids.npy")
 
         if p80 is not None:
-            # N_i TAI MOC p80 cho MOI item — khong leak val/test (cung co che voi §0).
+            # N_i TAI MOC p80 cho MOI item — khong leak val/test.
             ts_at_p80 = np.full(item_ids.shape[0], p80, dtype=np.int64)
             freq_observed = lookup_n_at_t_batch("item_N", item_ids, ts_at_p80).astype(np.float64)
         else:

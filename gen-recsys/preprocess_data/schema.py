@@ -14,16 +14,7 @@ LOG_STANDARD_FILES = [
     LOG_DIR / "log_standard_4_08_to_4_21_pure.csv",
     LOG_DIR / "log_standard_4_22_to_5_08_pure.csv",
 ]
-LOG_RANDOM_FILES = [LOG_DIR / "log_random_4_22_to_5_08_pure.csv"]
 VIDEO_BASIC_FILE = LOG_DIR / "video_features_basic_pure.csv"
-
-# log_standard_*.csv / log_random_*.csv — CÙNG schema, phân biệt qua cột is_rand
-LOG_SCHEMA = [
-    "user_id", "video_id", "date", "hourmin", "time_ms",
-    "is_click", "is_like", "is_follow", "is_comment", "is_forward", "is_hate",
-    "long_view", "play_time_ms", "duration_ms", "profile_stay_time",
-    "comment_stay_time", "is_profile_enter", "is_rand", "tab",
-]
 
 # action_vector: multi-hot/multi-value, đã chốt 2026-09-09 (idea.md mục 4.5 điểm 4)
 # Thứ tự cố định — dùng xuyên suốt pipeline, KHÔNG đổi thứ tự sau khi đã build dữ liệu.
@@ -42,27 +33,14 @@ ACTION_VECTOR_FIELDS = [
 ]
 NUM_ACTION_DIMS = len(ACTION_VECTOR_FIELDS)  # 11
 
-# user_features_pure.csv
-# [XOA 2026-10-06] USER_STATIC_ONEHOT_FEATS (onehot_feat0-17) va USER_STATIC_FIELD
-# (register_days) DA BO cung `build_user_static.py`. Chuoi chet: chung nuoi static_branch cua
-# `user_embedding.py`, file do xoa cung FiLM 2026-10-05 (formula.md §3bis).
-
 # video_features_basic_pure.csv
-VIDEO_BASIC_CATEGORY_FIELD = "tag"  # category 1 cấp DUY NHẤT có trong Pure — dùng cho cả N_category/category_confidence VÀ content_branch
+VIDEO_BASIC_CATEGORY_FIELD = "tag"  # tag multi-label, nguồn của tag_ids (nhánh tag của content token)
 # [CHỐT 2026-09-10, xác nhận lại 2026-09-13] ID lớn — cần nn.Embedding riêng (không phải
 # feature thống kê), giống e_collab của video_id.
 VIDEO_BASIC_ID_FIELDS = ["author_id", "music_id"]
 # categorical nhỏ — video_type: 3 giá trị (NORMAL/AD/UNKNOWN); music_type: 6 giá trị (có NaN, cần fillna trước)
 VIDEO_BASIC_CATEGORICAL_FIELDS = ["video_type", "music_type"]
 
-# [THÊM 2026-10-05] Ngày ra mắt item — cần cho age_t (formula.md §2).
-VIDEO_BASIC_UPLOAD_FIELD = "upload_dt"
-
-# video_features_statistic_pure.csv — dùng cho content_branch (KHÔNG dùng để tính N_i, sẽ leak tương lai)
-VIDEO_STATIC_STAT_FIELDS = [
-    "play_cnt", "like_cnt", "share_cnt", "comment_cnt", "follow_cnt", "collect_cnt",
-    "report_cnt", "reduce_similar_cnt",  # tín hiệu tiêu cực cụ thể hơn is_hate
-]
 
 # Sliding window — chốt lại 2026-09-14: đo trực tiếp trên output/user_offsets.npy (Pure),
 # p99 độ dài chuỗi/user = 234, 256 phủ 99.26% user + là power-of-2 (thân thiện GPU/attention

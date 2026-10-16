@@ -1,12 +1,8 @@
-"""Pass 1 — tính N_i và N_category lũy kế THEO THỜI GIAN (không leak tương lai).
+"""Pass 1 — tính N_i lũy kế THEO THỜI GIAN (không leak tương lai).
 
-[XOÁ 2026-10-06] N_u cũng từng tính ở đây (`build_user_n_cumulative`) nhưng đã bỏ — xem
-ghi chú tại chỗ hàm cũ, phía dưới `build_item_n_cumulative`.
-
-Vì sao pass riêng: N_i (số tương tác 1 item đã nhận) và N_category (số item RIÊNG
-BIỆT cùng tag đã có >=1 tương tác) đều thay đổi theo thời gian và cần tra cứu được
-TẠI BẤT KỲ thời điểm t nào khi build sequence/interactions (Pass 2, Pass 5) — nên phải
-tính xong và lưu dạng lũy kế TRƯỚC, thay vì tính lại mỗi lần cần dùng.
+Vì sao pass riêng: N_i (số tương tác 1 item đã nhận) thay đổi theo thời gian và cần
+tra cứu được TẠI BẤT KỲ thời điểm t nào khi build sequence/interactions (Pass 2, Pass 5)
+— nên phải tính xong và lưu dạng lũy kế TRƯỚC, thay vì tính lại mỗi lần cần dùng.
 
 KHÔNG dùng video_features_statistic_*.csv (play_cnt tổng...) cho N_i — đó là snapshot
 cuối, sẽ leak thông tin tương lai (idea.md mục 4.5, điểm 4).
@@ -14,7 +10,7 @@ cuối, sẽ leak thông tin tương lai (idea.md mục 4.5, điểm 4).
 Output: CSR-style flat arrays (KHÔNG dict theo key — đã đo thực nghiệm: 88,905 item
 trên chỉ 100k dòng subset mất ~10s chỉ để build dict do vòng lặp Python group_by; với
 32,038,725 item thật, cách này KHÔNG scale được). Mỗi nhóm gồm 3 file:
-  {name}_ids.npy         — id (item_id hoặc category) đã unique + sort tăng dần
+  {name}_ids.npy         — id (item_id) đã unique + sort tăng dần
   {name}_offsets.npy     — offsets[i] = vị trí bắt đầu của ids[i] trong mảng phẳng dưới
   {name}_events.npy      — structured array [("t", int64), ("count", int32)], đã sort
                            theo (id, t), nối liền tất cả các id (timestamps + counts
@@ -30,11 +26,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
-from schema import (
-    LOG_STANDARD_FILES,
-    VIDEO_BASIC_CATEGORY_FIELD,
-    VIDEO_BASIC_FILE,
-)
+from schema import LOG_STANDARD_FILES
 # [SỬA 2026-09-15] Cho phép ghi đè qua biến môi trường GEN_RECSYS_OUT_DIR.
 #
 # Vì sao cần: trước đây OUT_DIR hard-code = thư mục cạnh FILE CODE. Lúc BUILD dữ liệu điều
@@ -49,20 +41,6 @@ from schema import (
 # ngay khi biết --output-dir, TRƯỚC khi import module — xem train.py.
 # Không set env -> giữ nguyên hành vi cũ, nên 4 caller hiện tại không bị ảnh hưởng.
 OUT_DIR = Path(os.environ.get("GEN_RECSYS_OUT_DIR") or (Path(__file__).parent / "output"))
-
-
-def _first_interaction_per_item() -> pl.DataFrame:
-    """Với mỗi video_id, thời điểm nó XUẤT HIỆN LẦN ĐẦU trong log (dùng để đếm N_category)."""
-    scans = [
-        pl.scan_csv(f, schema_overrides={"video_id": pl.Int64, "user_id": pl.Int64, "time_ms": pl.Int64})
-        for f in LOG_STANDARD_FILES
-    ]
-    lazy = pl.concat(scans).select(["video_id", "time_ms"])
-    return (
-        lazy.group_by("video_id")
-        .agg(pl.col("time_ms").min().alias("first_seen_ms"))
-        .collect(streaming=True)
-    )
 
 
 def _save_csr(name: str, id_col: pl.Series, time_col: pl.Series, count_col: pl.Series) -> None:
@@ -104,42 +82,6 @@ def build_item_n_cumulative() -> None:
     df = df.with_columns(pl.int_range(1, pl.len() + 1).over("video_id").alias("cum_count"))
 
     _save_csr("item_N", df["video_id"], df["time_ms"], df["cum_count"])
-
-
-# [XOA 2026-10-06] `build_user_n_cumulative()` (N_u(user,t) luy ke, ghi user_N_*.npy) DA BO.
-#
-# Ly do: KHONG AI DOC file no ghi ra. `dataset.py` lay hist_n_u bang phep tru
-# `(window_start - user_start) + arange(window_len)` — dung cung so, re hon han, khong can
-# searchsorted. Pass nay sinh ra 2026-09-14 cho `user_weight` per-position; `user_weight` da
-# bo 2026-10-06 cung tau_u (formula.md §0: attention khong doc log_u o bat ky so hang nao
-# cua §4.1), nen file ghi ra khong ai mo.
-#
-# `hist_n_u` VAN SONG nhung chi dung 1 gia tri cuoi (`n_u_at_pred`) cho chan doan
-# `matched_by_n_u` o eval — khop confound, khong vao model.
-
-
-def build_category_n_cumulative() -> None:
-    """N_category(tag, t) = số video_id RIÊNG BIỆT cùng tag có first_seen_ms < t, lũy kế theo thời gian."""
-    video_basic = pl.read_csv(VIDEO_BASIC_FILE, columns=["video_id", VIDEO_BASIC_CATEGORY_FIELD])
-    first_seen = _first_interaction_per_item()
-
-    joined = first_seen.join(video_basic, on="video_id", how="inner").sort(
-        [VIDEO_BASIC_CATEGORY_FIELD, "first_seen_ms"]
-    )
-    joined = joined.with_columns(
-        pl.int_range(1, pl.len() + 1).over(VIDEO_BASIC_CATEGORY_FIELD).alias("cum_count")
-    )
-    # category là string (tag) — encode thành int trước khi lưu (CSR cần id dạng số để sort/searchsorted)
-    tag_codes, tag_uniques = joined[VIDEO_BASIC_CATEGORY_FIELD].to_pandas().factorize(sort=True)
-    joined = joined.with_columns(pl.Series("tag_code", tag_codes.astype(np.int64)))
-
-    _save_csr("category_N", joined["tag_code"], joined["first_seen_ms"], joined["cum_count"])
-    np.save(OUT_DIR / "category_N_tag_names.npy", np.array(tag_uniques, dtype=object), allow_pickle=True)
-
-
-# [XOA 2026-10-06] `lookup_n_at_t(name, entity_id, t)` — ban SCALAR — DA BO. No load lai CA
-# BA file .npy MOI LAN GOI, va khong con caller nao: ban vector hoa `lookup_n_at_t_batch`
-# (duoi day) la thu dang dung o build_interactions.py va train.py.
 
 
 def build_n_cache(name: str) -> dict:
@@ -228,7 +170,7 @@ def lookup_n_at_t_batch(name: str, entity_ids: np.ndarray, ts: np.ndarray, batch
 
     [SỬA 2026-09-10 — OOM đã xác nhận: ArrayMemoryError 4.80 GiB khi build query_struct
     cho toàn bộ 322,251,100 sample cùng lúc, trên máy 31.7GB RAM]: flat_struct (dựng từ
-    item_N/category_N, cố định theo dữ liệu — KHÔNG phụ thuộc entity_ids/ts của query) chỉ
+    item_N, cố định theo dữ liệu — KHÔNG phụ thuộc entity_ids/ts của query) chỉ
     build 1 LẦN; query_struct (phụ thuộc entity_ids/ts, có thể rất lớn — 322M+ sample) chia
     thành từng batch nhỏ (batch_size phần tử/lần) để tránh giữ 2 mảng ~4.8GB cùng lúc.
 
@@ -245,4 +187,3 @@ def lookup_n_at_t_batch(name: str, entity_ids: np.ndarray, ts: np.ndarray, batch
 
 if __name__ == "__main__":
     build_item_n_cumulative()
-    build_category_n_cumulative()
