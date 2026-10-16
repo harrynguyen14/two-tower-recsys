@@ -21,6 +21,7 @@ class SequenceModel(nn.Module):
         use_qk: bool = True,
         dynamic_ts: bool = False,
         static_delta: bool = False,
+        no_delta: bool = False,
     ):
         super().__init__()
         self.dim = dim
@@ -32,7 +33,7 @@ class SequenceModel(nn.Module):
         self.decoder = SequenceDecoder(
             dim, num_heads, num_layers, ffn_dim, dropout, max_seq_len=max_seq_len,
             use_checkpoint=use_checkpoint, use_qk=use_qk, dynamic_ts=dynamic_ts,
-            static_delta=static_delta,
+            static_delta=static_delta, no_delta=no_delta,
         )
 
     def forward(

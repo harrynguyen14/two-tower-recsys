@@ -297,6 +297,7 @@ def train(
     use_qk: bool = True,
     dynamic_ts: bool = False,
     static_delta: bool = False,
+    no_delta: bool = False,
     full_ranking: bool = False,
     use_checkpoint: bool = False,
     save_every: int | None = None,
@@ -372,7 +373,7 @@ def train(
         dim=dim, num_heads=num_heads, num_layers=num_layers, ffn_dim=ffn_dim,
         max_seq_len=2 * max_seq_len + 1,
         use_checkpoint=use_checkpoint, use_qk=use_qk, dynamic_ts=dynamic_ts,
-        static_delta=static_delta,
+        static_delta=static_delta, no_delta=no_delta,
     ).to(device, non_blocking=True)
     retrieval_loss_fn = RetrievalLoss(
         dim=dim, t_base=t_base, learnable_temp=learnable_temp,
@@ -441,7 +442,7 @@ def train(
     ckpt_config = {
         "dim": dim, "num_heads": num_heads, "num_layers": num_layers, "ffn_dim": ffn_dim,
         "amp": amp, "use_qk": use_qk, "dynamic_ts": dynamic_ts,
-        "static_delta": static_delta,
+        "static_delta": static_delta, "no_delta": no_delta,
         "t_base": t_base, "learnable_temp": learnable_temp,
         "max_seq_len": max_seq_len, "eval_negatives": eval_negatives,
         "random_window": random_window,
@@ -905,6 +906,9 @@ if __name__ == "__main__":
     parser.add_argument("--static-delta", action="store_true",
                         help="delta TINH: dong bang delta_proj o zero => delta_h hang so qua moi "
                              "query. O A1/A3 cua bang 2x2 (formula.md §4.4 nhom A).")
+    parser.add_argument("--no-delta", action="store_true",
+                        help="BO HAN delta (ca tinh lan dong): delta_h = 0 va dong bang => "
+                             "khong con so hang delta*log(dist). Ablation B5.")
     parser.add_argument("--no-amp", action="store_true", help="Tắt fp16 autocast + GradScaler (mặc định BẬT trên CUDA). Dùng khi nghi ngờ vấn đề độ chính xác")
     parser.add_argument("--eval-negatives", type=int, default=1024,
                         help="So candidate luc EVAL = 1 positive + (N-1) negative. KHAC "
@@ -970,6 +974,7 @@ if __name__ == "__main__":
         use_qk=not args.no_qk,
         dynamic_ts=args.dynamic_ts,
         static_delta=args.static_delta,
+        no_delta=args.no_delta,
         t_base=args.t_base,
         learnable_temp=not args.fixed_temp,
         lr=args.lr,

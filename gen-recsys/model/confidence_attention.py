@@ -96,6 +96,7 @@ class ConfidenceModulatedAttention(nn.Module):
     def __init__(
         self, dim: int, num_heads: int, dropout: float = 0.0, max_seq_len: int = 513,
         use_qk: bool = True, dynamic_ts: bool = False, static_delta: bool = False,
+        no_delta: bool = False,
     ):
         super().__init__()
         assert dim % num_heads == 0, "dim phải chia hết cho num_heads"
@@ -147,6 +148,14 @@ class ConfidenceModulatedAttention(nn.Module):
         # Khong can nhanh if trong forward.
         self.static_delta = static_delta
         if static_delta:
+            self.delta_proj.weight.requires_grad_(False)
+            self.delta_proj.bias.requires_grad_(False)
+
+        # BO HAN delta (`--no-delta`, ablation B5): ca delta_h lan delta_proj deu zero va
+        # dong bang => so hang delta*log(dist) = 0 CHINH XAC. Kiem tra "truc VI TRI co
+        # vo ich khi da co W_ts" (memory 10-16) — truoc day chi moi bo delta DONG.
+        if no_delta:
+            self.delta.requires_grad_(False)
             self.delta_proj.weight.requires_grad_(False)
             self.delta_proj.bias.requires_grad_(False)
 
