@@ -54,6 +54,16 @@ class SASRec(nn.Module):
                                            batch_first=True, norm_first=True)
         self.blocks = nn.TransformerEncoder(layer, layers, enable_nested_tensor=False)
         self.norm = nn.LayerNorm(dim)
+        # Meta's SASRec: item + position embeddings truncated-normal std 0.02, every other matrix
+        # xavier-normal. nn.Embedding's default N(0,1) is ~50x larger and (after * sqrt(d)) lets the
+        # item embedding drown the attention output.
+        for emb in (self.item, self.pos):
+            nn.init.trunc_normal_(emb.weight, std=0.02, a=-0.04, b=0.04)
+        with torch.no_grad():
+            self.item.weight[0].zero_()
+        for p in self.blocks.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_normal_(p)
 
     def item_table(self):
         return self.item.weight[1:]
@@ -83,6 +93,17 @@ class GRU4Rec(nn.Module):
         self.item = nn.Embedding(num_items + 1, dim, padding_idx=0)
         self.gru = nn.GRU(dim, dim, batch_first=True)
         self.drop = nn.Dropout(dropout_embed)
+        # official GRU4Rec: Glorot-uniform on every matrix, sigma = sqrt(6 / (rows + cols)), zero biases
+        with torch.no_grad():
+            s = (6.0 / (num_items + 1 + dim)) ** 0.5
+            self.item.weight.uniform_(-s, s)
+            self.item.weight[0].zero_()
+            s = (6.0 / (2 * dim)) ** 0.5
+            for w in (self.gru.weight_ih_l0, self.gru.weight_hh_l0):
+                for g in w.chunk(3):                      # reset / update / candidate gate
+                    g.uniform_(-s, s)
+            self.gru.bias_ih_l0.zero_()
+            self.gru.bias_hh_l0.zero_()
 
     def item_table(self):
         return self.item.weight[1:]

@@ -37,8 +37,12 @@ Original-paper variants stay selectable: `--loss bce` (SASRec 2018), `--loss bpr
 
 Deviations from the recipes (deliberate, none verified to be neutral):
 - Window = gen-recsys `max_seq_len` 256 (Meta: 200) so every model sees the same history.
-- Training is step-based, not epoch-based. `ssm` negatives are uniform over the catalog (Meta's `sampling_strategy=local`
-  is not reproduced). GRU4Rec in-batch negatives are a random subset of 1024 batch targets, not the session-parallel batch.
+- Training is step-based, not epoch-based. `ssm` negatives are uniform over the catalog = Meta's `sampling_strategy=local`
+  (checked in `autoregressive_losses.py`), except that I share 128 negatives across the batch while Meta draws 128 per position.
+  GRU4Rec in-batch negatives are a random subset of 1024 batch targets, not the session-parallel batch.
+- Initialisation follows the authors (SASRec/HSTU: embeddings trunc-normal std 0.02, other matrices xavier; GRU4Rec: Glorot-uniform).
+  The first Kaggle run used PyTorch's default N(0,1) embeddings and SASRec/GRU4Rec stayed at popularity level (hr@10 0.024/0.027); discard it.
+- `trivial.py` gives the reference rows (popularity, repeat-last-item) through the same protocol.
 - HSTU time buckets = floor(ln(max(|dt|,1 s)) / 0.301), 128 buckets: copied from Meta's `research/modeling/sequential/hstu.py`
   (lines ~611-613). torch-rechub's rab has one bias per head, Meta's is shared across heads (identical with 1 head).
 - GRU4Rec has no output bias, and its hyper-parameters come from another dataset (the repo says to tune per dataset;
