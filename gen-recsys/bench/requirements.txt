@@ -1,0 +1,3 @@
+torch
+numpy
+torch-rechub==0.9.0   # install with --no-deps to keep your torch; HSTUModel only needs torch
